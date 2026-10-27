@@ -28,7 +28,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_nvt.c
-@@ -0,0 +1,656 @@
+@@ -0,0 +1,734 @@
 +/*
 + * SWEET vayu (POCO X3 Pro) touch: Novatek NT36672C (TDDI) behind the QUPv3
 + * wrapper 2 SE0 (global SE17) pins, SPI mode 0 bit-banged on TLMM GPIO55-58.
@@ -44,8 +44,10 @@
 + * (GPIO122) never toggled in the shim test, so the event buffer is polled.
 + *
 + * Boot-args: sweetnvt=1 enables; sweetnvtdelay=S start delay (default 20 s);
-+ * sweetnvtcsum=1 drops frames with a bad checksum; sweetnvthalfns=N half SPI
-+ * clock. Protocol and download: Linux nt36xxx.c / nt36xxx_fw_update.c (NT36675
++ * sweetnvtcsum=1 drops frames with a bad checksum; sweetnvtfast=0 forces the
++ * slow (barriered) SPI with half clock sweetnvthalfns=N (default 500 ns, also
++ * the fallback when fast SPI fails); sweetnvtpri=P thread priority (60).
++ * Protocol and download: Linux nt36xxx.c / nt36xxx_fw_update.c (NT36675
 + * memory map, hw_crc = 2), verified on the phone with the shim (iOS/touch.md).
 + * No clock, regulator or PMIC writes: bit-bang needs only TLMM, and the IC is
 + * powered with the panel. The firmware is downloaded again on the watchdog
@@ -62,8 +64,9 @@
 +#include <pexpert/pexpert.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
-+/* Mach MIG declaration is not included by BSD's exported thread.h. */
++/* Mach declarations not included by BSD's exported thread.h. */
 +extern kern_return_t thread_terminate(thread_t);
++extern kern_return_t kernel_thread_start_priority(thread_continue_t, void *, integer_t, thread_t *);
 +extern void sweet_hid_touch(int finger, int down, int x, int y);
 +void sweet_nvt_init(void);
 +
@@ -103,8 +106,10 @@
 +#define NVT_FW_MAX      0x40000u
 +#define NVT_X_MAX       1079
 +#define NVT_Y_MAX       2399
-+#define NVT_POLL_MS     10u
++#define NVT_POLL_MS     10u     /* while a finger is down */
++#define NVT_POLL_IDLE_MS 20u
 +#define NVT_RETRY_MS    2000u
++#define NVT_PRIORITY    60      /* below kernel threads and the UI's realtime work, above apps */
 +
 +enum { NVT_POLL_OK, NVT_POLL_SKIP, NVT_POLL_RELOAD };
 +
@@ -116,7 +121,8 @@
 +	vm_offset_t north, south, fw;
 +	uint32_t fw_size;
 +	uint64_t half;          /* half SPI clock period in absolute time */
-+	bool started, dead, csum;
++	uint64_t poll_abs, poll_max, poll_n;    /* time spent reading event frames */
++	bool started, dead, csum, fast;
 +	unsigned nparts, contact_frames, contact_bad_sum;
 +	struct nvt_part parts[NVT_PARTS_MAX];
 +	uint32_t active;
@@ -170,6 +176,32 @@
 +	return (nvt_rd(base, NVT_GPIO_IO(pin)) & 1u) != 0;
 +}
 +
++/*
++ * Clock and data inside a frame. TLMM is mapped Device-nGnRnE, so accesses to
++ * it stay in program order without barriers; the dsb after every write cost
++ * ~2.4 us per bit (shim and first xnu runs: 3.4 us/bit). Fast mode drops the
++ * barriers and the half-period wait, slow mode keeps the verified timing. CS
++ * edges always use the barriered write.
++ */
++static inline void
++nvt_bit_out(unsigned pin, bool high)
++{
++	if (nvt.fast) {
++		*(volatile uint32_t *)(nvt.south + NVT_GPIO_IO(pin)) = high ? 2u : 0u;
++	} else {
++		nvt_pin(nvt.south, pin, high);
++	}
++}
++
++static inline unsigned
++nvt_bit_in(void)
++{
++	if (nvt.fast) {
++		return *(volatile uint32_t *)(nvt.south + NVT_GPIO_IO(NVT_PIN_MISO)) & 1u;
++	}
++	return nvt_pin_in(nvt.south, NVT_PIN_MISO) ? 1u : 0u;
++}
++
 +/* Function 0 (GPIO), 2 mA, no pull. Latch before output enable: CS high, CLK low. */
 +static void
 +nvt_bb_setup(void)
@@ -193,12 +225,16 @@
 +	for (unsigned i = 0; i < n; i++) {
 +		unsigned in = 0;
 +		for (int b = 7; b >= 0; b--) {
-+			nvt_pin(nvt.south, NVT_PIN_MOSI, ((tx[i] >> b) & 1u) != 0);
-+			nvt_spin(nvt.half);
-+			nvt_pin(nvt.south, NVT_PIN_CLK, true);  /* both sides sample on the rising edge */
-+			nvt_spin(nvt.half);
-+			in = (in << 1) | (nvt_pin_in(nvt.south, NVT_PIN_MISO) ? 1u : 0u);
-+			nvt_pin(nvt.south, NVT_PIN_CLK, false);
++			nvt_bit_out(NVT_PIN_MOSI, ((tx[i] >> b) & 1u) != 0);
++			if (nvt.half) {
++				nvt_spin(nvt.half);
++			}
++			nvt_bit_out(NVT_PIN_CLK, true);  /* both sides sample on the rising edge */
++			if (nvt.half) {
++				nvt_spin(nvt.half);
++			}
++			in = (in << 1) | nvt_bit_in();
++			nvt_bit_out(NVT_PIN_CLK, false);
 +		}
 +		if (rx) {
 +			rx[i] = (uint8_t)in;
@@ -573,7 +609,7 @@
 +static void
 +nvt_thread(void *arg, wait_result_t result)
 +{
-+	unsigned delay_s = 20, half_ns = 500, csum = 0, need = 0;
++	unsigned delay_s = 20, half_ns = 500, csum = 0, fast = 1, need = 0;
 +	uint64_t fw_pa = 0;
 +	uint32_t fw_size = 0;
 +	(void)arg;
@@ -581,9 +617,11 @@
 +	(void)PE_parse_boot_argn("sweetnvtdelay", &delay_s, sizeof(delay_s));
 +	(void)PE_parse_boot_argn("sweetnvthalfns", &half_ns, sizeof(half_ns));
 +	(void)PE_parse_boot_argn("sweetnvtcsum", &csum, sizeof(csum));
++	(void)PE_parse_boot_argn("sweetnvtfast", &fast, sizeof(fast));
 +	(void)PE_parse_boot_argn("sweetnvtfw", &fw_pa, sizeof(fw_pa));
 +	(void)PE_parse_boot_argn("sweetnvtfwsz", &fw_size, sizeof(fw_size));
 +	nvt.csum = csum != 0;
++	nvt.fast = fast != 0;
 +	if (!fw_pa || fw_size < 0x1000u || fw_size > NVT_FW_MAX) {
 +		printf("SWEET NVT: no firmware from the shim (sweetnvtfw=%#llx sweetnvtfwsz=%#x)\n",
 +		    fw_pa, fw_size);
@@ -604,10 +642,13 @@
 +	}
 +	printf("SWEET NVT: firmware %#x bytes at %#llx, need %#x, %u partitions\n",
 +	    fw_size, fw_pa, need, nvt.nparts);
-+	nanoseconds_to_absolutetime(half_ns, &nvt.half);
-+	printf("SWEET NVT: TLMM cfg55=%#x rst=%#x; bit-bang SPI, half period %u ns\n",
++	nvt.half = 0;
++	if (!nvt.fast) {
++		nanoseconds_to_absolutetime(half_ns, &nvt.half);
++	}
++	printf("SWEET NVT: TLMM cfg55=%#x rst=%#x; bit-bang SPI, %s\n",
 +	    nvt_rd(nvt.south, NVT_GPIO_CFG(NVT_PIN_MISO)), nvt_rd(nvt.north, NVT_GPIO_IO(NVT_PIN_RST)),
-+	    half_ns);
++	    nvt.fast ? "fast (no barriers)" : "slow");
 +	nvt_bb_setup();
 +
 +	/*
@@ -617,16 +658,29 @@
 +	 */
 +	bool up = false, ever = false;
 +	int last = -1;
-+	unsigned fails = 0, wdt = 0, polls = 0, logged = 0;
++	unsigned fails = 0, wdt = 0, reports = 0, logged = 0;
++	uint64_t t_stat = 0, period;
++	nanoseconds_to_absolutetime(30ull * NSEC_PER_SEC, &period);
 +	while (!nvt.dead) {
 +		if (!up) {
 +			int err = nvt_boot(last != ENXIO);
 +			if (!err) {
-+				printf("SWEET NVT: touch up (poll %u ms, checksum %s)\n", NVT_POLL_MS,
-+				    nvt.csum ? "on" : "off");
++				uint64_t ns;
++				absolutetime_to_nanoseconds(nvt.half, &ns);
++				printf("SWEET NVT: touch up (poll %u/%u ms, checksum %s, SPI %s, half %llu ns)\n",
++				    NVT_POLL_MS, NVT_POLL_IDLE_MS, nvt.csum ? "on" : "off",
++				    nvt.fast ? "fast" : "slow", ns);
 +				up = ever = true;
 +				fails = wdt = 0;
 +				last = 0;
++				t_stat = mach_absolute_time() + period;
++			} else if (!ever && nvt.fast) {
++				/* Trim ID and the CRC-checked download validate the link: fall back to verified timing */
++				printf("SWEET NVT: fast SPI failed (err=%d); falling back to slow SPI, half %u ns\n",
++				    err, half_ns);
++				nvt.fast = false;
++				nanoseconds_to_absolutetime(half_ns, &nvt.half);
++				continue;
 +			} else if (ever || ++fails < NVT_RELOAD_MAX) {
 +				/* After a good boot keep retrying (panel off, ESD); before it, a few tries. */
 +				if (ever && err != last) {
@@ -641,22 +695,44 @@
 +				break;
 +			}
 +		}
-+		if (nvt_poll(&wdt) == NVT_POLL_RELOAD) {
++		uint64_t t0 = mach_absolute_time();
++		int r = nvt_poll(&wdt);
++		uint64_t dt = mach_absolute_time() - t0;
++		nvt.poll_abs += dt;
++		nvt.poll_n++;
++		if (dt > nvt.poll_max) {
++			nvt.poll_max = dt;
++		}
++		if (r == NVT_POLL_RELOAD) {
 +			printf("SWEET NVT: firmware watchdog pattern; reloading\n");
 +			nvt_report(0, nvt.x, nvt.y);
 +			up = false;
 +			continue;
 +		}
-+		/* Every 30 s, if anything was touched: how many contact frames, how many failed the checksum */
-+		if (++polls >= 30000u / NVT_POLL_MS) {
-+			polls = 0;
-+			if (nvt.contact_frames != logged) {
-+				logged = nvt.contact_frames;
-+				printf("SWEET NVT: %u contact frames, %u with a bad checksum\n",
++		/*
++		 * Every 30 s (the first 3 times, then only if something was touched):
++		 * poll cost and contact-frame checksum statistics.
++		 */
++		if (t0 + dt >= t_stat) {
++			t_stat = t0 + dt + period;
++			if (reports < 3 || nvt.contact_frames != logged) {
++				uint64_t busy_ns, avg_ns = 0, max_ns;
++				absolutetime_to_nanoseconds(nvt.poll_abs, &busy_ns);
++				absolutetime_to_nanoseconds(nvt.poll_max, &max_ns);
++				if (nvt.poll_n) {
++					avg_ns = busy_ns / nvt.poll_n;
++				}
++				printf("SWEET NVT: 30 s: %llu polls, avg %llu us, max %llu us, %llu.%llu%% of a core; "
++				    "%u contact frames, %u with a bad checksum\n", nvt.poll_n, avg_ns / 1000,
++				    max_ns / 1000, busy_ns / 300000000ull, busy_ns / 30000000ull % 10,
 +				    nvt.contact_frames, nvt.contact_bad_sum);
++				reports++;
++				logged = nvt.contact_frames;
 +			}
++			nvt.poll_abs = nvt.poll_max = nvt.poll_n = 0;
 +		}
-+		nvt_wait(NVT_POLL_MS);
++		/* Idle: a slower poll; the first touch is seen within NVT_POLL_IDLE_MS. */
++		nvt_wait(nvt.active ? NVT_POLL_MS : NVT_POLL_IDLE_MS);
 +	}
 +	nvt_report(0, nvt.x, nvt.y);
 +out:
@@ -667,17 +743,19 @@
 +void
 +sweet_nvt_init(void)
 +{
-+	int enabled = 0;
++	int enabled = 0, pri = NVT_PRIORITY;
 +	thread_t thread;
 +	if (nvt.started) {
 +		return;
 +	}
 +	nvt.started = true;
 +	(void)PE_parse_boot_argn("sweetnvt", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("sweetnvtpri", &pri, sizeof(pri));
 +	if (!enabled) {
 +		return;
 +	}
-+	kern_return_t kr = kernel_thread_start(nvt_thread, NULL, &thread);
++	/* The bit-bang busy-waits: run below the kernel's own threads (81) so it never preempts them. */
++	kern_return_t kr = kernel_thread_start_priority(nvt_thread, NULL, pri, &thread);
 +	if (kr == KERN_SUCCESS) {
 +		thread_deallocate(thread);
 +	} else {
