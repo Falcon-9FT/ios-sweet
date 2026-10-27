@@ -1,0 +1,100 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5568,6 +5568,46 @@
+  * Note:	The argument and environment vectors are user space pointers
+  *		to arrays of user space pointers.
+  */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET (vayu): boot-arg sweetoslog=NAME[,NAME...] - programs with these file names get
++ * OS_ACTIVITY_DT_MODE=YES and CFLOG_FORCE_STDERR=YES in their environment, so os_log and CFLog
++ * (the "Terminating app due to uncaught exception" reason) also go to standard error; launchd
++ * points that at /dev/null, and sweetnull=NAME (bsd/dev/mem.c) prints it on the console.
++ * After HakiOS applog (oosexgang/hackios-xnu-kernel, exec_applog_oslog, APSL 2.0).
++ */
++static bool
++sweet_oslog_wanted(struct image_params *imgp)
++{
++	static char names[128];
++	static int parsed;
++
++	if (!parsed) {
++		if (!PE_parse_boot_argn("sweetoslog", names, sizeof(names))) {
++			names[0] = 0;
++		}
++		parsed = 1;
++	}
++	if (names[0] == 0 || imgp->ip_ndp == NULL) {
++		return false;
++	}
++	const char *name = imgp->ip_ndp->ni_cnd.cn_nameptr;
++	size_t n = (size_t)imgp->ip_ndp->ni_cnd.cn_namelen;
++	for (const char *t = names; *t;) {
++		const char *end = strchr(t, ',');
++		size_t tl = end ? (size_t)(end - t) : strlen(t);
++		if (tl == n && n > 0 && strncmp(t, name, n) == 0) {
++			return true;
++		}
++		if (!end) {
++			break;
++		}
++		t = end + 1;
++	}
++	return false;
++}
++#endif
++
+ __attribute__((noinline))
+ static int
+ exec_extract_strings(struct image_params *imgp)
+@@ -5741,6 +5781,24 @@
+ 		imgp->ip_envc++;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (sweet_oslog_wanted(imgp)) {
++		static const char *const sweet_vars[] = {"OS_ACTIVITY_DT_MODE=YES", "CFLOG_FORCE_STDERR=YES"};
++		for (unsigned i = 0; i < sizeof(sweet_vars) / sizeof(sweet_vars[0]); i++) {
++			error = exec_add_user_string(imgp, CAST_USER_ADDR_T(sweet_vars[i]), UIO_SYSSPACE, TRUE);
++			if (error) {
++				goto bad;
++			}
++			if (imgp->ip_argspace < new_ptr_size) {
++				error = E2BIG;
++				goto bad;
++			}
++			imgp->ip_argspace -= new_ptr_size;
++			imgp->ip_envc++;
++		}
++	}
++#endif
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -877,6 +877,15 @@
+ 	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
+ 		return;
+ 	}
++	/*
++	 * vayu: DWC_usb31 (GSNPSID 0x3331xxxx; vayu 1.10a). Linux dwc3_core_soft_reset: on DWC_usb31
++	 * 1.80a and older, wait at least 50 ms after CSFTRST clears before touching the PHY domain
++	 * (synchronization delay). Without it the next accesses hung the phone (iOS/runs/full-1).
++	 */
++	if ((dwc_rd(0xc120) >> 16) == 0x3331) {
++		delay(60 * 1000);
++		printf("SWEET USB: DWC_usb31: waited 60 ms after soft reset\n");
++	}
+ 
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+ 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
+@@ -901,6 +910,7 @@
+ 	}
+ 	dwc_wr(DALEPENA, 0x3);
+ 	ud_start_setup();
++	printf("SWEET USB: event buffer, DCFG 0x%08x and endpoint 0 set up\n", dwc_rd(DCFG));
+ 
+ 	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
+ 	if (qs != 0) {
