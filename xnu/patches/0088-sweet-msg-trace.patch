@@ -1,9 +1,9 @@
 --- a/osfmk/ipc/ipc_kmsg.c
 +++ b/osfmk/ipc/ipc_kmsg.c
-@@ -2870,6 +2870,36 @@
+@@ -2869,6 +2869,35 @@
+  *		MACH_SEND_INVALID_DEST	   Caller still has message.
   *      MACH_SEND_INVALID_OPTIONS  Caller still has message.
   */
- mach_msg_return_t
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +/*
 + * SWEET: boot-arg sweetmsgid=N logs who sends Mach message id N and which task holds the
@@ -12,7 +12,6 @@
 + * without the port lock - a diagnostic race - because printf under the port's spinlock is not
 + * safe. At most 50 lines.
 + */
-+extern char *proc_name_address(void *p);
 +static TUNABLE(uint32_t, sweet_msgid, "sweetmsgid", 0);
 +static uint32_t sweet_msgid_logged;
 +
@@ -28,16 +27,16 @@
 +	task_t dst = space != NULL ? space->is_task : TASK_NULL;
 +	void *dp = (dst != TASK_NULL && dst != kernel_task) ? get_bsdtask_info(dst) : NULL;
 +	printf("SWEET MSG: id %d bits %#x size %u from %s to %s (port %p%s)\n", hdr->msgh_id, hdr->msgh_bits,
-+	    hdr->msgh_size, sp ? proc_name_address(sp) : "?",
-+	    dp ? proc_name_address(dp) : (dst == kernel_task ? "kernel" : (space ? "?" : "port not in a space")),
++	    hdr->msgh_size, sp ? proc_name_address((struct proc *)sp) : "?",
++	    dp ? proc_name_address((struct proc *)dp) : (dst == kernel_task ? "kernel" : (space ? "?" : "port not in a space")),
 +	    port, ip_active(port) ? "" : ", dead");
 +}
 +#endif
 +
+ mach_msg_return_t
  ipc_kmsg_send(
  	ipc_kmsg_t              kmsg,
- 	mach_msg_option64_t     option64,
-@@ -2910,6 +2940,9 @@
+@@ -2910,6 +2939,9 @@
  
  	port = hdr->msgh_remote_port;
  	assert(IP_VALID(port));
