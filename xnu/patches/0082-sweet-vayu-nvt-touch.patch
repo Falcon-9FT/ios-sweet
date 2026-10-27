@@ -28,7 +28,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_nvt.c
-@@ -0,0 +1,655 @@
+@@ -0,0 +1,656 @@
 +/*
 + * SWEET vayu (POCO X3 Pro) touch: Novatek NT36672C (TDDI) behind the QUPv3
 + * wrapper 2 SE0 (global SE17) pins, SPI mode 0 bit-banged on TLMM GPIO55-58.
@@ -44,12 +44,12 @@
 + * (GPIO122) never toggled in the shim test, so the event buffer is polled.
 + *
 + * Boot-args: sweetnvt=1 enables; sweetnvtdelay=S start delay (default 20 s);
-+ * sweetnvtcsum=0 skips the event checksum; sweetnvthalfns=N half SPI clock.
-+ * Protocol and download: Linux nt36xxx.c / nt36xxx_fw_update.c (NT36675
++ * sweetnvtcsum=1 drops frames with a bad checksum; sweetnvthalfns=N half SPI
++ * clock. Protocol and download: Linux nt36xxx.c / nt36xxx_fw_update.c (NT36675
 + * memory map, hw_crc = 2), verified on the phone with the shim (iOS/touch.md).
 + * No clock, regulator or PMIC writes: bit-bang needs only TLMM, and the IC is
-+ * powered with the panel. If the panel powers down, the IC loses its firmware;
-+ * the health check notices and the driver downloads it again.
++ * powered with the panel. The firmware is downloaded again on the watchdog
++ * pattern; a panel power cycle is not detected yet.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -117,7 +117,7 @@
 +	uint32_t fw_size;
 +	uint64_t half;          /* half SPI clock period in absolute time */
 +	bool started, dead, csum;
-+	unsigned nparts;
++	unsigned nparts, contact_frames, contact_bad_sum;
 +	struct nvt_part parts[NVT_PARTS_MAX];
 +	uint32_t active;
 +	int x[NVT_FINGERS], y[NVT_FINGERS];
@@ -453,8 +453,15 @@
 +		    rs, ns / NSEC_PER_MSEC);
 +		return EIO;
 +	}
-+	nvt_set_page(NVT_EVENT | NVT_EV_FWINFO);  /* nvt_get_fw_info */
-+	nvt_read(NVT_EV_FWINFO, info, sizeof(info));
++	/* nvt_get_fw_info, retried like Linux: the fw may fill it a little after the reset state */
++	for (unsigned tries = 0; tries < 10; tries++) {
++		nvt_set_page(NVT_EVENT | NVT_EV_FWINFO);
++		nvt_read(NVT_EV_FWINFO, info, sizeof(info));
++		if ((uint8_t)(info[0] + info[1]) == 0xff) {
++			break;
++		}
++		nvt_wait(10);
++	}
 +	nvt_set_page(NVT_EVENT | NVT_EV_PID);
 +	nvt_read(NVT_EV_PID, pid, sizeof(pid));
 +	nvt_set_page(NVT_EVENT);
@@ -467,17 +474,6 @@
 +	    ns / NSEC_PER_MSEC, info[2], info[3], (unsigned)info[4] << 8 | info[5],
 +	    (unsigned)info[6] << 8 | info[7], (unsigned)pid[1] << 8 | pid[0]);
 +	return 0;
-+}
-+
-+/* Firmware still running: fw info and its complement (Linux nvt_get_fw_info check). */
-+static bool
-+nvt_alive(void)
-+{
-+	uint8_t v[2];
-+	nvt_set_page(NVT_EVENT | NVT_EV_FWINFO);
-+	nvt_read(NVT_EV_FWINFO, v, sizeof(v));
-+	nvt_set_page(NVT_EVENT);
-+	return (uint8_t)(v[0] + v[1]) == 0xff;
 +}
 +
 +static void
@@ -502,11 +498,14 @@
 + * nvt_ts_work_func on the polled event buffer. Record i at 6*i: id = b0 >> 3
 + * (1..10), b0 & 7 = 1 down / 2 move, x = b1 << 4 | b3 >> 4, y = b2 << 4 | b3 & 15.
 + * Idle frames (id 0) carry no contacts. *wdt counts watchdog frames in a row.
++ * Linux checks the frame checksum, but it only reads the buffer on an interrupt;
++ * polled idle frames never sum to zero (phone, 27.10.2026), so here the check
++ * is opt-in and otherwise only counted on frames with contacts.
 + */
 +static int
-+nvt_poll(unsigned *wdt, unsigned *bad_sum)
++nvt_poll(unsigned *wdt)
 +{
-+	uint8_t ev[NVT_POINTS];
++	uint8_t ev[NVT_POINTS], sum = 0;
 +	int x[NVT_FINGERS] = {0}, y[NVT_FINGERS] = {0};
 +	uint32_t mask = 0;
 +	bool fd = true, esd = true;
@@ -523,19 +522,8 @@
 +	if (esd) {
 +		return NVT_POLL_SKIP;   /* nvt_fw_recovery pattern: not a report */
 +	}
-+	if (nvt.csum) {
-+		/* nvt_ts_point_data_checksum: the 65 bytes sum to zero */
-+		uint8_t sum = 0;
-+		for (unsigned i = 0; i < NVT_POINTS; i++) {
-+			sum += ev[i];
-+		}
-+		if (sum) {
-+			if ((*bad_sum)++ < 5) {
-+				printf("SWEET NVT: event checksum %#x: %02x %02x %02x %02x %02x %02x\n",
-+				    sum, ev[0], ev[1], ev[2], ev[3], ev[4], ev[5]);
-+			}
-+			return NVT_POLL_SKIP;
-+		}
++	for (unsigned i = 0; i < NVT_POINTS; i++) {
++		sum += ev[i];   /* nvt_ts_point_data_checksum: the 65 bytes sum to zero */
 +	}
 +	for (unsigned i = 0; i < NVT_FINGERS; i++) {
 +		const uint8_t *p = ev + 6 * i;
@@ -551,6 +539,17 @@
 +		mask |= 1u << (fid - 1);
 +		x[fid - 1] = px;
 +		y[fid - 1] = py;
++	}
++	if (mask) {
++		nvt.contact_frames++;
++		nvt.contact_bad_sum += sum != 0;
++		if (nvt.contact_frames <= 8) {
++			printf("SWEET NVT: contact frame %02x %02x %02x %02x %02x %02x mask %#x, checksum %s\n",
++			    ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], mask, sum ? "bad" : "ok");
++		}
++	}
++	if (nvt.csum && sum) {
++		return NVT_POLL_SKIP;
 +	}
 +	nvt_report(mask, x, y);
 +	return NVT_POLL_OK;
@@ -574,7 +573,7 @@
 +static void
 +nvt_thread(void *arg, wait_result_t result)
 +{
-+	unsigned delay_s = 20, half_ns = 500, csum = 1, need = 0;
++	unsigned delay_s = 20, half_ns = 500, csum = 0, need = 0;
 +	uint64_t fw_pa = 0;
 +	uint32_t fw_size = 0;
 +	(void)arg;
@@ -611,9 +610,14 @@
 +	    half_ns);
 +	nvt_bb_setup();
 +
++	/*
++	 * No periodic fw-info health check: on the phone 0x22D78 stops reading back
++	 * the fw info while the fw runs (27.10.2026), which looked like a lost
++	 * firmware and forced needless reloads. Reload only on the watchdog pattern.
++	 */
 +	bool up = false, ever = false;
 +	int last = -1;
-+	unsigned fails = 0, wdt = 0, bad_sum = 0, idle = 0, lost = 0;
++	unsigned fails = 0, wdt = 0, polls = 0, logged = 0;
 +	while (!nvt.dead) {
 +		if (!up) {
 +			int err = nvt_boot(last != ENXIO);
@@ -621,11 +625,12 @@
 +				printf("SWEET NVT: touch up (poll %u ms, checksum %s)\n", NVT_POLL_MS,
 +				    nvt.csum ? "on" : "off");
 +				up = ever = true;
-+				fails = wdt = idle = lost = 0;
-+			} else if ((ever && err == ENXIO) || ++fails < NVT_RELOAD_MAX) {
-+				/* Panel off after a good boot: retry until it powers up again. */
-+				if (err == ENXIO && last != ENXIO && ever) {
-+					printf("SWEET NVT: IC silent, retrying every %u ms\n", NVT_RETRY_MS);
++				fails = wdt = 0;
++				last = 0;
++			} else if (ever || ++fails < NVT_RELOAD_MAX) {
++				/* After a good boot keep retrying (panel off, ESD); before it, a few tries. */
++				if (ever && err != last) {
++					printf("SWEET NVT: reload failed (err=%d), retrying every %u ms\n", err, NVT_RETRY_MS);
 +				}
 +				last = err;
 +				nvt_wait(NVT_RETRY_MS);
@@ -635,24 +640,20 @@
 +				nvt.dead = true;
 +				break;
 +			}
-+			last = err;
 +		}
-+		int r = nvt_poll(&wdt, &bad_sum);
-+		if (r == NVT_POLL_RELOAD) {
++		if (nvt_poll(&wdt) == NVT_POLL_RELOAD) {
 +			printf("SWEET NVT: firmware watchdog pattern; reloading\n");
 +			nvt_report(0, nvt.x, nvt.y);
 +			up = false;
 +			continue;
 +		}
-+		/* Once a second without contacts: did the IC lose its firmware (panel power-off, ESD)? */
-+		if (!nvt.active && ++idle >= 1000u / NVT_POLL_MS) {
-+			idle = 0;
-+			if (nvt_alive()) {
-+				lost = 0;
-+			} else if (++lost >= 3) {
-+				printf("SWEET NVT: firmware gone; reloading\n");
-+				up = false;
-+				continue;
++		/* Every 30 s, if anything was touched: how many contact frames, how many failed the checksum */
++		if (++polls >= 30000u / NVT_POLL_MS) {
++			polls = 0;
++			if (nvt.contact_frames != logged) {
++				logged = nvt.contact_frames;
++				printf("SWEET NVT: %u contact frames, %u with a bad checksum\n",
++				    nvt.contact_frames, nvt.contact_bad_sum);
 +			}
 +		}
 +		nvt_wait(NVT_POLL_MS);
