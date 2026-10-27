@@ -74,6 +74,71 @@ static int magic_ok(const char *m)
 	return 1;
 }
 
+static uint32_t le32_at(const volatile uint8_t *p)
+{
+	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+/* Append " name=0x<hex>" to the NUL-terminated command line; 0 if it does not fit. */
+static int cmdline_add_hex(volatile char *cmd, const char *name, uint64_t v)
+{
+	char buf[48];
+	int n = 0, len = 0, digits = 1;
+	while (digits < 16 && (v >> (4 * digits)))
+		digits++;
+	buf[n++] = ' ';
+	while (*name)
+		buf[n++] = *name++;
+	buf[n++] = '=';
+	buf[n++] = '0';
+	buf[n++] = 'x';
+	for (int i = digits - 1; i >= 0; i--)
+		buf[n++] = "0123456789abcdef"[(v >> (4 * i)) & 0xf];
+	while (len < BOOT_LINE_LENGTH && cmd[len])
+		len++;
+	if (len + n >= BOOT_LINE_LENGTH)
+		return 0;
+	for (int i = 0; i < n; i++)
+		cmd[len + i] = buf[i];
+	cmd[len + n] = 0;
+	return 1;
+}
+
+/*
+ * vayu touch firmware for sweet_nvt.c: build-payload.sh (NVTFW=) appends the
+ * blob and a 16-byte trailer "SWEETNVT", u32 offset from the ramdisk start,
+ * u32 size, all 16-aligned from the ramdisk start. The ramdisk lies outside
+ * xnu's RAM window, so the blob stays where ABL put it; pass its address.
+ * The trailer is searched in the last 64 KiB in case the end is rounded up.
+ */
+static void nvt_fw_args(volatile char *cmd, uint64_t rd_start, uint64_t rd_end)
+{
+	static const char magic[] = "SWEETNVT";
+	uint64_t len = rd_end - rd_start;
+	if (len < 0x1010)
+		return;
+	for (uint64_t t = (len - 16) & ~15UL; t + 0x10000 > len && t >= 0x1000; t -= 16) {
+		const volatile uint8_t *p = (const volatile uint8_t *)(rd_start + t);
+		int ok = 1;
+		for (int i = 0; i < 8; i++)
+			ok &= p[i] == (uint8_t)magic[i];
+		if (!ok)
+			continue;
+		uint32_t off = le32_at(p + 8), size = le32_at(p + 12);
+		if (off > t || size > t - off) {
+			con_hex2("NVTFW", "bad off=", off, "size=", size);
+			return;
+		}
+		con_hex("NVTFW pa", rd_start + off);
+		if (!cmdline_add_hex(cmd, "sweetnvtfw", rd_start + off) ||
+		    !cmdline_add_hex(cmd, "sweetnvtfwsz", size))
+			con_str("NVTFW", "command line full: not passed");
+		else
+			con_hex2("NVTFW", "size=", size, "at=", (uint32_t)t);
+		return;
+	}
+}
+
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
 const char *loader_boot(uintptr_t dtb)
@@ -133,6 +198,8 @@ const char *loader_boot(uintptr_t dtb)
 	ba->deviceTreeLength = (uint32_t)p->adt_size;
 	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
 		ba->CommandLine[i] = p->cmdline[i];
+	ba->CommandLine[BOOT_LINE_LENGTH - 1] = 0;
+	nvt_fw_args(ba->CommandLine, rd_start, rd_end);
 	ba->memSizeActual = p->mem_size;
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
 
