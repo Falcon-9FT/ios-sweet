@@ -28,7 +28,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_cpufreq.c
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,231 @@
 +/*
 + * SWEET vayu (SM8150/SM8150-AC): CPU clocks. The OSM (Operating State Manager) of each
 + * frequency domain picks the clock and voltage of its cores from a lookup table; the OS
@@ -44,8 +44,12 @@
 + *   2 request the highest row of every domain;
 + *   4 measure each CPU's clock (dependent adds per counter tick on that CPU, 1 add/cycle on A55
 + *     and A76, thread bound to it, interrupts off for 2 ms) - before and after 2.
++ *   8 every 30 s (first 5 times) log each domain's clock from the OSM's own cycle counters
++ *     (per core, 0x9c0 + 4*n, downstream clk-cpu-osm OSM_CYCLE_COUNTER_STATUS_REG v2): read
++ *     twice 100 ms apart from an ordinary thread, so nothing is bound or masked. The counters
++ *     only run while a core is clocked, so an idle domain reads low; the busiest core is shown.
 + * With 4 (alone or with 1) the disk stopped writing right after boot on the phone (iOS/apps.md),
-+ * so it is a separate, opt-in test; 3 is the setting meant for use.
++ * so it is a separate, opt-in test; 3 (or 11 with the counters) is the setting meant for use.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -67,6 +71,7 @@
 +#define CF_ROW          32u
 +#define CF_ROWS         40u
 +#define CF_PERF_STATE   0x920u
++#define CF_CYCLES(n)    (0x9c0u + 4u * (n))     /* per-core cycle counter, 32 bits */
 +#define CF_XO_KHZ       19200u
 +#define CF_ALT_KHZ      300000u         /* LUT source 0: the 300 MHz GPLL0 path */
 +
@@ -199,6 +204,37 @@
 +			delay(10 * 1000);
 +			cf_measure_all("after max");
 +		}
++	}
++	for (unsigned round = 0; (mode & 8) && round < 5; round++) {
++		static int cf_chan;
++		uint64_t deadline;
++		uint32_t c0[CF_NDOM][4], c1[CF_NDOM][4];
++		unsigned mhz[CF_NDOM];
++		clock_interval_to_deadline(round ? 30000 : 5000, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&cf_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++		uint64_t t0 = cf_ticks();
++		for (unsigned d = 0; d < CF_NDOM; d++) {
++			for (int n = 0; n < cf_dom[d].ncpu; n++) {
++				c0[d][n] = cf_rd(base[d], CF_CYCLES(n));
++			}
++		}
++		clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&cf_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++		uint64_t dt = cf_ticks() - t0;
++		for (unsigned d = 0; d < CF_NDOM; d++) {
++			uint32_t best = 0;
++			for (int n = 0; n < cf_dom[d].ncpu; n++) {
++				c1[d][n] = cf_rd(base[d], CF_CYCLES(n));
++				uint32_t delta = c1[d][n] - c0[d][n];
++				best = delta > best ? delta : best;
++			}
++			/* cycles per counter tick * 19.2 MHz */
++			mhz[d] = dt ? (unsigned)((uint64_t)best * CF_XO_KHZ / dt / 1000u) : 0;
++		}
++		printf("SWEET CPUFREQ: OSM cycle counters, busiest core per domain: A55 %u, A76 %u, A76 prime %u MHz\n",
++		    mhz[0], mhz[1], mhz[2]);
 +	}
 +out:
 +	(void)thread_terminate(current_thread());
