@@ -28,7 +28,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_adreno.c
-@@ -0,0 +1,307 @@
+@@ -0,0 +1,315 @@
 +/*
 + * SWEET vayu (SM8150, Adreno 640): GPU bring-up, milestone 1 - is the GPU block reachable.
 + * Steps after HakiOS hakios.adreno.c (oosexgang/hackios-xnu-kernel, APSL 2.0, steps 1-6 and 11),
@@ -234,10 +234,13 @@
 +
 +	announce(2, "GCC: vote GPLL0 for the GPU, enable cfg-ahb, memnoc, snoc-dvm, ddrss-axi");
 +	wr(gcc, GCC_APCS_VOTE2, rd(gcc, GCC_APCS_VOTE2) | (1u << 15) | (1u << 16));
-+	/* every clock is tried even if an earlier one did not come up: the log then shows all of them */
++	/*
++	 * memnoc-gfx and snoc-dvm-gfx feed the GPU's power domain and stay CLK_OFF until the CX GDSC
++	 * is up (phone, iOS/runs/gpu-1); they are enabled here and checked again after step 3.
++	 */
 +	bool ok = branch_on(gcc, GCC_GPU_CFG_AHB, "gcc_gpu_cfg_ahb");
-+	ok = branch_on(gcc, GCC_GPU_MEMNOC_GFX, "gcc_gpu_memnoc_gfx") && ok;
-+	ok = branch_on(gcc, GCC_GPU_SNOC_DVM_GFX, "gcc_gpu_snoc_dvm_gfx") && ok;
++	(void)branch_on(gcc, GCC_GPU_MEMNOC_GFX, "gcc_gpu_memnoc_gfx");
++	(void)branch_on(gcc, GCC_GPU_SNOC_DVM_GFX, "gcc_gpu_snoc_dvm_gfx");
 +	ok = branch_on(gcc, GCC_DDRSS_GPU_AXI, "gcc_ddrss_gpu_axi") && ok;
 +	dump_clocks();
 +	if (!ok || last < 3) {
@@ -258,6 +261,11 @@
 +		}
 +		printf("SWEET GPU: CX GDSC %s (%#x)\n", (g & GDSC_PWR_ON) ? "ON" : "DID NOT POWER UP", g);
 +		ok = ok && (g & GDSC_PWR_ON) != 0;
++	}
++	if (ok) {
++		ok = branch_on(gcc, GCC_GPU_MEMNOC_GFX, "gcc_gpu_memnoc_gfx (CX on)");
++		ok = branch_on(gcc, GCC_GPU_SNOC_DVM_GFX, "gcc_gpu_snoc_dvm_gfx (CX on)") && ok;
++		dump_clocks();
 +	}
 +	if (!ok || last < 4) {
 +		goto out;
