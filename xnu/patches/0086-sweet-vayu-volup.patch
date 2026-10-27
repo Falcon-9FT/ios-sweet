@@ -1,0 +1,18 @@
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -152,7 +152,14 @@
+ 		return;
+ 	}
+ 	keys_pon_apid = keys_find_apid(0x008, count);
+-	keys_gpio_apid = keys_find_apid(0x4c1, count);
++	/*
++	 * Volume up: sweet PM6150L GPIO2 (SID 4, peripheral 0xc1). vayu has it on PM8150 GPIO6
++	 * (SID 0, peripheral 0xc5): boot-arg sweetvolup=0x0c5. Only the register offsets inside
++	 * the peripheral are used below, so they stay the same.
++	 */
++	uint32_t volup_ppid = 0x4c1;
++	(void)PE_parse_boot_argn("sweetvolup", &volup_ppid, sizeof(volup_ppid));
++	keys_gpio_apid = keys_find_apid((uint16_t)volup_ppid, count);
+ 	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
+ 	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+ 	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
