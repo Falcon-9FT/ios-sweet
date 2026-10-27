@@ -1,0 +1,67 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -367,6 +367,55 @@
+ 
+ static mac_policy_handle_t sweet_amfi_mac_handle;
+ 
++/*
++ * Policy "AMFI": what dyld and libamfi ask the AMFI kext with __mac_syscall("AMFI", ...). The
++ * policy above is named "SWEET AMFI", so without this one those calls fail with ENOPOLICY and
++ * dyld takes its restricted defaults: no @rpath/@executable_path expansion, and applications
++ * with their own embedded frameworks cannot start (Podcasts -> NowPlayingUI.framework: "security
++ * policy does not allow @ path expansion", vayu). After HakiOS kern_minimac.c (APSL 2.0):
++ *   0x5a check dyld policy: { flags in, pointer to flags out } - everything allowed (0xff);
++ *   0x60 query boot-arg state: AMFI not enforcing (0x86), so ExtensionKit reads the table of
++ *        extension points without asking AMFI's IOKit service, which does not exist here
++ *        (otherwise LaunchServices knows no extension point and refuses every app extension).
++ */
++#define SWEET_AMFI_CHECK_DYLD_POLICY    0x5a
++#define SWEET_AMFI_QUERY_BOOTARG_STATE  0x60
++
++static int
++sweet_amfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
++{
++	struct {
++		uint64_t input_flags;
++		user_addr_t output_flags;
++	} args;
++	uint64_t flags = 0xffULL, state = 0x86ULL;
++	int error;
++
++	if (call == SWEET_AMFI_QUERY_BOOTARG_STATE) {
++		return copyout(&state, arg, sizeof(state));
++	}
++	if (call != SWEET_AMFI_CHECK_DYLD_POLICY) {
++		return ENOPOLICY;
++	}
++	error = copyin(arg, &args, sizeof(args));
++	if (error == 0) {
++		error = copyout(&flags, args.output_flags, sizeof(flags));
++	}
++	return error;
++}
++
++static const struct mac_policy_ops sweet_amfi_syscall_ops = {
++	.mpo_policy_syscall = sweet_amfi_syscall,
++};
++
++static struct mac_policy_conf sweet_amfi_syscall_conf = {
++	.mpc_name = "AMFI",
++	.mpc_fullname = "SWEET answers to dyld and libamfi",
++	.mpc_ops = &sweet_amfi_syscall_ops,
++};
++
++static mac_policy_handle_t sweet_amfi_syscall_handle;
++
+ /* Called from bsd_init once MAC policies can register, before any exec. */
+ void sweet_amfi_policy_register(void);
+ 
+@@ -379,5 +428,8 @@
+ 	error = mac_policy_register(&sweet_sandbox_mac_conf, &sweet_sandbox_mac_handle, NULL);
+ 	printf("SWEET Sandbox: permissive policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
++	error = mac_policy_register(&sweet_amfi_syscall_conf, &sweet_amfi_syscall_handle, NULL);
++	printf("SWEET AMFI: \"AMFI\" dyld/boot-arg answers %s (%d)\n",
++	    error ? "NOT registered" : "registered", error);
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

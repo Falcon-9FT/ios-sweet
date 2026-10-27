@@ -28,7 +28,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_cpufreq.c
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,195 @@
 +/*
 + * SWEET vayu (SM8150/SM8150-AC): CPU clocks. The OSM (Operating State Manager) of each
 + * frequency domain picks the clock and voltage of its cores from a lookup table; the OS
@@ -37,11 +37,15 @@
 + * cpu0-3), 0x18325800 (A76, cpu4-6), 0x18327800 (A76 prime, cpu7)). Nothing here sets
 + * voltages: the OSM and its CPR do, and LMh (qcom,limits-dcvs) still throttles in hardware.
 + *
-+ * Without a cpufreq driver the cores stay at whatever state ABL left. Boot-arg sweetcpufreq:
-+ *   0 off; 1 (default) report: the table, the requested state and each CPU's measured clock;
-+ *   2 also request the highest row of every domain, then measure again.
-+ * A clock is measured as dependent adds per counter tick on that CPU (1 add/cycle on A55
-+ * and A76), with interrupts off for 2 ms.
++ * Without a cpufreq driver the cores stay at whatever state ABL left (vayu: A55 at row 15 of 18,
++ * 1632 MHz; both A76 domains at row 0, 710 and 825 MHz). Boot-arg sweetcpufreq is a bit mask,
++ * default 0 (off):
++ *   1 report each table and requested row;
++ *   2 request the highest row of every domain;
++ *   4 measure each CPU's clock (dependent adds per counter tick on that CPU, 1 add/cycle on A55
++ *     and A76, thread bound to it, interrupts off for 2 ms) - before and after 2.
++ * With 4 (alone or with 1) the disk stopped writing right after boot on the phone (iOS/apps.md),
++ * so it is a separate, opt-in test; 3 is the setting meant for use.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -175,20 +179,26 @@
 +		}
 +		rows[d] = cf_lut(base[d], khz[d]);
 +		uint32_t st = cf_rd(base[d], CF_PERF_STATE);
-+		printf("SWEET CPUFREQ: %s (cpu%d-%d): %u rows %u-%u MHz, enable %#x, requested row %u (%u MHz)\n",
-+		    cf_dom[d].name, cf_dom[d].first_cpu, cf_dom[d].first_cpu + cf_dom[d].ncpu - 1, rows[d],
-+		    khz[d][0] / 1000, khz[d][rows[d] - 1] / 1000, cf_rd(base[d], 0), st,
-+		    st < rows[d] ? khz[d][st] / 1000 : 0);
++		if (mode & 1) {
++			printf("SWEET CPUFREQ: %s (cpu%d-%d): %u rows %u-%u MHz, enable %#x, requested row %u (%u MHz)\n",
++			    cf_dom[d].name, cf_dom[d].first_cpu, cf_dom[d].first_cpu + cf_dom[d].ncpu - 1, rows[d],
++			    khz[d][0] / 1000, khz[d][rows[d] - 1] / 1000, cf_rd(base[d], 0), st,
++			    st < rows[d] ? khz[d][st] / 1000 : 0);
++		}
 +	}
-+	cf_measure_all("measured");
-+	if (mode >= 2) {
++	if (mode & 4) {
++		cf_measure_all("measured");
++	}
++	if (mode & 2) {
 +		for (unsigned d = 0; d < CF_NDOM; d++) {
 +			cf_wr(base[d], CF_PERF_STATE, rows[d] - 1);
 +			printf("SWEET CPUFREQ: %s: requested row %u (%u MHz), reads back %u\n", cf_dom[d].name,
 +			    rows[d] - 1, khz[d][rows[d] - 1] / 1000, cf_rd(base[d], CF_PERF_STATE));
 +		}
-+		delay(10 * 1000);
-+		cf_measure_all("after max");
++		if (mode & 4) {
++			delay(10 * 1000);
++			cf_measure_all("after max");
++		}
 +	}
 +out:
 +	(void)thread_terminate(current_thread());
@@ -199,7 +209,7 @@
 +sweet_cpufreq_init(void)
 +{
 +	static bool started;
-+	int mode = 1;
++	int mode = 0;
 +	thread_t thread;
 +	if (started) {
 +		return;
