@@ -1,0 +1,208 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -38,6 +38,31 @@
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ 
++/*
++ * vayu: the vsync timer follows the panel. The ABL leaves a DSI video-mode interface running
++ * that reads this framebuffer by itself; a copy at a random moment of its scan shows a tear
++ * (half old, half new frame). Its timing engine (SDE INTF, dt qcom,mdss_mdp@ae00000
++ * qcom,sde-intf-off 0x6b800 / 0x6c000 for the two DSI ports; registers as kernel
++ * sde_hw_intf.c) counts the lines of each frame from the vsync pulse: the active area is
++ * [DISPLAY_V_START, DISPLAY_V_END] in pixel clocks / HSYNC period. The timer is aimed at the
++ * start of vertical blanking and, before a panel copy, waits there by the line counter: the copy
++ * (a few ms) then runs ahead of the scan (16.7 ms at 60 Hz) and the panel never shows a tear.
++ * CoreAnimation's vsync notification is sent at the same moment. Boot-arg sweetfb_vsync=0 keeps
++ * the free-running 60 Hz timer; without a running interface it is kept too.
++ */
++extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++#define SWEET_INTF_BLOCK_PA     0x0ae6b000u     /* page with INTF_1 at +0x800; INTF_2 is the next page */
++#define SWEET_INTF_TIMING_EN    0x000u
++#define SWEET_INTF_HSYNC_CTL    0x008u
++#define SWEET_INTF_VSYNC_PERIOD 0x00cu
++#define SWEET_INTF_V_START      0x01cu
++#define SWEET_INTF_V_END        0x024u
++#define SWEET_INTF_COUNT_EN     0x0a8u
++#define SWEET_INTF_FRAME_COUNT  0x0acu
++#define SWEET_INTF_LINE_COUNT   0x0b0u
++#define SWEET_VSYNC_SPIN_US     1500    /* closer than this to blanking: wait by spinning */
++#define SWEET_VSYNC_EARLY_US    300     /* timer aimed this much before blanking */
++
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+@@ -116,8 +141,17 @@
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	volatile uint32_t *fIntf;     /* running DSI timing engine, or NULL: free-running timer */
++	uint32_t      fVTotal, fActStart, fActEnd;   /* lines per frame, active area [start, end) */
++	uint64_t      fLineAbs;       /* mach time of one line */
++	uint64_t      fLateTicks;     /* ticks that missed the blanking: no copy on them */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void setupVsync(void);
++	uint32_t line(void) { return fIntf[SWEET_INTF_LINE_COUNT / 4]; }
++	bool inBlank(uint32_t l) { return l >= fActEnd || l < fActStart; }
++	bool waitBlank(void);
++	void scheduleNext(IOTimerEventSource *sender);
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+@@ -195,7 +229,8 @@
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+-	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	setupVsync();
++	scheduleNext(fVsync);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -206,10 +241,111 @@
+ 	return true;
+ }
+ 
++/* Find the DSI interface the ABL left scanning, its frame geometry and refresh; else fIntf stays NULL. */
++void
++AppleCLCD::setupVsync(void)
++{
++	uint32_t on = 1;
++	PE_parse_boot_argn("sweetfb_vsync", &on, sizeof(on));
++	vm_offset_t block = on ? ml_io_map(SWEET_INTF_BLOCK_PA, 0x2000) : 0;
++	if (block == 0) {
++		return;
++	}
++	volatile uint32_t *intf = NULL;
++	for (uint32_t off = 0x800; off <= 0x1000 && intf == NULL; off += 0x800) {
++		volatile uint32_t *r = (volatile uint32_t *)(block + off);
++		if (r[SWEET_INTF_TIMING_EN / 4] & 1) {
++			intf = r;
++		}
++	}
++	if (intf == NULL) {
++		IOLog("SWEET FB: no DSI timing engine running: free-running vsync timer\n");
++		return;
++	}
++	uint32_t hperiod = intf[SWEET_INTF_HSYNC_CTL / 4] & 0xffff;
++	uint32_t vperiod = intf[SWEET_INTF_VSYNC_PERIOD / 4];
++	uint32_t vstart = intf[SWEET_INTF_V_START / 4], vend = intf[SWEET_INTF_V_END / 4];
++	if (hperiod == 0) {
++		return;
++	}
++	if ((intf[SWEET_INTF_COUNT_EN / 4] & 3) != 3) {
++		intf[SWEET_INTF_COUNT_EN / 4] = 3;      /* sde_hw_intf_enable_timing: frame and line counters */
++		IODelay(50000);
++	}
++	uint32_t f0 = intf[SWEET_INTF_FRAME_COUNT / 4];
++	uint64_t t0 = mach_absolute_time();
++	IOSleep(200);
++	uint32_t f1 = intf[SWEET_INTF_FRAME_COUNT / 4];
++	uint64_t t1 = mach_absolute_time(), ns = 0;
++	uint32_t vtotal = vperiod / hperiod, frames = f1 - f0;
++	absolutetime_to_nanoseconds(t1 - t0, &ns);
++	uint32_t mhz = frames ? (uint32_t)(frames * 1000000000ull * 1000 / ns) : 0;        /* refresh in mHz */
++	IOLog("SWEET FB: DSI interface at %#x: hsync period %u, %u lines, active %u..%u, %u frames in %llu us "
++	    "(%u.%03u Hz), line now %u\n", SWEET_INTF_BLOCK_PA + (uint32_t)((vm_offset_t)intf - block), hperiod, vtotal,
++	    vstart / hperiod, (vend + 1) / hperiod, frames, ns / 1000, mhz / 1000, mhz % 1000, intf[SWEET_INTF_LINE_COUNT / 4]);
++	if (vtotal < fHeight || vtotal > 2 * fHeight || mhz < 20000 || mhz > 150000) {
++		IOLog("SWEET FB: implausible timing: free-running vsync timer\n");
++		return;
++	}
++	fVTotal = vtotal;
++	fActStart = vstart / hperiod;
++	fActEnd = (vend + 1) / hperiod;
++	fLineAbs = (t1 - t0) / frames / vtotal;
++	fIntf = intf;
++}
++
++/*
++ * True once the scan is in vertical blanking: spins if that is near, false if this tick came
++ * late and the blanking has passed (no waiting through a whole frame; the copy waits a tick).
++ */
++bool
++AppleCLCD::waitBlank(void)
++{
++	uint32_t l = line();
++	uint64_t spin;
++	nanoseconds_to_absolutetime(SWEET_VSYNC_SPIN_US * 1000ull, &spin);
++	if (inBlank(l)) {
++		return true;
++	}
++	if ((uint64_t)(fActEnd - l) * fLineAbs > spin) {
++		return false;
++	}
++	uint64_t end = mach_absolute_time() + spin;
++	while (!inBlank(line())) {
++		if (mach_absolute_time() > end) {
++			return false;
++		}
++	}
++	return true;
++}
++
++/* The next tick: at the start of the coming blanking (a little early), else 60 Hz. */
++void
++AppleCLCD::scheduleNext(IOTimerEventSource *sender)
++{
++	if (fIntf == NULL) {
++		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		return;
++	}
++	uint32_t l = line();
++	uint32_t lines = (fActEnd + fVTotal - l) % fVTotal;
++	uint64_t wait = (uint64_t)lines * fLineAbs, early, minimum;
++	nanoseconds_to_absolutetime(SWEET_VSYNC_EARLY_US * 1000ull, &early);
++	nanoseconds_to_absolutetime(SWEET_VSYNC_SPIN_US * 1000ull, &minimum);
++	if (wait < minimum) {
++		wait += (uint64_t)fVTotal * fLineAbs;   /* this blanking is (nearly) here: aim at the next */
++	}
++	AbsoluteTime interval, leeway;
++	interval = wait - early;
++	nanoseconds_to_absolutetime(100 * 1000ull, &leeway);
++	sender->setTimeout(kIOTimeOptionsWithLeeway, interval, leeway);
++}
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
++	bool blank = fb->fIntf == NULL || fb->waitBlank();
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
+ 	uint64_t values[6] = {
+@@ -239,10 +375,13 @@
+ 				}
+ 			}
+ 		}
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		fb->scheduleNext(sender);
+ 		return;
+ 	}
+-	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
++	bool flush = fb->fDirty && blank && (count % fb->fFlushTicks) == 0;
++	if (!blank) {
++		fb->fLateTicks++;
++	}
+ 	uint8_t *rec = NULL;
+ 	if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+@@ -256,7 +395,7 @@
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	fb->scheduleNext(sender);
+ }
+ 
+ void
+@@ -304,7 +443,7 @@
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+-		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
++		IOLog("SWEET FB: %llu swaps, %llu vsync ticks, %llu late\n", sweet_fb_swap_count, fVsyncCount, fLateTicks);
+ 	}
+ }
+ 
