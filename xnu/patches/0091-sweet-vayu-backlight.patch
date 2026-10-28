@@ -1,0 +1,224 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,7 @@
+ bsd/dev/sweet_nvt.c			standard
+ bsd/dev/sweet_cpufreq.c		standard
+ bsd/dev/sweet_adreno.c			standard
++bsd/dev/sweet_backlight.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- /dev/null
++++ b/bsd/dev/sweet_backlight.c
+@@ -0,0 +1,211 @@
++/*
++ * SWEET vayu: LCD backlight - the PM8150L WLED (vendor dtbo qcom,wled@d800 on pm8150l@5:
++ * wled-ctrl-base 0xd800, wled-sink-base 0xd900, SPMI SID 5; panels j20s 36 02 0a / 42 02 0b,
++ * bl_ctrl_wled, 12-bit levels 1..0xfff). Registers and sequences as the vendor 4.14 kernel's
++ * drivers/video/backlight/qcom-spmi-wled.c for WLED_PM8150L ("wled5"):
++ *   ctrl 0x46 MOD_ENABLE bit 7, ctrl 0xef PBUS_WRITE_SYNC_CTL (0 on, 3 off: HFRC forced off),
++ *   sink 0xb6 FLASH_SHDN_CLR written 0 after enabling
++ *   sink 0x53/0x54 MOD_A brightness LSB/MSB (12 bits), sink 0x65 bit 0 sync MOD_A, then clear
++ * Without it "display off" only drew black under a lit backlight. sweet_bl_* are used by
++ * SweetFramebuffer (patch 0091) to fade the backlight out and switch the WLED off, and back.
++ *
++ * SPMI (PMIC arbiter v5, dt qcom,spmi-pmic-arb: chnls 0xc600000, obsrvr 0xe600000, cnfg
++ * 0xc40a000, ee 0): reads go through the observer channel like sweet_spmi.c, writes through
++ * the peripheral's own channel at chnls + 0x10000 * APID (Linux pmic_arb_offset_v5), and only
++ * when the ownership table gives the peripheral to this EE (apps, 0) - else no write at all.
++ * Boot-arg sweetbl=0 leaves the backlight alone.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <IOKit/IOLocks.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++int sweet_bl_init(void);
++uint32_t sweet_bl_level(void);
++int sweet_bl_set(uint32_t level);
++int sweet_bl_enable(int on);
++
++#define BL_CORE_PA      0x0c440000u
++#define BL_CHNLS_PA     0x0c600000u
++#define BL_OBS_PA       0x0e600000u
++#define BL_CFG_PA       0x0c40a000u
++#define BL_SID          5u
++#define BL_CTRL         0xd8u           /* peripheral numbers: 0xd800, 0xd900 */
++#define BL_SINK         0xd9u
++#define BL_MOD_ENABLE   0x46u
++#define BL_PBUS_SYNC    0xefu
++#define BL_BRT_LSB      0x53u
++#define BL_BRT_MSB      0x54u
++#define BL_SYNC         0x65u
++#define BL_FLASH_SHDN_CLR 0xb6u         /* sink; cleared after enabling on PM8150L */
++#define BL_MAX          0xfffu
++
++static vm_offset_t bl_core, bl_obs, bl_cfg;
++static vm_offset_t bl_chan[2];          /* write channels: ctrl, sink */
++static uint32_t bl_obs_off[2];
++static IOLock *bl_lock;
++static bool bl_ready, bl_tried, bl_broken;
++static uint32_t bl_saved;
++
++static uint32_t
++bl_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++bl_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++/* APID of a peripheral, preferring one this EE owns; ~0u if none. */
++static uint32_t
++bl_apid(uint32_t ppid, uint32_t count, uint32_t *owner)
++{
++	uint32_t found = ~0u;
++	for (uint32_t i = 0; i < count; i++) {
++		uint32_t map = bl_rd(bl_core, 0x900u + 4u * i);
++		if (map == 0 || ((map >> 8) & 0xfffu) != ppid) {
++			continue;
++		}
++		uint32_t o = bl_rd(bl_cfg, 0x700u + 4u * i) & 7u;
++		if (found == ~0u || o == 0) {
++			found = i;
++			*owner = o;
++		}
++	}
++	return found;
++}
++
++/* One byte; command and status as sweet_spmi.c (EXT_READL / EXT_WRITEL, v5 command format). */
++static int
++bl_cmd(int which, bool write, uint32_t reg, uint8_t *val)
++{
++	vm_offset_t base = write ? bl_chan[which] : bl_obs;
++	uint32_t off = write ? 0 : bl_obs_off[which];
++	if (bl_broken) {
++		return -1;
++	}
++	if (write) {
++		bl_wr(base, off + 0x10u, *val);                         /* WDATA0 */
++	}
++	bl_wr(base, off, ((write ? 0u : 1u) << 27) | ((reg & 0xffu) << 4));
++	for (unsigned i = 0; i < 1000; i++) {
++		uint32_t status = bl_rd(base, off + 0x08u);
++		if (status & 1u) {
++			if (status & 0x0eu) {
++				printf("SWEET BL: SPMI %s %#x%02x failed, status %#x\n", write ? "write" : "read",
++				    which ? BL_SINK : BL_CTRL, reg, status);
++				return -1;
++			}
++			if (!write) {
++				*val = (uint8_t)bl_rd(base, off + 0x18u);       /* RDATA0 */
++			}
++			return 0;
++		}
++		delay(1);
++	}
++	bl_broken = true;       /* a late completion could still land: no more access this boot */
++	printf("SWEET BL: SPMI timeout at %#x%02x: backlight control off for this boot\n", which ? BL_SINK : BL_CTRL, reg);
++	return -1;
++}
++
++static int
++bl_write(int which, uint32_t reg, uint8_t v)
++{
++	return bl_cmd(which, true, reg, &v);
++}
++
++int
++sweet_bl_init(void)
++{
++	int on = 1;
++	if (bl_tried) {
++		return bl_ready ? 0 : -1;
++	}
++	bl_tried = true;
++	(void)PE_parse_boot_argn("sweetbl", &on, sizeof(on));
++	if (!on) {
++		return -1;
++	}
++	bl_lock = IOLockAlloc();
++	bl_core = ml_io_map(BL_CORE_PA, 0x2000);
++	bl_cfg = ml_io_map(BL_CFG_PA, 0x1000);
++	bl_obs = ml_io_map(BL_OBS_PA, 0x10000);
++	if (!bl_lock || !bl_core || !bl_cfg || !bl_obs) {
++		return -1;
++	}
++	uint32_t count = bl_rd(bl_core, 4) & 0x7ffu, owner[2] = { 7, 7 };
++	uint32_t apid[2] = { bl_apid(BL_SID << 8 | BL_CTRL, count, &owner[0]), bl_apid(BL_SID << 8 | BL_SINK, count, &owner[1]) };
++	printf("SWEET BL: WLED ctrl APID %d owner %u, sink APID %d owner %u (arb %#x, %u APIDs)\n", (int)apid[0], owner[0],
++	    (int)apid[1], owner[1], bl_rd(bl_core, 0), count);
++	if (apid[0] == ~0u || apid[1] == ~0u || owner[0] != 0 || owner[1] != 0) {
++		printf("SWEET BL: WLED not owned by the apps EE: not touching it\n");
++		return -1;
++	}
++	for (int i = 0; i < 2; i++) {
++		bl_obs_off[i] = 0x80u * apid[i];
++		bl_chan[i] = ml_io_map(BL_CHNLS_PA + 0x10000u * apid[i], 0x1000);
++		if (!bl_chan[i]) {
++			return -1;
++		}
++	}
++	uint8_t en = 0, lsb = 0, msb = 0;
++	if (bl_cmd(0, false, BL_MOD_ENABLE, &en) || bl_cmd(1, false, BL_BRT_LSB, &lsb) || bl_cmd(1, false, BL_BRT_MSB, &msb)) {
++		return -1;
++	}
++	bl_saved = ((uint32_t)(msb & 0xf) << 8) | lsb;
++	printf("SWEET BL: WLED module %s, brightness %u of %u (as the boot loader left it)\n", (en & 0x80) ? "on" : "off",
++	    bl_saved, BL_MAX);
++	if (bl_saved == 0) {
++		bl_saved = BL_MAX / 2;
++	}
++	bl_ready = true;
++	return 0;
++}
++
++uint32_t
++sweet_bl_level(void)
++{
++	return bl_saved;
++}
++
++/* 0..0xfff; the modulator takes the new value on the sync pulse. */
++int
++sweet_bl_set(uint32_t level)
++{
++	if (!bl_ready) {
++		return -1;
++	}
++	level = level > BL_MAX ? BL_MAX : level;
++	IOLockLock(bl_lock);
++	int r = bl_write(1, BL_BRT_LSB, level & 0xff) || bl_write(1, BL_BRT_MSB, (level >> 8) & 0xf) ||
++	    bl_write(1, BL_SYNC, 1) || bl_write(1, BL_SYNC, 0);
++	IOLockUnlock(bl_lock);
++	return r ? -1 : 0;
++}
++
++/* The WLED module on or off (qcom-spmi-wled.c wled_module_enable, PM8150L). */
++int
++sweet_bl_enable(int on)
++{
++	if (!bl_ready) {
++		return -1;
++	}
++	uint8_t en = 0;
++	IOLockLock(bl_lock);
++	int r = bl_cmd(0, false, BL_MOD_ENABLE, &en) || bl_write(0, BL_PBUS_SYNC, on ? 0 : 3) ||
++	    bl_write(0, BL_MOD_ENABLE, on ? (en | 0x80) : (en & 0x7f)) || (on && bl_write(1, BL_FLASH_SHDN_CLR, 0));
++	IOLockUnlock(bl_lock);
++	printf("SWEET BL: WLED module %s%s\n", on ? "on" : "off", r ? " FAILED" : "");
++	return r ? -1 : 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
