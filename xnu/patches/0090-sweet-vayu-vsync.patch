@@ -63,7 +63,7 @@
  #if defined(SWEET)
  #include <IOKit/IOService.h>
  #include <IOKit/IOUserClient.h>
-@@ -116,12 +172,40 @@
+@@ -116,16 +172,81 @@
  	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
  	bool          fPowerOff;      /* RequestPowerChange(0) */
  	uint32_t      fFadeStep;      /* fade-out steps done while off */
@@ -80,6 +80,7 @@
 +	bool          fAwaitFresh;    /* display on: no swap since, the panel still holds the frame from before off */
 +	uint32_t      fWakeTicks;     /* ticks waited for that swap */
 +	uint64_t      fWakeAbs;       /* mach time of display on */
++	uint64_t      fHoldUntil;     /* sweet_fb_show(): iOS frames not shown until this mach time (0: none) */
 +	volatile uint32_t *fSspp, *fCtl;        /* page flip: VIG0 and CTL0, or NULL */
 +	uintptr_t     fBuf[2];        /* kernel mappings of the two frames */
 +	uint64_t      fBufPA[2];
@@ -105,7 +106,47 @@
  };
  
  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
-@@ -195,7 +279,11 @@
+ 
++static AppleCLCD *sweet_fb_main;        /* for sweet_fb_show() */
++
++/*
++ * A picture made in the kernel (bsd/dev/sweet_adreno.c: the GPU's first frame) on the panel for ms
++ * milliseconds: iOS frames are held back meanwhile (vsyncFired), the picture is copied into the
++ * shown frame (rows of width BGRA pixels, row_bytes apart), and afterwards the latest iOS frame is
++ * shown again. Not for a display that is off.
++ */
++extern "C" int
++sweet_fb_show(const uint8_t *pixels, uint32_t width, uint32_t height, uint32_t row_bytes, uint32_t ms)
++{
++	AppleCLCD *fb = sweet_fb_main;
++	if (fb == NULL || pixels == NULL || row_bytes < width * 4) {
++		return -1;
++	}
++	uint64_t until;
++	clock_interval_to_deadline(ms, kMillisecondScale, &until);
++	IOLockLock(fb->fLock);
++	bool off = fb->fPowerOff;
++	if (!off) {
++		fb->fHoldUntil = until;
++	}
++	IOLockUnlock(fb->fLock);
++	if (off) {
++		return -2;     /* display off */
++	}
++	IOSleep(40);    /* a copy or flip already under way is done */
++	uintptr_t dst = fb->shown();
++	uint32_t w = width < fb->fWidth ? width : fb->fWidth, h = height < fb->fHeight ? height : fb->fHeight;
++	for (uint32_t y = 0; y < h; y++) {
++		memcpy((void *)(dst + (uint64_t)y * fb->fRowBytes), pixels + (uint64_t)y * row_bytes, (size_t)w * 4);
++	}
++	IOLog("SWEET FB: kernel picture %ux%u on the panel for %u ms\n", w, h, ms);
++	return 0;
++}
++
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+ 
+@@ -195,7 +316,11 @@
  	uint32_t hz = 10;
  	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
  	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
@@ -118,13 +159,14 @@
  
  	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
  	setProperty("external", false);
-@@ -203,13 +291,321 @@
+@@ -203,13 +328,322 @@
  	registerService();
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
  	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
 +	if (fBacklight) {
 +		publishBacklight();
 +	}
++	sweet_fb_main = this;
 +	return true;
 +}
 +
@@ -186,9 +228,9 @@
 +		return false;
 +	}
 +	*out = n->unsigned64BitValue();
-+	return true;
-+}
-+
+ 	return true;
+ }
+ 
 +IOReturn
 +AppleARMBacklight::setProperties(OSObject *properties)
 +{
@@ -406,9 +448,9 @@
 +			return false;
 +		}
 +	}
- 	return true;
- }
- 
++	return true;
++}
++
 +/* The next tick: at the start of the coming blanking (a little early), else 60 Hz. */
 +void
 +AppleCLCD::scheduleNext(IOTimerEventSource *sender)
@@ -440,7 +482,7 @@
  	uint64_t now = mach_absolute_time();
  	uint64_t count = ++fb->fVsyncCount;
  	uint64_t values[6] = {
-@@ -224,6 +620,22 @@
+@@ -224,6 +658,22 @@
  		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
  		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
  	}
@@ -463,7 +505,7 @@
  	if (fb->fPowerOff) {
  		/* Fade out: halve every channel each vsync, then black, then idle. */
  		uint32_t step = fb->fFadeStep;
-@@ -233,16 +645,26 @@
+@@ -233,16 +683,32 @@
  		IOLockUnlock(fb->fLock);
  		if (step <= 6) {
  			for (uint32_t y = 0; y < fb->fHeight; y++) {
@@ -479,7 +521,13 @@
  		return;
  	}
 -	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
-+	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0 && !fb->flipPending();
++	/* A picture from sweet_fb_show() stays until its time is up; then the latest iOS frame again. */
++	bool held = fb->fHoldUntil != 0 && now < fb->fHoldUntil;
++	if (fb->fHoldUntil != 0 && !held) {
++		fb->fHoldUntil = 0;
++		fb->fDirty = true;
++	}
++	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0 && !fb->flipPending() && !held;
 +	if (!blank) {
 +		fb->fLateTicks++;
 +	}
@@ -493,7 +541,7 @@
  	uint8_t *rec = NULL;
  	if (flush) {
  		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
-@@ -253,10 +675,42 @@
+@@ -253,10 +719,42 @@
  	}
  	IOLockUnlock(fb->fLock);
  	if (rec != NULL) {
@@ -538,7 +586,7 @@
  }
  
  void
-@@ -296,22 +750,74 @@
+@@ -296,22 +794,74 @@
   * shows the latest frame every fFlushTicks ticks (boot-arg sweetfb_hz,
   * default 10 Hz).
   */
@@ -616,7 +664,7 @@
  
  
  	if (!fConsolePaused) {
-@@ -392,13 +898,15 @@
+@@ -392,13 +942,15 @@
  		}
  		if (src != 0 && bpe == 4) {
  			for (int32_t y = 0; y < h; y++) {
@@ -633,7 +681,7 @@
  }
  
  bool
-@@ -539,7 +1047,16 @@
+@@ -539,7 +1091,16 @@
  			if (off != fFB->fPowerOff) {
  				fFB->fPowerOff = off;
  				fFB->fFadeStep = 0;

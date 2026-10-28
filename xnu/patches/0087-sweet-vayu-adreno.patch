@@ -28,7 +28,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_adreno.c
-@@ -0,0 +1,1552 @@
+@@ -0,0 +1,1687 @@
 +/*
 + * SWEET vayu (SM8150, Adreno 640): GPU bring-up, milestone 1 - is the GPU block reachable.
 + * Steps after HakiOS hakios.adreno.c (oosexgang/hackios-xnu-kernel, APSL 2.0, steps 1-6 and 11),
@@ -61,6 +61,7 @@
 + *  16 3D core memory (ring, a630_sqe.fw, scratch) and its SMMU context, stream 0
 + *  17 a640 registers, ring and microcode, CP out of halt, CP_ME_INIT
 + *  18 CP_MEM_WRITE into the scratch page; 19 (only if 18 failed) SECVID_TRUST_CNTL = 0 and again
++ * Milestone 5: 20 the 2D engine fills a frame with three bands; shown on the panel for 10 s
 + * Up to step 13 nothing powers GX or changes a voltage. A started GMU is left running (its memory
 + * is never freed); after step 15 GX stays on (the OOB is not cleared).
 + */
@@ -1376,6 +1377,132 @@
 +	return got == value;
 +}
 +
++/*
++ * ---- milestone 5: a frame drawn by the GPU (step 20) ----
++ *
++ * HakiOS step 22: the 2D engine fills rectangles with one colour (Mesa fd6_blitter fd6_clear_surface,
++ * a6xx.xml names), three bands, into a 1080x2400 BGRA buffer of ours at GPU address 0x10000000 with
++ * rows of 4352 bytes (the destination pitch is in 64-byte units; the panel's 4320 is not one). The
++ * colour buffer cache is bypassed (RB_CCU_CNTL: Mesa's ccu_offset_bypass 0x20000 of the a630/a640
++ * family). Two timestamped events push the caches out (PC_CCU_FLUSH_COLOR_TS, CACHE_FLUSH_TS); the
++ * picture is checked by the CPU and shown for 10 s by the framebuffer driver (sweet_fb_show in
++ * iokit/Kernel/arm/SweetFramebuffer.cpp), which then goes back to the iOS frames.
++ */
++#define PM4_NOP                 0x10u
++#define PM4_WAIT_FOR_IDLE       0x26u
++#define PM4_BLIT                0x2cu
++#define PM4_EVENT_WRITE         0x46u
++#define PM4_SET_MARKER          0x65u
++#define RB_CCU_CNTL             0x8e07u         /* registers written by command (word numbers) */
++#define GRAS_2D_BLIT_CNTL       0x8400u
++#define GRAS_2D_DST_TL          0x8405u
++#define GRAS_2D_DST_BR          0x8406u
++#define RB_2D_BLIT_CNTL         0x8c00u
++#define RB_2D_PIXEL_CNTL        0x8c01u
++#define RB_2D_DST_INFO          0x8c17u
++#define RB_2D_DST               0x8c18u
++#define RB_2D_DST_PITCH         0x8c1au
++#define RB_2D_SRC_SOLID_C0      0x8c2cu
++#define SP_2D_DST_FORMAT        0xacc0u
++#define FMT_8888                0x30u
++#define BLIT_SOLID_8888         (1u << 7 | FMT_8888 << 8 | 0xfu << 20 | 0x10u << 24)     /* solid; all channels; unorm8 */
++#define DST_BGRA_LINEAR         (FMT_8888 | 1u << 10)
++#define CCU_BYPASS              (0x20u << 23)   /* colour offset 0x20000 >> 12 */
++#define EV_PC_CCU_FLUSH_COLOR_TS 0x1du
++#define EV_CACHE_FLUSH_TS       0x04u
++#define MARK_BLIT2DSCALE        12u
++#define FRAME_W                 1080u
++#define FRAME_H                 2400u
++#define FRAME_ROW               4352u
++#define CORE_FRAME_VA           0x10000000u
++extern int sweet_fb_show(const uint8_t *pixels, uint32_t width, uint32_t height, uint32_t row_bytes, uint32_t ms);
++
++static vm_offset_t core_frame;
++
++static void
++ring_reg(uint32_t reg, uint32_t value)
++{
++	ring(4u << 28 | 1u | odd_parity(1) << 7 | reg << 8 | odd_parity(reg) << 27);
++	ring(value);
++}
++
++static void
++ring_fill(uint32_t top, uint32_t bottom, uint32_t red, uint32_t green, uint32_t blue)
++{
++	ring_reg(GRAS_2D_DST_TL, top << 16);
++	ring_reg(GRAS_2D_DST_BR, (FRAME_W - 1u) | (bottom - 1u) << 16);
++	ring_reg(RB_2D_SRC_SOLID_C0, red);
++	ring_reg(RB_2D_SRC_SOLID_C0 + 1, green);
++	ring_reg(RB_2D_SRC_SOLID_C0 + 2, blue);
++	ring_reg(RB_2D_SRC_SOLID_C0 + 3, 255);
++	ring_reg(RB_2D_BLIT_CNTL, BLIT_SOLID_8888);
++	ring_reg(GRAS_2D_BLIT_CNTL, BLIT_SOLID_8888);
++	ring_reg(SP_2D_DST_FORMAT, 1u | FMT_8888 << 3 | 0xfu << 12);
++	ring_reg(RB_2D_PIXEL_CNTL, 0);
++	ring_reg(RB_2D_DST_INFO, DST_BGRA_LINEAR);
++	ring_reg(RB_2D_DST, CORE_FRAME_VA);
++	ring_reg(RB_2D_DST + 1, 0);
++	ring_reg(RB_2D_DST_PITCH, FRAME_ROW >> 6);
++	ring_cmd(PM4_WAIT_FOR_IDLE, 0);
++	ring_cmd(PM4_BLIT, 1);
++	ring(3);                                        /* BLIT_OP_SCALE: the 2D engine's one operation */
++}
++
++/* Step 20: three bands of colour filled by the 2D engine; checked, then on the panel. */
++static bool
++core_draw(void)
++{
++	core_frame = core_buffer(CORE_FRAME_VA, FRAME_ROW * FRAME_H, PTE_CORE);
++	if (!core_frame) {
++		return false;
++	}
++	to_memory(core_frame, FRAME_ROW * FRAME_H);
++	for (unsigned i = 0; i < pt_count; i++) {
++		to_memory((vm_offset_t)pt_table[i], 4096);
++	}
++	printf("SWEET GPU: frame %#x (%u bytes) -> pa %#llx; %u tables\n", CORE_FRAME_VA, FRAME_ROW * FRAME_H,
++	    kvtophys(core_frame), pt_count);
++	volatile uint32_t *scratch = (volatile uint32_t *)core_scratch;
++	ring_cmd(PM4_SET_MARKER, 1);
++	ring(MARK_BLIT2DSCALE);
++	ring_reg(RB_CCU_CNTL, CCU_BYPASS);
++	ring_fill(0, 800, 255, 128, 0);                 /* orange */
++	ring_fill(800, 1600, 255, 255, 255);            /* white */
++	ring_fill(1600, FRAME_H, 0, 128, 255);          /* blue */
++	ring_cmd(PM4_EVENT_WRITE, 4);
++	ring(EV_PC_CCU_FLUSH_COLOR_TS);
++	ring(CORE_SCRATCH_VA + 32);
++	ring(0);
++	ring(0x0c0c0c0cu);
++	ring_cmd(PM4_EVENT_WRITE, 4);
++	ring(EV_CACHE_FLUSH_TS);
++	ring(CORE_SCRATCH_VA + 16);
++	ring(0);
++	ring(0x0d0e0d0eu);
++	ring_cmd(PM4_WAIT_FOR_IDLE, 0);
++	if (!ring_run("2D fill")) {
++		return false;
++	}
++	to_memory(core_scratch, 64);
++	to_memory(core_frame, FRAME_ROW * FRAME_H);
++	const volatile uint8_t *p = (const volatile uint8_t *)core_frame;
++	uint32_t mid = 1200u * FRAME_ROW + 540u * 4u, last = 2399u * FRAME_ROW + 1079u * 4u;
++	printf("SWEET GPU: flush stamps %#x %#x (told 0xc0c0c0c 0xd0e0d0e); pixels BGRA: first %02x %02x %02x %02x "
++	    "(orange: 00 80 ff ff), middle %02x %02x %02x %02x (white), last %02x %02x %02x %02x (blue: ff 80 00 ff)\n",
++	    scratch[8], scratch[4], p[0], p[1], p[2], p[3], p[mid], p[mid + 1], p[mid + 2], p[mid + 3], p[last],
++	    p[last + 1], p[last + 2], p[last + 3]);
++	bool ok = p[0] == 0x00 && p[1] == 0x80 && p[2] == 0xff && p[mid] == 0xff && p[mid + 1] == 0xff &&
++	    p[last] == 0xff && p[last + 1] == 0x80 && p[last + 2] == 0x00;
++	if (!ok) {
++		printf("SWEET GPU: the frame is not what the 2D engine was told to draw\n");
++		return false;
++	}
++	int shown = sweet_fb_show((const uint8_t *)core_frame, FRAME_W, FRAME_H, FRAME_ROW, 10000);
++	printf("SWEET GPU: %s\n", shown == 0 ? "A FRAME DRAWN BY THE GPU IS ON THE PANEL for 10 s: orange, white, blue" :
++	    "the frame is right, but the panel did not take it (display off?)");
++	return true;
++}
++
 +static void
 +gpu_thread(void *arg, wait_result_t result)
 +{
@@ -1553,8 +1680,16 @@
 +		printf("SWEET GPU: secvid_trust_cntl reads %#x\n", rd(gpu3d, RBBM_SECVID_TRUST_CNTL));
 +		wrote = core_write(0x0dd0c0deu);
 +	}
-+	if (wrote) {
-+		printf("SWEET GPU: milestone 4 done - the command processor runs our commands\n");
++	if (!wrote) {
++		goto out;
++	}
++	printf("SWEET GPU: milestone 4 done - the command processor runs our commands\n");
++	if (last < 20) {
++		goto out;
++	}
++	announce(20, "2D engine: fill a 1080x2400 frame with three bands, show it on the panel for 10 s");
++	if (core_draw()) {
++		printf("SWEET GPU: milestone 5 done - the GPU draws\n");
 +	}
 +out:
 +	printf("SWEET GPU: stopped after step %u\n", step_now);
