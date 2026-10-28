@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -38,6 +38,60 @@
+@@ -38,6 +38,59 @@
  
  extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
  
@@ -17,7 +17,6 @@
 + * the free-running 60 Hz timer; without a running interface it is kept too.
 + */
 +extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
-+extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
 +/*
 + * vayu backlight (bsd/dev/sweet_backlight.c, PM8150L WLED): display off ramps it down over
 + * SWEET_BL_STEPS ticks and switches the WLED off; on draws the latest frame, switches it on
@@ -61,7 +60,7 @@
  #if defined(SWEET)
  #include <IOKit/IOService.h>
  #include <IOKit/IOUserClient.h>
-@@ -116,12 +170,35 @@
+@@ -116,12 +169,35 @@
  	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
  	bool          fPowerOff;      /* RequestPowerChange(0) */
  	uint32_t      fFadeStep;      /* fade-out steps done while off */
@@ -98,7 +97,7 @@
  };
  
  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
-@@ -195,7 +272,11 @@
+@@ -195,7 +271,11 @@
  	uint32_t hz = 10;
  	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
  	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
@@ -111,7 +110,7 @@
  
  	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
  	setProperty("external", false);
-@@ -206,10 +287,177 @@
+@@ -206,10 +286,187 @@
  	return true;
  }
  
@@ -218,9 +217,19 @@
 +	}
 +	volatile uint32_t *sspp = (volatile uint32_t *)(mdp + SWEET_VIG0_OFF);
 +	volatile uint32_t *ctl = (volatile uint32_t *)(mdp + SWEET_CTL0_OFF);
-+	uintptr_t second = ml_io_map_wcomb(SWEET_SPLASH_PA + SWEET_FLIP_STRIDE, (vm_size_t)round_page(size));
-+	if (sspp[SWEET_SSPP_SRC0 / 4] != (uint32_t)fPhys || ctl[0] == 0 || second == 0) {
++	if (sspp[SWEET_SSPP_SRC0 / 4] != (uint32_t)fPhys || ctl[0] == 0) {
 +		IOLog("SWEET FB: page flip not set up: vig0 src0 %#x, ctl0 layer %#x\n", sspp[SWEET_SSPP_SRC0 / 4], ctl[0]);
++		return;
++	}
++	/* Not ml_io_map: its I/O map has no room for a 10 MB frame (kmem_alloc NOFAIL panic). */
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(SWEET_SPLASH_PA + SWEET_FLIP_STRIDE,
++	    round_page(size), kIODirectionInOut);
++	fMap = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
++	OSSafeReleaseNULL(md);
++	uintptr_t second = fMap != NULL ? (uintptr_t)fMap->getVirtualAddress() : 0;
++	if (second == 0) {
++		OSSafeReleaseNULL(fMap);
++		IOLog("SWEET FB: page flip not set up: second frame not mapped\n");
 +		return;
 +	}
 +	fSspp = sspp;
@@ -289,7 +298,7 @@
  	uint64_t now = mach_absolute_time();
  	uint64_t count = ++fb->fVsyncCount;
  	uint64_t values[6] = {
-@@ -224,6 +472,22 @@
+@@ -224,6 +481,22 @@
  		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
  		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
  	}
@@ -312,7 +321,7 @@
  	if (fb->fPowerOff) {
  		/* Fade out: halve every channel each vsync, then black, then idle. */
  		uint32_t step = fb->fFadeStep;
-@@ -233,16 +497,26 @@
+@@ -233,16 +506,26 @@
  		IOLockUnlock(fb->fLock);
  		if (step <= 6) {
  			for (uint32_t y = 0; y < fb->fHeight; y++) {
@@ -342,7 +351,7 @@
  	uint8_t *rec = NULL;
  	if (flush) {
  		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
-@@ -253,10 +527,33 @@
+@@ -253,10 +536,33 @@
  	}
  	IOLockUnlock(fb->fLock);
  	if (rec != NULL) {
@@ -378,7 +387,7 @@
  }
  
  void
-@@ -296,22 +593,68 @@
+@@ -296,22 +602,68 @@
   * shows the latest frame every fFlushTicks ticks (boot-arg sweetfb_hz,
   * default 10 Hz).
   */
@@ -450,7 +459,7 @@
  
  
  	if (!fConsolePaused) {
-@@ -392,13 +735,15 @@
+@@ -392,13 +744,15 @@
  		}
  		if (src != 0 && bpe == 4) {
  			for (int32_t y = 0; y < h; y++) {
@@ -467,7 +476,7 @@
  }
  
  bool
-@@ -540,6 +885,7 @@
+@@ -540,6 +894,7 @@
  				fFB->fPowerOff = off;
  				fFB->fFadeStep = 0;
  				fFB->fDirty = true;     /* on: redraw the latest frame */
