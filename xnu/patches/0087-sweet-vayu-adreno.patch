@@ -28,7 +28,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_adreno.c
-@@ -0,0 +1,870 @@
+@@ -0,0 +1,884 @@
 +/*
 + * SWEET vayu (SM8150, Adreno 640): GPU bring-up, milestone 1 - is the GPU block reachable.
 + * Steps after HakiOS hakios.adreno.c (oosexgang/hackios-xnu-kernel, APSL 2.0, steps 1-6 and 11),
@@ -483,17 +483,31 @@
 +	uint32_t nvt_size = 0;
 +	(void)PE_parse_boot_argn("sweetnvtfw", &nvt_pa, sizeof(nvt_pa));
 +	(void)PE_parse_boot_argn("sweetnvtfwsz", &nvt_size, sizeof(nvt_size));
-+	const uint8_t *hdr = nvt_pa ? (const uint8_t *)ml_static_ptovirt((vm_offset_t)(nvt_pa + ((nvt_size + 15u) & ~15u))) : NULL;
-+	if (hdr == NULL || memcmp(hdr, "SWEETGMU", 8) != 0) {
++	/*
++	 * The shim's ramdisk lies below the memory XNU manages (phone: PA 0x856f5000, phys base 0xc0000000),
++	 * so ml_static_ptovirt panics on it (iOS/runs/ios-gmu1): mapped as I/O like sweet_nvt.c does, and
++	 * copied out word by word (Device memory takes no unaligned or byte-wise memcpy).
++	 */
++	uint64_t pa = nvt_pa + ((nvt_size + 15u) & ~15u), base = pa & ~0x3fffull;
++	vm_offset_t io = nvt_pa ? ml_io_map((vm_offset_t)base, (vm_size_t)((pa - base + 16u + 0x10000u + 0x3fffu) & ~0x3fffull)) : 0;
++	volatile const uint32_t *w = (volatile const uint32_t *)(io + (pa - base));
++	uint32_t magic[2];
++	memcpy(magic, "SWEETGMU", 8);
++	if (io == 0 || w[0] != magic[0] || w[1] != magic[1]) {
 +		printf("SWEET GPU: no GMU firmware after the touch firmware (sweetnvtfw=%#llx size %#x)\n", nvt_pa, nvt_size);
 +		return false;
 +	}
-+	memcpy(&gmu_fw_size, hdr + 8, 4);
-+	gmu_fw = hdr + 16;
-+	printf("SWEET GPU: a640_gmu.bin: %u bytes\n", gmu_fw_size);
-+	if (gmu_fw_size < 16 || gmu_fw_size > 0x10000u) {
++	gmu_fw_size = w[2];
++	printf("SWEET GPU: a640_gmu.bin: %u bytes at pa %#llx\n", gmu_fw_size, pa + 16u);
++	vm_offset_t copy = 0;
++	if (gmu_fw_size < 16 || gmu_fw_size > 0x10000u || (gmu_fw_size & 3) || kmem_alloc(kernel_map, &copy,
++	    round_page(gmu_fw_size), KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 +		return false;
 +	}
++	for (uint32_t i = 0; i < gmu_fw_size / 4u; i++) {
++		((uint32_t *)copy)[i] = w[4 + i];
++	}
++	gmu_fw = (const uint8_t *)copy;
 +	for (unsigned i = 0; i < GMU_MEMS; i++) {
 +		struct gmu_mem *m = &gmu_mem[i];
 +		if (kmem_alloc(kernel_map, &m->kva, round_page(m->size), KMA_KOBJECT | KMA_ZERO | KMA_DATA,
