@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -38,6 +38,52 @@
+@@ -38,6 +38,60 @@
  
  extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
  
@@ -17,6 +17,7 @@
 + * the free-running 60 Hz timer; without a running interface it is kept too.
 + */
 +extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
 +/*
 + * vayu backlight (bsd/dev/sweet_backlight.c, PM8150L WLED): display off ramps it down over
 + * SWEET_BL_STEPS ticks and switches the WLED off; on draws the latest frame, switches it on
@@ -49,11 +50,18 @@
 + */
 +#define SWEET_MDP_PA            0x0ae00000u
 +#define SWEET_MDP_SIZE          0x0002c000u
++#define SWEET_VIG0_OFF          0x5000u
++#define SWEET_CTL0_OFF          0x2000u
++#define SWEET_SSPP_SRC0         0x14u
++#define SWEET_CTL_FLUSH         0x18u
++#define SWEET_FLUSH_VIG0        (1u << 0)
++#define SWEET_SPLASH_PA         0x9c000000ull
++#define SWEET_FLIP_STRIDE       0x00a00000ull   /* second frame; 2 * this fits the 36 MB reservation */
 +
  #if defined(SWEET)
  #include <IOKit/IOService.h>
  #include <IOKit/IOUserClient.h>
-@@ -116,8 +162,21 @@
+@@ -116,12 +170,35 @@
  	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
  	bool          fPowerOff;      /* RequestPowerChange(0) */
  	uint32_t      fFadeStep;      /* fade-out steps done while off */
@@ -65,9 +73,18 @@
 +	uint64_t      fPresents;      /* panel copies */
 +	bool          fBacklight;     /* the WLED is ours to dim and switch */
 +	uint32_t      fBlRamp;        /* ramp-up steps done after display on (SWEET_BL_STEPS: none due) */
++	uint32_t      fBlTarget;      /* backlight level wanted (from the swaps; the boot loader's at first) */
++	uint32_t      fBlApplied;     /* last level set while fully on */
++	volatile uint32_t *fSspp, *fCtl;        /* page flip: VIG0 and CTL0, or NULL */
++	uintptr_t     fBuf[2];        /* kernel mappings of the two frames */
++	uint64_t      fBufPA[2];
++	uint32_t      fFront;         /* the frame the pipe shows */
++	uint64_t      fFlips;
  
  	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
 +	void setupVsync(void);
++	void setupFlip(void);
++	bool flipPending(void) { return fCtl != NULL && (fCtl[SWEET_CTL_FLUSH / 4] & SWEET_FLUSH_VIG0); }
 +	uint32_t line(void) { return fIntf[SWEET_INTF_LINE_COUNT / 4]; }
 +	bool inBlank(uint32_t l) { return l >= fActEnd || l < fActStart; }
 +	bool waitBlank(void);
@@ -75,7 +92,13 @@
  	void addClient(IOMobileFramebufferUserClient *client);
  	void removeClient(IOMobileFramebufferUserClient *client);
  	void swap(const uint8_t *rec);
-@@ -195,7 +254,10 @@
+-	void present(const uint8_t *rec);
++	bool present(const uint8_t *rec, uintptr_t dst);
++	uintptr_t shown(void) { return fCtl != NULL ? fBuf[fFront] : fPixels; }
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -195,7 +272,11 @@
  	uint32_t hz = 10;
  	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
  	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
@@ -83,11 +106,12 @@
 +	setupVsync();
 +	fBacklight = sweet_bl_init() == 0;
 +	fBlRamp = SWEET_BL_STEPS;
++	fBlTarget = fBlApplied = fBacklight ? sweet_bl_level() : 0;
 +	scheduleNext(fVsync);
  
  	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
  	setProperty("external", false);
-@@ -206,10 +268,148 @@
+@@ -206,10 +287,177 @@
  	return true;
  }
  
@@ -159,25 +183,54 @@
 +	fActStart = (uint32_t)((uint64_t)vstart * vtotal / vperiod);
 +	fActEnd = (uint32_t)(((uint64_t)vend + 1) * vtotal / vperiod);
 +	fLineAbs = (t1 - t0) / frames / vtotal;
-+	vm_offset_t mdp = ml_io_map(SWEET_MDP_PA, SWEET_MDP_SIZE);
-+	if (mdp != 0) {
-+		static const uint32_t sspp[8] = { 0x5000, 0x7000, 0x9000, 0xb000, 0x25000, 0x27000, 0x29000, 0x2b000 };
-+		for (unsigned i = 0; i < 8; i++) {
-+			volatile uint32_t *p = (volatile uint32_t *)(mdp + sspp[i]);
-+			IOLog("SWEET FB: sspp %s%u: src0 %#x size %#x ystride %#x\n", i < 4 ? "vig" : "dma", i & 3, p[0x14 / 4],
-+			    p[0], p[0x24 / 4]);
-+		}
-+		for (unsigned i = 0; i < 6; i++) {
-+			volatile uint32_t *c = (volatile uint32_t *)(mdp + 0x2000 + 0x200 * i);
-+			IOLog("SWEET FB: ctl%u: top %#x flush %#x layer %#x %#x %#x %#x %#x %#x\n", i, c[0x14 / 4], c[0x18 / 4],
-+			    c[0], c[1], c[2], c[3], c[4], c[0x24 / 4]);
-+		}
-+	}
++	setupFlip();
 +	fFrameDiv = (mhz + 30000) / 60000;     /* about 60 Hz for CoreAnimation: 124 Hz panel -> every 2nd frame */
 +	fFrameDiv = fFrameDiv ? fFrameDiv : 1;
 +	IOLog("SWEET FB: vsync on the panel: active lines %u..%u of %u, a tick every %u frame(s)\n", fActStart, fActEnd,
 +	    fVTotal, fFrameDiv);
 +	fIntf = intf;
++}
++
++/*
++ * Page flip (boot-arg sweetfb_flip=1): the ABL's pipe is VIG0 (SRC0_ADDR 0x9c000000, stride
++ * 4320) staged by CTL0 (LAYER0 0x1000005), as the phone showed (iOS/runs/ios-disp1). A second
++ * frame lies in the same continuous-splash reservation (dt cont_splash_region 0x9c000000 +
++ * 0x2400000, below XNU's memory) at +0xa00000. A frame that covers the whole panel is copied
++ * into the hidden buffer, then SRC0_ADDR is pointed at it and VIG0's CTL_FLUSH bit (0, kernel
++ * sde_hw_ctl.c sspp_tbl) set: the pipe takes the new address at the next vsync by itself, so
++ * no copy is ever seen half done. Until that bit clears the hidden buffer is still on screen
++ * and is not written. Other frames are copied into the shown buffer as before. The kernel's
++ * panic screen draws into the first buffer, so with a flip pending it may not be seen.
++ */
++void
++AppleCLCD::setupFlip(void)
++{
++	uint32_t on = 0;
++	uint64_t size = (uint64_t)fRowBytes * fHeight;
++	PE_parse_boot_argn("sweetfb_flip", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	vm_offset_t mdp = ml_io_map(SWEET_MDP_PA, SWEET_MDP_SIZE);
++	if (mdp == 0 || fPhys != SWEET_SPLASH_PA || size > SWEET_FLIP_STRIDE) {
++		IOLog("SWEET FB: page flip not set up (panel memory %#llx, %llu bytes)\n", fPhys, size);
++		return;
++	}
++	volatile uint32_t *sspp = (volatile uint32_t *)(mdp + SWEET_VIG0_OFF);
++	volatile uint32_t *ctl = (volatile uint32_t *)(mdp + SWEET_CTL0_OFF);
++	uintptr_t second = ml_io_map_wcomb(SWEET_SPLASH_PA + SWEET_FLIP_STRIDE, (vm_size_t)round_page(size));
++	if (sspp[SWEET_SSPP_SRC0 / 4] != (uint32_t)fPhys || ctl[0] == 0 || second == 0) {
++		IOLog("SWEET FB: page flip not set up: vig0 src0 %#x, ctl0 layer %#x\n", sspp[SWEET_SSPP_SRC0 / 4], ctl[0]);
++		return;
++	}
++	fSspp = sspp;
++	fCtl = ctl;
++	fBuf[0] = fPixels;
++	fBuf[1] = second;
++	fBufPA[0] = fPhys;
++	fBufPA[1] = fPhys + SWEET_FLIP_STRIDE;
++	fFront = 0;
++	IOLog("SWEET FB: page flip between %#llx and %#llx through vig0/ctl0\n", fBufPA[0], fBufPA[1]);
 +}
 +
 +/*
@@ -236,7 +289,7 @@
  	uint64_t now = mach_absolute_time();
  	uint64_t count = ++fb->fVsyncCount;
  	uint64_t values[6] = {
-@@ -224,6 +424,22 @@
+@@ -224,6 +472,22 @@
  		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
  		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
  	}
@@ -248,7 +301,7 @@
 +		}
 +		IOLockUnlock(fb->fLock);
 +		if (step < SWEET_BL_STEPS) {
-+			(void)sweet_bl_set(sweet_bl_level() * (SWEET_BL_STEPS - 1 - step) / SWEET_BL_STEPS);
++			(void)sweet_bl_set(fb->fBlTarget * (SWEET_BL_STEPS - 1 - step) / SWEET_BL_STEPS);
 +			if (step == SWEET_BL_STEPS - 1) {
 +				(void)sweet_bl_enable(0);
 +			}
@@ -259,7 +312,14 @@
  	if (fb->fPowerOff) {
  		/* Fade out: halve every channel each vsync, then black, then idle. */
  		uint32_t step = fb->fFadeStep;
-@@ -239,10 +455,20 @@
+@@ -233,16 +497,26 @@
+ 		IOLockUnlock(fb->fLock);
+ 		if (step <= 6) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+-				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
++				volatile uint32_t *row = (volatile uint32_t *)(fb->shown() + (uint64_t)y * fb->fRowBytes);
+ 				for (uint32_t x = 0; x < fb->fWidth; x++) {
+ 					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
  				}
  			}
  		}
@@ -267,7 +327,8 @@
 +		fb->scheduleNext(sender);
  		return;
  	}
- 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+-	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
++	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0 && !fb->flipPending();
 +	if (!blank) {
 +		fb->fLateTicks++;
 +	}
@@ -275,14 +336,28 @@
 +		fb->fPresents++;
 +	}
 +	if (fb->fIntf != NULL && (count % 600) == 0) {
-+		IOLog("SWEET FB: %llu vsync ticks, %llu copies, %llu ticks missed the blanking\n", count, fb->fPresents,
-+		    fb->fLateTicks);
++		IOLog("SWEET FB: %llu vsync ticks, %llu copies (%llu page flips), %llu ticks missed the blanking\n", count,
++		    fb->fPresents, fb->fFlips, fb->fLateTicks);
 +	}
  	uint8_t *rec = NULL;
  	if (flush) {
  		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
-@@ -256,7 +482,15 @@
- 		fb->present(rec);
+@@ -253,10 +527,33 @@
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
+-		fb->present(rec);
++		uint32_t back = fb->fFront ^ 1;
++		if (fb->fCtl != NULL && fb->present(rec, fb->fBuf[back])) {
++			/* The whole panel is in the hidden frame: the pipe takes it at the next vsync. */
++			__asm__ volatile ("dsb sy" ::: "memory");
++			fb->fSspp[SWEET_SSPP_SRC0 / 4] = (uint32_t)fb->fBufPA[back];
++			fb->fCtl[SWEET_CTL_FLUSH / 4] = SWEET_FLUSH_VIG0;
++			fb->fFront = back;
++			fb->fFlips++;
++		} else {
++			(void)fb->present(rec, fb->shown());
++		}
  		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
  	}
 -	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
@@ -292,14 +367,71 @@
 +			(void)sweet_bl_enable(1);
 +		}
 +		fb->fBlRamp++;
-+		(void)sweet_bl_set(sweet_bl_level() * fb->fBlRamp / SWEET_BL_STEPS);
++		(void)sweet_bl_set(fb->fBlTarget * fb->fBlRamp / SWEET_BL_STEPS);
++	}
++	/* The brightness CoreBrightness sent with the swaps (swap()), once the display is fully on. */
++	if (fb->fBacklight && !fb->fPowerOff && fb->fBlRamp >= SWEET_BL_STEPS && fb->fBlApplied != fb->fBlTarget) {
++		fb->fBlApplied = fb->fBlTarget;
++		(void)sweet_bl_set(fb->fBlApplied);
 +	}
 +	fb->scheduleNext(sender);
  }
  
  void
-@@ -304,7 +538,7 @@
+@@ -296,22 +593,68 @@
+  * shows the latest frame every fFlushTicks ticks (boot-arg sweetfb_hz,
+  * default 10 Hz).
+  */
++/* An IEEE 754 double, given as its bits, times 1000 - integer only (no FPU use in the kernel); <0 -> 0. */
++static uint64_t
++sweet_double_milli(uint64_t bits)
++{
++	uint32_t biased = (uint32_t)(bits >> 52) & 0x7ff;
++	int exp = (int)biased - 1023;
++	if ((bits >> 63) || biased == 0 || exp < -11) {
++		return 0;
++	}
++	if (exp > 20) {
++		return 1000000000ull;
++	}
++	return (((bits & ((1ull << 52) - 1)) | (1ull << 52)) * 1000) >> (52 - exp);
++}
++
++/*
++ * Brightness: IOMobileFramebufferSwapSetBrightness (kern_SwapSetBrightness, iOS 16.7 dyld
++ * cache) keeps a double at +0x304 of the client's swap state and a "set" byte at +0x2ff;
++ * SwapEnd sends that state from +0x18, so in the swap record they are at 0x2ec and 0x2e7.
++ * Its scale is not documented: a value up to 1 is taken as a fraction of full, a larger one
++ * as nits of a ~500-nit LCD. The first changes are logged with their raw bits.
++ */
++#define SWEET_SWAP_BRIGHTNESS_SET       0x2e7
++#define SWEET_SWAP_BRIGHTNESS           0x2ec
++#define SWEET_BL_FULL                   0xfffu
++#define SWEET_BL_LOWEST                 48u     /* readable even if the scale above is wrong */
++
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
++	static uint32_t logged;
++	uint32_t level = 0;
++	if (rec[SWEET_SWAP_BRIGHTNESS_SET]) {
++		uint64_t bits;
++		memcpy(&bits, rec + SWEET_SWAP_BRIGHTNESS, sizeof(bits));
++		uint64_t milli = sweet_double_milli(bits);
++		uint64_t l = milli <= 1000 ? milli * SWEET_BL_FULL / 1000 : milli * SWEET_BL_FULL / 500000;
++		level = (uint32_t)(l > SWEET_BL_FULL ? SWEET_BL_FULL : (l < SWEET_BL_LOWEST ? SWEET_BL_LOWEST : l));
++		if (level != fBlTarget && logged < 40) {
++			logged++;
++			IOLog("SWEET FB: brightness %#llx = %llu.%03llu -> backlight %u of %u\n", bits, milli / 1000, milli % 1000,
++			    level, SWEET_BL_FULL);
++		}
++	}
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
  	fDirty = true;
++	if (level != 0) {
++		fBlTarget = level;
++	}
  	IOLockUnlock(fLock);
  	if ((++sweet_fb_swap_count % 1000) == 0) {
 -		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
@@ -307,7 +439,35 @@
  	}
  }
  
-@@ -540,6 +774,7 @@
+-void
+-AppleCLCD::present(const uint8_t *rec)
++/* Into dst (a frame's kernel mapping); true if one layer covered the whole panel. */
++bool
++AppleCLCD::present(const uint8_t *rec, uintptr_t dst)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
++	bool covered = false;
+ 
+ 
+ 	if (!fConsolePaused) {
+@@ -392,13 +735,15 @@
+ 		}
+ 		if (src != 0 && bpe == 4) {
+ 			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++				memcpy((void *)(dst + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
++			covered |= dx == 0 && dy == 0 && w == (int32_t)fWidth && h == (int32_t)fHeight;
+ 		}
+ 		s->release();
+ 	}
++	return covered;
+ }
+ 
+ bool
+@@ -540,6 +885,7 @@
  				fFB->fPowerOff = off;
  				fFB->fFadeStep = 0;
  				fFB->fDirty = true;     /* on: redraw the latest frame */
