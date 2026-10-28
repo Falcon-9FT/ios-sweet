@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -38,6 +38,31 @@
+@@ -38,6 +38,42 @@
  
  extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
  
@@ -27,12 +27,23 @@
 +#define SWEET_INTF_FRAME_COUNT  0x0acu
 +#define SWEET_INTF_LINE_COUNT   0x0b0u
 +#define SWEET_VSYNC_SPIN_US     1500    /* closer than this to blanking: wait by spinning */
-+#define SWEET_VSYNC_EARLY_US    300     /* timer aimed this much before blanking */
++#define SWEET_VSYNC_EARLY_US    1000    /* timer aimed this much before blanking (its wake-up jitter) */
++/*
++ * The panel's blanking is short (66 of 2466 lines, 0.22 ms at 119 Hz) and the timer often woke
++ * after it: copies that waited for the next one left most frames unshown (iOS/runs/ios-smooth2,
++ * "terrible lag"). A late tick now copies anyway - a possible tear instead of a lost frame - and
++ * the real fix is a page flip in the pipe (SDE latches a new SRC0_ADDR at vsync by itself). The
++ * pipes and CTLs the ABL left are logged for it, read only: SSPP at mdp + qcom,sde-sspp-off
++ * (VIG 0x5000-0xb000, DMA 0x25000-0x2b000; SRC0_ADDR +0x14), CTL at mdp + 0x2000 + 0x200 n
++ * (LAYER 0x00-0x10/0x24, TOP 0x14, FLUSH 0x18; sde_hw_ctl.c).
++ */
++#define SWEET_MDP_PA            0x0ae00000u
++#define SWEET_MDP_SIZE          0x0002c000u
 +
  #if defined(SWEET)
  #include <IOKit/IOService.h>
  #include <IOKit/IOUserClient.h>
-@@ -116,8 +141,18 @@
+@@ -116,8 +152,19 @@
  	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
  	bool          fPowerOff;      /* RequestPowerChange(0) */
  	uint32_t      fFadeStep;      /* fade-out steps done while off */
@@ -40,7 +51,8 @@
 +	uint32_t      fVTotal, fActStart, fActEnd;   /* lines per frame, active area [start, end) */
 +	uint64_t      fLineAbs;       /* mach time of one line */
 +	uint32_t      fFrameDiv;      /* panel frames per vsync tick (about 60 Hz) */
-+	uint64_t      fLateTicks;     /* ticks that missed the blanking: no copy on them */
++	uint64_t      fLateTicks;     /* ticks that missed the blanking (they copy anyway) */
++	uint64_t      fPresents;      /* panel copies */
  
  	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
 +	void setupVsync(void);
@@ -51,7 +63,7 @@
  	void addClient(IOMobileFramebufferUserClient *client);
  	void removeClient(IOMobileFramebufferUserClient *client);
  	void swap(const uint8_t *rec);
-@@ -195,7 +230,8 @@
+@@ -195,7 +242,8 @@
  	uint32_t hz = 10;
  	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
  	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
@@ -61,7 +73,7 @@
  
  	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
  	setProperty("external", false);
-@@ -206,10 +242,134 @@
+@@ -206,10 +254,148 @@
  	return true;
  }
  
@@ -133,6 +145,20 @@
 +	fActStart = (uint32_t)((uint64_t)vstart * vtotal / vperiod);
 +	fActEnd = (uint32_t)(((uint64_t)vend + 1) * vtotal / vperiod);
 +	fLineAbs = (t1 - t0) / frames / vtotal;
++	vm_offset_t mdp = ml_io_map(SWEET_MDP_PA, SWEET_MDP_SIZE);
++	if (mdp != 0) {
++		static const uint32_t sspp[8] = { 0x5000, 0x7000, 0x9000, 0xb000, 0x25000, 0x27000, 0x29000, 0x2b000 };
++		for (unsigned i = 0; i < 8; i++) {
++			volatile uint32_t *p = (volatile uint32_t *)(mdp + sspp[i]);
++			IOLog("SWEET FB: sspp %s%u: src0 %#x size %#x ystride %#x\n", i < 4 ? "vig" : "dma", i & 3, p[0x14 / 4],
++			    p[0], p[0x24 / 4]);
++		}
++		for (unsigned i = 0; i < 6; i++) {
++			volatile uint32_t *c = (volatile uint32_t *)(mdp + 0x2000 + 0x200 * i);
++			IOLog("SWEET FB: ctl%u: top %#x flush %#x layer %#x %#x %#x %#x %#x %#x\n", i, c[0x14 / 4], c[0x18 / 4],
++			    c[0], c[1], c[2], c[3], c[4], c[0x24 / 4]);
++		}
++	}
 +	fFrameDiv = (mhz + 30000) / 60000;     /* about 60 Hz for CoreAnimation: 124 Hz panel -> every 2nd frame */
 +	fFrameDiv = fFrameDiv ? fFrameDiv : 1;
 +	IOLog("SWEET FB: vsync on the panel: active lines %u..%u of %u, a tick every %u frame(s)\n", fActStart, fActEnd,
@@ -196,7 +222,7 @@
  	uint64_t now = mach_absolute_time();
  	uint64_t count = ++fb->fVsyncCount;
  	uint64_t values[6] = {
-@@ -239,10 +399,13 @@
+@@ -239,10 +425,20 @@
  				}
  			}
  		}
@@ -204,15 +230,21 @@
 +		fb->scheduleNext(sender);
  		return;
  	}
--	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
-+	bool flush = fb->fDirty && blank && (count % fb->fFlushTicks) == 0;
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
 +	if (!blank) {
 +		fb->fLateTicks++;
++	}
++	if (flush) {
++		fb->fPresents++;
++	}
++	if (fb->fIntf != NULL && (count % 600) == 0) {
++		IOLog("SWEET FB: %llu vsync ticks, %llu copies, %llu ticks missed the blanking\n", count, fb->fPresents,
++		    fb->fLateTicks);
 +	}
  	uint8_t *rec = NULL;
  	if (flush) {
  		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
-@@ -256,7 +419,7 @@
+@@ -256,7 +452,7 @@
  		fb->present(rec);
  		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
  	}
@@ -221,7 +253,7 @@
  }
  
  void
-@@ -304,7 +467,7 @@
+@@ -304,7 +500,7 @@
  	fDirty = true;
  	IOLockUnlock(fLock);
  	if ((++sweet_fb_swap_count % 1000) == 0) {
