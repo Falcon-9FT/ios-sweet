@@ -28,7 +28,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_adreno.c
-@@ -0,0 +1,1226 @@
+@@ -0,0 +1,1552 @@
 +/*
 + * SWEET vayu (SM8150, Adreno 640): GPU bring-up, milestone 1 - is the GPU block reachable.
 + * Steps after HakiOS hakios.adreno.c (oosexgang/hackios-xnu-kernel, APSL 2.0, steps 1-6 and 11),
@@ -57,6 +57,10 @@
 + * Milestone 3, GX (kgsl hfi_start, a6xx_gmu_oob_set):
 + *  14 HFI messages: firmware version, GPU/GMU level table with rail votes, bus table, core start
 + *  15 default GPU level, OOB gpu: the GMU votes the GX rail and powers the GX GDSC; RBBM status
++ * Milestone 4, the command processor (kgsl a6xx_start, a6xx_rb_start; HakiOS steps 18, 20, 21):
++ *  16 3D core memory (ring, a630_sqe.fw, scratch) and its SMMU context, stream 0
++ *  17 a640 registers, ring and microcode, CP out of halt, CP_ME_INIT
++ *  18 CP_MEM_WRITE into the scratch page; 19 (only if 18 failed) SECVID_TRUST_CNTL = 0 and again
 + * Up to step 13 nothing powers GX or changes a voltage. A started GMU is left running (its memory
 + * is never freed); after step 15 GX stays on (the OOB is not cleared).
 + */
@@ -123,7 +127,7 @@
 +#define SCM_INTERRUPTED         1
 +#define PAS_GPU                 13
 +
-+static vm_offset_t gcc, gpucc, gmu, smmu;
++static vm_offset_t gcc, gpucc, gmu, smmu, gpu3d;
 +static unsigned step_now;
 +static int gpu_chan;
 +
@@ -351,11 +355,12 @@
 +#define HFI_QUEUE_AT(i)         (((uint32_t)sizeof(struct hfi_qtbl) + 15u) / 16u * 16u + 4096u * (i))
 +
 +static vm_offset_t pdc_cfg, pdc_seq;
-+static uint32_t smmu_pgsz, smmu_npages, smmu_ctx, smmu_smr;
-+static const uint8_t *gmu_fw;
-+static uint32_t gmu_fw_size;
-+static uint64_t *pt_table[8];
-+static uint64_t pt_phys[8];
++static uint32_t smmu_pgsz, smmu_npages, smmu_ctx, smmu_smr, smmu_ncb, smmu_nsmr;
++static const uint8_t *gmu_fw, *sqe_fw;
++static uint32_t gmu_fw_size, sqe_fw_size;
++#define PT_TABLES       16u
++static uint64_t *pt_table[PT_TABLES];
++static uint64_t pt_phys[PT_TABLES];
 +static unsigned pt_count;
 +
 +/* Push this CPU's writes to memory the GPU block reads, and drop the lines (it writes some too). */
@@ -372,11 +377,11 @@
 +pt_new(void)
 +{
 +	static vm_offset_t pool;
-+	if (pool == 0 && kmem_alloc(kernel_map, &pool, 8 * 4096, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	if (pool == 0 && kmem_alloc(kernel_map, &pool, PT_TABLES * 4096, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
 +	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 +		return NULL;
 +	}
-+	if (pt_count == 8) {
++	if (pt_count == PT_TABLES) {
 +		return NULL;
 +	}
 +	pt_table[pt_count] = (uint64_t *)(pool + 4096u * pt_count);
@@ -403,16 +408,23 @@
 +	return t;
 +}
 +
++/* One table tree for both contexts (GMU: stream 5, 3D core: stream 0); their addresses do not overlap. */
 +static bool
-+pt_map(uint64_t va, uint64_t pa)
++pt_map_attr(uint64_t va, uint64_t pa, uint64_t attr)
 +{
 +	uint64_t *l1 = pt_count ? pt_table[0] : pt_new(), *l2, *l3;
 +	if (l1 == NULL || (l2 = pt_next(&l1[(va >> 30) & 0x1ff])) == NULL ||
 +	    (l3 = pt_next(&l2[(va >> 21) & 0x1ff])) == NULL) {
 +		return false;
 +	}
-+	l3[(va >> 12) & 0x1ff] = pa | PTE_GMU | PTE_VALID;
++	l3[(va >> 12) & 0x1ff] = pa | attr | PTE_VALID;
 +	return true;
++}
++
++static bool
++pt_map(uint64_t va, uint64_t pa)
++{
++	return pt_map_attr(va, pa, PTE_GMU);
 +}
 +
 +static uint32_t
@@ -421,12 +433,61 @@
 +	return (smmu_npages + ctx) * smmu_pgsz;
 +}
 +
++/* Fault status of a context; true if it recorded a translation fault (FSR bits 1-8, not the format field). */
++static bool
++smmu_fault_ctx(uint32_t ctx, const char *when)
++{
++	uint32_t c = cb(ctx), fsr = rd(smmu, c + SMMU_CB_FSR);
++	printf("SWEET GPU: SMMU context %u %s: fsr %#x far %#x%08x fsynr0 %#x, sgfsr %#x\n", ctx, when, fsr,
++	    rd(smmu, c + SMMU_CB_FAR + 4), rd(smmu, c + SMMU_CB_FAR), rd(smmu, c + SMMU_CB_FSYNR0), rd(smmu, SMMU_SGFSR));
++	return (fsr & 0x1feu) != 0;
++}
++
 +static void
 +smmu_fault_report(const char *when)
 +{
-+	uint32_t c = cb(smmu_ctx), fsr = rd(smmu, c + SMMU_CB_FSR);
-+	printf("SWEET GPU: SMMU context %u %s: fsr %#x far %#x%08x fsynr0 %#x, sgfsr %#x\n", smmu_ctx, when, fsr,
-+	    rd(smmu, c + SMMU_CB_FAR + 4), rd(smmu, c + SMMU_CB_FAR), rd(smmu, c + SMMU_CB_FSYNR0), rd(smmu, SMMU_SGFSR));
++	(void)smmu_fault_ctx(smmu_ctx, when);
++}
++
++/*
++ * HakiOS space_on: a context's registers first (stage 1, 64-bit, the shared tables with the context
++ * number as ASID), translation on, then the stream sent through it by a match; read back.
++ */
++static bool
++smmu_attach(uint32_t ctx, uint32_t smr_index, uint32_t stream, uint32_t mask)
++{
++	uint32_t c = cb(ctx), want = SMMU_SMR_VALID | mask << 16 | stream;
++	uint64_t ttbr = pt_phys[0] | (uint64_t)ctx << 48;
++	wr(smmu, c + SMMU_CB_SCTLR, 0);
++	wr(smmu, smmu_pgsz + SMMU_CBA2R(ctx), 1);       /* 64-bit */
++	wr(smmu, smmu_pgsz + SMMU_CBAR(ctx), SMMU_CBAR_S1);
++	wr(smmu, c + SMMU_CB_TCR2, SMMU_TCR2_36);
++	wr(smmu, c + SMMU_CB_TCR, SMMU_TCR_39);
++	wr(smmu, c + SMMU_CB_TTBR0, (uint32_t)ttbr);
++	wr(smmu, c + SMMU_CB_TTBR0 + 4, (uint32_t)(ttbr >> 32));
++	wr(smmu, c + SMMU_CB_TTBR1, 0);
++	wr(smmu, c + SMMU_CB_TTBR1 + 4, 0);
++	wr(smmu, c + SMMU_CB_MAIR0, SMMU_MAIR0);
++	wr(smmu, c + SMMU_CB_MAIR1, 0);
++	wr(smmu, c + SMMU_CB_FSR, SMMU_FSR_ALL);
++	wr(smmu, c + SMMU_CB_TLBIASID, ctx);
++	wr(smmu, c + SMMU_CB_TLBSYNC, 1);
++	for (unsigned i = 0; i < 1000 && (rd(smmu, c + SMMU_CB_TLBSTATUS) & 1); i++) {
++		delay(10);
++	}
++	wr(smmu, c + SMMU_CB_SCTLR, SMMU_SCTLR_ON);
++	wr(smmu, SMMU_S2CR(smr_index), ctx);
++	wr(smmu, SMMU_SMR(smr_index), want);
++	uint32_t smr = rd(smmu, SMMU_SMR(smr_index)), s2cr = rd(smmu, SMMU_S2CR(smr_index));
++	printf("SWEET GPU: SMMU cb%u: cbar %#x sctlr %#x tcr %#x ttbr0 %#x%08x; smr%u %#x s2cr %#x\n", ctx,
++	    rd(smmu, smmu_pgsz + SMMU_CBAR(ctx)), rd(smmu, c + SMMU_CB_SCTLR), rd(smmu, c + SMMU_CB_TCR),
++	    rd(smmu, c + SMMU_CB_TTBR0 + 4), rd(smmu, c + SMMU_CB_TTBR0), smr_index, smr, s2cr);
++	if (smr != want || (s2cr & 0x300ff) != ctx || !(rd(smmu, c + SMMU_CB_SCTLR) & 1) ||
++	    rd(smmu, c + SMMU_CB_TTBR0) != (uint32_t)ttbr) {
++		printf("SWEET GPU: the SMMU (or the hypervisor) did not take it\n");
++		return false;
++	}
++	return true;
 +}
 +
 +/* Step 8: the SMMU's layout and what the boot loader and hypervisor left in it; pick a context and a match. */
@@ -435,6 +496,8 @@
 +{
 +	uint32_t idr0 = rd(smmu, SMMU_IDR0), idr1 = rd(smmu, SMMU_IDR1);
 +	uint32_t nsmr = idr0 & 0xff, ncb = idr1 & 0xff, busy = 0;
++	smmu_nsmr = nsmr;
++	smmu_ncb = ncb;
 +	smmu_pgsz = (idr1 >> 31) ? 0x10000u : 0x1000u;
 +	smmu_npages = 2u << ((idr1 >> 28) & 7);
 +	printf("SWEET GPU: SMMU %u matches, %u contexts, %u pages of %#x (%#x of registers, dt 0x10000)\n", nsmr, ncb,
@@ -492,7 +555,8 @@
 +	 * copied out word by word (Device memory takes no unaligned or byte-wise memcpy).
 +	 */
 +	uint64_t pa = nvt_pa + ((nvt_size + 15u) & ~15u), base = pa & ~0x3fffull;
-+	vm_offset_t io = nvt_pa ? ml_io_map((vm_offset_t)base, (vm_size_t)((pa - base + 16u + 0x10000u + 0x3fffu) & ~0x3fffull)) : 0;
++	/* GMU firmware (up to 64K) and, after it, the CP microcode (build-payload.sh SQEFW=, up to 64K) */
++	vm_offset_t io = nvt_pa ? ml_io_map((vm_offset_t)base, (vm_size_t)((pa - base + 32u + 0x20000u + 0x3fffu) & ~0x3fffull)) : 0;
 +	volatile const uint32_t *w = (volatile const uint32_t *)(io + (pa - base));
 +	uint32_t magic[2];
 +	memcpy(magic, "SWEETGMU", 8);
@@ -511,6 +575,20 @@
 +		((uint32_t *)copy)[i] = w[4 + i];
 +	}
 +	gmu_fw = (const uint8_t *)copy;
++	volatile const uint32_t *s = w + 4 + ((gmu_fw_size + 15u) & ~15u) / 4u;
++	memcpy(magic, "SWEETSQE", 8);
++	if (s[0] == magic[0] && s[1] == magic[1] && s[2] >= 8 && s[2] <= 0x10000u && !(s[2] & 3) &&
++	    kmem_alloc(kernel_map, &copy, round_page(s[2]), KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
++		sqe_fw_size = s[2];
++		for (uint32_t i = 0; i < sqe_fw_size / 4u; i++) {
++			((uint32_t *)copy)[i] = s[4 + i];
++		}
++		sqe_fw = (const uint8_t *)copy;
++		printf("SWEET GPU: a630_sqe.fw: %u bytes, first words %#x %#x\n", sqe_fw_size, ((uint32_t *)copy)[0],
++		    ((uint32_t *)copy)[1]);
++	} else {
++		printf("SWEET GPU: no CP microcode after the GMU firmware (SQEFW=)\n");
++	}
 +	for (unsigned i = 0; i < GMU_MEMS; i++) {
 +		struct gmu_mem *m = &gmu_mem[i];
 +		if (kmem_alloc(kernel_map, &m->kva, round_page(m->size), KMA_KOBJECT | KMA_ZERO | KMA_DATA,
@@ -531,39 +609,7 @@
 +		to_memory((vm_offset_t)pt_table[i], 4096);
 +	}
 +
-+	/* HakiOS space_on: context registers first, translation on, then the stream sent through it */
-+	uint32_t c = cb(smmu_ctx);
-+	uint64_t ttbr = pt_phys[0] | (uint64_t)smmu_ctx << 48;
-+	wr(smmu, c + SMMU_CB_SCTLR, 0);
-+	wr(smmu, smmu_pgsz + SMMU_CBA2R(smmu_ctx), 1);  /* 64-bit */
-+	wr(smmu, smmu_pgsz + SMMU_CBAR(smmu_ctx), SMMU_CBAR_S1);
-+	wr(smmu, c + SMMU_CB_TCR2, SMMU_TCR2_36);
-+	wr(smmu, c + SMMU_CB_TCR, SMMU_TCR_39);
-+	wr(smmu, c + SMMU_CB_TTBR0, (uint32_t)ttbr);
-+	wr(smmu, c + SMMU_CB_TTBR0 + 4, (uint32_t)(ttbr >> 32));
-+	wr(smmu, c + SMMU_CB_TTBR1, 0);
-+	wr(smmu, c + SMMU_CB_TTBR1 + 4, 0);
-+	wr(smmu, c + SMMU_CB_MAIR0, SMMU_MAIR0);
-+	wr(smmu, c + SMMU_CB_MAIR1, 0);
-+	wr(smmu, c + SMMU_CB_FSR, SMMU_FSR_ALL);
-+	wr(smmu, c + SMMU_CB_TLBIASID, smmu_ctx);
-+	wr(smmu, c + SMMU_CB_TLBSYNC, 1);
-+	for (unsigned i = 0; i < 1000 && (rd(smmu, c + SMMU_CB_TLBSTATUS) & 1); i++) {
-+		delay(10);
-+	}
-+	wr(smmu, c + SMMU_CB_SCTLR, SMMU_SCTLR_ON);
-+	wr(smmu, SMMU_S2CR(smmu_smr), smmu_ctx);
-+	wr(smmu, SMMU_SMR(smmu_smr), SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | GMU_STREAM);
-+	uint32_t smr = rd(smmu, SMMU_SMR(smmu_smr)), s2cr = rd(smmu, SMMU_S2CR(smmu_smr));
-+	printf("SWEET GPU: SMMU cb%u: cbar %#x sctlr %#x tcr %#x ttbr0 %#x%08x; smr%u %#x s2cr %#x\n", smmu_ctx,
-+	    rd(smmu, smmu_pgsz + SMMU_CBAR(smmu_ctx)), rd(smmu, c + SMMU_CB_SCTLR), rd(smmu, c + SMMU_CB_TCR),
-+	    rd(smmu, c + SMMU_CB_TTBR0 + 4), rd(smmu, c + SMMU_CB_TTBR0), smmu_smr, smr, s2cr);
-+	if (smr != (SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | GMU_STREAM) || (s2cr & 0x300ff) != smmu_ctx ||
-+	    !(rd(smmu, c + SMMU_CB_SCTLR) & 1) || rd(smmu, c + SMMU_CB_TTBR0) != (uint32_t)ttbr) {
-+		printf("SWEET GPU: the SMMU (or the hypervisor) did not take it\n");
-+		return false;
-+	}
-+	return true;
++	return smmu_attach(smmu_ctx, smmu_smr, GMU_STREAM, SMMU_STREAM_MASK);
 +}
 +
 +/* Step 10: TCM retention, then the RSCC and PDC sequences (kgsl _load_gmu_rpmh_ucode, a640 values). */
@@ -772,7 +818,7 @@
 +#define GPU_QFPROM_PA           0x00784000u     /* page of qfprom 0x780000 + 0x4130 */
 +#define GPU_SPEED_BIN_OFF       0x130u
 +#define GPU_3D_PA               0x02c00000u
-+#define GPU_3D_SIZE             0x00003000u
++#define GPU_3D_SIZE             0x00040000u     /* dt kgsl_3d0_reg_memory */
 +#define GPU_RBBM_STATUS         (0x210u * 4u)
 +#define GPU_RBBM_STATUS3        (0x213u * 4u)
 +#define GPU_CP_HW_FAULT         (0x821u * 4u)
@@ -1065,12 +1111,269 @@
 +	if (!acked || !on) {
 +		return false;
 +	}
-+	vm_offset_t gpu = ml_io_map(GPU_3D_PA, GPU_3D_SIZE);
-+	if (gpu) {
-+		printf("SWEET GPU: 3D core: RBBM_STATUS %#x RBBM_STATUS3 %#x CP_HW_FAULT %#x\n", rd(gpu, GPU_RBBM_STATUS),
-+		    rd(gpu, GPU_RBBM_STATUS3), rd(gpu, GPU_CP_HW_FAULT));
++	gpu3d = ml_io_map(GPU_3D_PA, GPU_3D_SIZE);
++	if (gpu3d) {
++		printf("SWEET GPU: 3D core: RBBM_STATUS %#x RBBM_STATUS3 %#x CP_HW_FAULT %#x\n", rd(gpu3d, GPU_RBBM_STATUS),
++		    rd(gpu3d, GPU_RBBM_STATUS3), rd(gpu3d, GPU_CP_HW_FAULT));
 +	}
-+	return true;
++	return gpu3d != 0;
++}
++
++/*
++ * ---- milestone 4: the command processor (steps 16-19) ----
++ *
++ * HakiOS steps 18, 20, 21 with the a640 values of kgsl a6xx_start / a6xx_rb_start (vayu dt: GMEM 1 MB
++ * at GPU address 0x100000, highest-bank-bit 15, min-access-length 32, ubwc-mode 3; GBIF). The 3D
++ * core's requests (stream 0, dt gfx3d_user iommus <0 0x401>) go through another SMMU context into
++ * the same table tree as the GMU's: ring 32K at 0x01000000, the CP microcode (a630_sqe.fw without
++ * its first word) at 0x01100000, a scratch page at 0x01200000. Commands are PM4 type 7 packets with
++ * parity (adreno_pm4types.h); the ring's read pointer is not copied to memory (CP_RB_CNTL bit 27):
++ * CP_RB_RPTR is polled. The core starts in secure mode: a zap shader (TrustZone, PAS 13) takes it
++ * out (CP_SET_SECURE_MODE 0); without one kgsl writes RBBM_SECVID_TRUST_CNTL = 0 itself. Step 18
++ * first tries a memory write as the core is; step 19 only if that did not land.
++ */
++#define GPU_REG(w)              ((w) * 4u)
++#define CP_RB_BASE              GPU_REG(0x800u)
++#define CP_RB_CNTL              GPU_REG(0x802u)
++#define CP_RB_RPTR              GPU_REG(0x806u)
++#define CP_RB_WPTR              GPU_REG(0x807u)
++#define CP_SQE_CNTL             GPU_REG(0x808u)
++#define CP_INTERRUPT_STATUS     GPU_REG(0x823u)
++#define CP_PROTECT_STATUS       GPU_REG(0x824u)
++#define CP_SQE_INSTR_BASE       GPU_REG(0x830u)
++#define CP_ROQ_THRESHOLDS_1     GPU_REG(0x8c1u)
++#define CP_ROQ_THRESHOLDS_2     GPU_REG(0x8c2u)
++#define CP_MEM_POOL_SIZE        GPU_REG(0x8c3u)
++#define CP_AHB_CNTL             GPU_REG(0x98du)
++#define RBBM_GBIF_CLIENT_QOS_CNTL GPU_REG(0x011u)
++#define RBBM_GBIF_HALT          GPU_REG(0x016u)
++#define RBBM_INTERFACE_HANG_INT_CNTL GPU_REG(0x01fu)
++#define RBBM_INT_0_STATUS       GPU_REG(0x201u)
++#define RBBM_PERFCTR_CNTL       GPU_REG(0x500u)
++#define RBBM_PERFCTR_GPU_BUSY_MASKED GPU_REG(0x50bu)
++#define UCHE_MODE_CNTL          GPU_REG(0xe01u)
++#define UCHE_WRITE_RANGE_MAX    GPU_REG(0xe05u)
++#define UCHE_WRITE_THRU_BASE    GPU_REG(0xe07u)
++#define UCHE_TRAP_BASE          GPU_REG(0xe09u)
++#define UCHE_GMEM_RANGE_MIN     GPU_REG(0xe0bu)
++#define UCHE_GMEM_RANGE_MAX     GPU_REG(0xe0du)
++#define UCHE_CACHE_WAYS         GPU_REG(0xe17u)
++#define UCHE_FILTER_CNTL        GPU_REG(0xe18u)
++#define UCHE_CLIENT_PF          GPU_REG(0xe19u)
++#define GBIF_QSB_SIDE0          GPU_REG(0x3c03u)
++#define GBIF_HALT               GPU_REG(0x3c45u)
++#define RB_NC_MODE_CNTL         GPU_REG(0x8e08u)
++#define PC_DBG_ECO_CNTL         GPU_REG(0x9e00u)
++#define SP_NC_MODE_CNTL         GPU_REG(0xae02u)
++#define TPL1_NC_MODE_CNTL       GPU_REG(0xb604u)
++#define RBBM_SECVID_TRUST_CNTL  GPU_REG(0xf400u)
++#define RBBM_SECVID_TSB_TRUSTED_BASE GPU_REG(0xf800u)
++#define RBBM_SECVID_TSB_TRUSTED_SIZE GPU_REG(0xf802u)
++#define RBBM_SECVID_TSB_CNTL    GPU_REG(0xf803u)
++#define CP_RB_CNTL_VALUE        (12u | 2u << 8 | 1u << 27)      /* 2^12 quadwords, no read pointer in memory */
++#define PM4_ME_INIT             0x48u
++#define PM4_MEM_WRITE           0x3du
++#define CORE_STREAM             0u
++#define CORE_STREAM_MASK        0x401u
++#define CORE_RING_VA            0x01000000u
++#define CORE_RING_SIZE          0x8000u
++#define CORE_SQE_VA             0x01100000u
++#define CORE_SCRATCH_VA         0x01200000u
++#define PTE_CORE                (PTE_GMU | (1ull << 6))         /* + unprivileged access, as HakiOS */
++#define PTE_RO                  (1ull << 7)
++#define GMEM_BASE               0x00100000u
++#define GMEM_SIZE               0x00100000u
++
++static vm_offset_t core_ring, core_sqe, core_scratch;
++static uint32_t core_ctx = ~0u, ring_at, ring_sent;
++
++static uint32_t
++odd_parity(uint32_t v)
++{
++	return 0x9669u >> (0xfu & (v ^ v >> 4 ^ v >> 8 ^ v >> 12 ^ v >> 16 ^ v >> 20 ^ v >> 24 ^ v >> 28)) & 1u;
++}
++
++static void
++ring(uint32_t word)
++{
++	((volatile uint32_t *)core_ring)[ring_at] = word;
++	ring_at = (ring_at + 1u) % (CORE_RING_SIZE / 4u);
++}
++
++static void
++ring_cmd(uint32_t op, uint32_t words)
++{
++	ring(7u << 28 | words | odd_parity(words) << 15 | op << 16 | odd_parity(op) << 23);
++}
++
++static void
++wr64(vm_offset_t base, uint32_t off, uint64_t v)
++{
++	wr(base, off, (uint32_t)v);
++	wr(base, off + 4u, (uint32_t)(v >> 32));
++}
++
++/* Hand the core what is new in the ring; wait (2 s) until it has read it all and is idle. */
++static bool
++ring_run(const char *what)
++{
++	uint32_t taken = ~0u, status = ~0u;
++	to_memory(core_ring, CORE_RING_SIZE);
++	ring_sent = ring_at;
++	wr(gpu3d, CP_RB_WPTR, ring_at);
++	for (unsigned i = 0; i < 20000 && (taken != ring_at || (status & ~1u)); i++) {
++		delay(100);
++		taken = rd(gpu3d, CP_RB_RPTR);
++		status = rd(gpu3d, GPU_RBBM_STATUS);
++	}
++	bool fault = smmu_fault_ctx(core_ctx, what);
++	bool ok = taken == ring_at && !(status & ~1u) && rd(gpu3d, GPU_CP_HW_FAULT) == 0 && !fault;
++	printf("SWEET GPU: %s: ring read %u of %u, rbbm_status %#x, rbbm_int %#x, cp: fault %#x int %#x protect %#x%s\n",
++	    what, taken, ring_at, status, rd(gpu3d, RBBM_INT_0_STATUS), rd(gpu3d, GPU_CP_HW_FAULT),
++	    rd(gpu3d, CP_INTERRUPT_STATUS), rd(gpu3d, CP_PROTECT_STATUS), ok ? " - DONE" : " - NOT DONE");
++	return ok;
++}
++
++/* Kernel memory for the core, mapped at va with attr; zeroed and pushed to memory. */
++static vm_offset_t
++core_buffer(uint32_t va, uint32_t size, uint64_t attr)
++{
++	vm_offset_t kva = 0;
++	if (kmem_alloc(kernel_map, &kva, round_page(size), KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return 0;
++	}
++	for (uint32_t off = 0; off < size; off += 4096u) {
++		if (!pt_map_attr(va + off, kvtophys(kva + off), attr)) {
++			printf("SWEET GPU: page tables full at %#x\n", va + off);
++			return 0;
++		}
++	}
++	return kva;
++}
++
++/* Step 16: the core's memory and its SMMU context (stream 0, mask 0x401). */
++static bool
++core_memory(void)
++{
++	uint32_t smr = ~0u;
++	if (sqe_fw == NULL || sqe_fw_size <= 4) {
++		printf("SWEET GPU: no CP microcode\n");
++		return false;
++	}
++	for (uint32_t i = 0; i < smmu_ncb && core_ctx == ~0u; i++) {
++		if (i != smmu_ctx && !(rd(smmu, cb(i) + SMMU_CB_SCTLR) & 1)) {
++			core_ctx = i;
++		}
++	}
++	for (uint32_t i = 0; i < smmu_nsmr && smr == ~0u; i++) {
++		if (!(rd(smmu, SMMU_SMR(i)) & SMMU_SMR_VALID)) {
++			smr = i;
++		}
++	}
++	printf("SWEET GPU: 3D core stream %u/%#x goes through context %d, match %d\n", CORE_STREAM, CORE_STREAM_MASK,
++	    (int)core_ctx, (int)smr);
++	if (core_ctx == ~0u || smr == ~0u) {
++		return false;
++	}
++	core_ring = core_buffer(CORE_RING_VA, CORE_RING_SIZE, PTE_CORE);
++	core_sqe = core_buffer(CORE_SQE_VA, sqe_fw_size - 4u, PTE_CORE | PTE_RO);
++	core_scratch = core_buffer(CORE_SCRATCH_VA, 4096u, PTE_CORE);
++	if (!core_ring || !core_sqe || !core_scratch) {
++		return false;
++	}
++	memcpy((void *)core_sqe, sqe_fw + 4, sqe_fw_size - 4u);         /* the first word is not microcode */
++	to_memory(core_sqe, sqe_fw_size - 4u);
++	to_memory(core_ring, CORE_RING_SIZE);
++	to_memory(core_scratch, 4096u);
++	for (unsigned i = 0; i < pt_count; i++) {
++		to_memory((vm_offset_t)pt_table[i], 4096);
++	}
++	printf("SWEET GPU: ring %#x -> pa %#llx, microcode %#x (%u bytes) -> pa %#llx, scratch %#x -> pa %#llx; %u tables\n",
++	    CORE_RING_VA, kvtophys(core_ring), CORE_SQE_VA, sqe_fw_size - 4u, kvtophys(core_sqe), CORE_SCRATCH_VA,
++	    kvtophys(core_scratch), pt_count);
++	/* the GMU's context shares the tables: its cached walks of them are dropped too */
++	wr(smmu, cb(smmu_ctx) + SMMU_CB_TLBIASID, smmu_ctx);
++	return smmu_attach(core_ctx, smr, CORE_STREAM, CORE_STREAM_MASK);
++}
++
++/* Step 17: a6xx_start (a640), the ring and microcode, the CP out of halt, CP_ME_INIT. */
++static bool
++core_start(void)
++{
++	wr(gpu3d, GBIF_HALT, 0);
++	wr(gpu3d, RBBM_GBIF_HALT, 0);
++	wr(gpu3d, RBBM_SECVID_TSB_CNTL, 0);
++	wr64(gpu3d, RBBM_SECVID_TSB_TRUSTED_BASE, 0);
++	wr(gpu3d, RBBM_SECVID_TSB_TRUSTED_SIZE, 0);
++	static const uint32_t addr_mode[] = { 0x842, 0xc01, 0x8601, 0x8e05, 0x9e01, 0xbe05, 0xa601, 0x9601, 0xe00,
++		                              0xae01, 0xb601, 0xf810 };      /* a6xx_enable_64bit */
++	for (unsigned i = 0; i < sizeof(addr_mode) / sizeof(addr_mode[0]); i++) {
++		wr(gpu3d, GPU_REG(addr_mode[i]), 1);
++	}
++	for (unsigned i = 0; i < 4; i++) {
++		wr(gpu3d, GBIF_QSB_SIDE0 + 4u * i, 0x00071620u);        /* a640_gbif */
++	}
++	wr(gpu3d, RBBM_GBIF_CLIENT_QOS_CNTL, 3);
++	wr(gpu3d, RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffffu);
++	wr64(gpu3d, UCHE_WRITE_RANGE_MAX, 0x0001ffffffffffc0ull);
++	wr64(gpu3d, UCHE_TRAP_BASE, 0x0001fffffffff000ull);
++	wr64(gpu3d, UCHE_WRITE_THRU_BASE, 0x0001fffffffff000ull);
++	wr64(gpu3d, UCHE_GMEM_RANGE_MIN, GMEM_BASE);
++	wr64(gpu3d, UCHE_GMEM_RANGE_MAX, GMEM_BASE + GMEM_SIZE - 1u);
++	wr(gpu3d, UCHE_FILTER_CNTL, 0x804);
++	wr(gpu3d, UCHE_CACHE_WAYS, 0x4);
++	wr(gpu3d, CP_ROQ_THRESHOLDS_2, 0x02000140u);    /* a640 */
++	wr(gpu3d, CP_ROQ_THRESHOLDS_1, 0x8040362cu);
++	wr(gpu3d, CP_MEM_POOL_SIZE, 128);
++	wr(gpu3d, PC_DBG_ECO_CNTL, 0x400u << 11);       /* a640 primFifo threshold */
++	wr(gpu3d, CP_AHB_CNTL, 1);
++	wr(gpu3d, RBBM_PERFCTR_CNTL, 1);
++	/* UBWC 3.0: mode 0 + amsbc; hbb 15 -> 2; mal 32 -> 0 */
++	wr(gpu3d, RB_NC_MODE_CNTL, 1u << 4 | 2u << 1);
++	wr(gpu3d, TPL1_NC_MODE_CNTL, 2u << 1);
++	wr(gpu3d, SP_NC_MODE_CNTL, 2u << 1);
++	wr(gpu3d, UCHE_MODE_CNTL, 2u << 21);
++	wr(gpu3d, RBBM_INTERFACE_HANG_INT_CNTL, 1u << 30 | 0xcfffffu);
++	wr(gpu3d, UCHE_CLIENT_PF, 1);
++	wr64(gpu3d, CP_SQE_INSTR_BASE, CORE_SQE_VA);
++	wr64(gpu3d, CP_RB_BASE, CORE_RING_VA);
++	wr(gpu3d, CP_RB_CNTL, CP_RB_CNTL_VALUE);
++	printf("SWEET GPU: sqe_instr_base %#x rb_base %#x rb_cntl %#x rb_rptr %u wptr %u rbbm_status %#x\n",
++	    rd(gpu3d, CP_SQE_INSTR_BASE), rd(gpu3d, CP_RB_BASE), rd(gpu3d, CP_RB_CNTL), rd(gpu3d, CP_RB_RPTR),
++	    rd(gpu3d, CP_RB_WPTR), rd(gpu3d, GPU_RBBM_STATUS));
++	wr(gpu3d, CP_SQE_CNTL, 1);
++	sleep_ms(20);
++	printf("SWEET GPU: CP out of halt: rbbm_status %#x rbbm_int %#x cp: fault %#x int %#x protect %#x, rptr %u\n",
++	    rd(gpu3d, GPU_RBBM_STATUS), rd(gpu3d, RBBM_INT_0_STATUS), rd(gpu3d, GPU_CP_HW_FAULT),
++	    rd(gpu3d, CP_INTERRUPT_STATUS), rd(gpu3d, CP_PROTECT_STATUS), rd(gpu3d, CP_RB_RPTR));
++	if (smmu_fault_ctx(core_ctx, "after the CP start")) {
++		return false;
++	}
++	ring_cmd(PM4_ME_INIT, 8);                       /* upstream a6xx_cp_init */
++	ring(0x0000002fu);
++	ring(0x00000003u);                              /* multiple hardware contexts */
++	ring(0x20000000u);                              /* error detection */
++	for (unsigned i = 0; i < 5; i++) {
++		ring(0);
++	}
++	return ring_run("CP_ME_INIT");
++}
++
++/* Steps 18-19: CP_MEM_WRITE of a word into the scratch page; true if it is there. */
++static bool
++core_write(uint32_t value)
++{
++	ring_cmd(PM4_MEM_WRITE, 3);
++	ring(CORE_SCRATCH_VA);
++	ring(0);
++	ring(value);
++	(void)ring_run("CP_MEM_WRITE");
++	to_memory(core_scratch, 64);
++	uint32_t got = *(volatile uint32_t *)core_scratch;
++	printf("SWEET GPU: scratch reads %#x (told %#x)%s\n", got, value,
++	    got == value ? " - THE 3D CORE WRITES OUR MEMORY ON COMMAND" : "");
++	return got == value;
 +}
 +
 +static void
@@ -1227,8 +1530,31 @@
 +		goto out;
 +	}
 +	announce(15, "default GPU level, OOB gpu: the GMU powers GX; 3D core status");
-+	if (gmu_gx_on()) {
-+		printf("SWEET GPU: milestone 3 done - GX is on\n");
++	if (!gmu_gx_on()) {
++		goto out;
++	}
++	printf("SWEET GPU: milestone 3 done - GX is on\n");
++	if (last < 16) {
++		goto out;
++	}
++	announce(16, "3D core memory: ring, CP microcode, scratch; SMMU context for stream 0");
++	if (!core_memory() || last < 17) {
++		goto out;
++	}
++	announce(17, "a640 hw init, ring and microcode, CP out of halt, CP_ME_INIT");
++	if (!core_start() || last < 18) {
++		goto out;
++	}
++	announce(18, "CP_MEM_WRITE into the scratch page (secure mode as it is)");
++	bool wrote = core_write(0x600dc0deu);
++	if (!wrote && last >= 19) {
++		announce(19, "RBBM_SECVID_TRUST_CNTL = 0 (kgsl without a zap shader), CP_MEM_WRITE again");
++		wr(gpu3d, RBBM_SECVID_TRUST_CNTL, 0);
++		printf("SWEET GPU: secvid_trust_cntl reads %#x\n", rd(gpu3d, RBBM_SECVID_TRUST_CNTL));
++		wrote = core_write(0x0dd0c0deu);
++	}
++	if (wrote) {
++		printf("SWEET GPU: milestone 4 done - the command processor runs our commands\n");
 +	}
 +out:
 +	printf("SWEET GPU: stopped after step %u\n", step_now);
