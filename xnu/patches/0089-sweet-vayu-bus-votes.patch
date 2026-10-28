@@ -1,0 +1,289 @@
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -2,16 +2,32 @@
+  * SWEET PM6150L L11C bring-up; see report.md for DT and source evidence.
+  * Sole XNU apps-DRV owner, called from thread context with deep idle disabled.
+  * No sleep/wake programming, SPMI writes, GIC handler, or timeout recovery.
++ *
++ * vayu (SM8150) has the same apps RSC (dt mailbox@18220000 "apps_rsc": 0x18220000 + TCS 0x18220d00,
++ * drv-id 2, tcs-config ACTIVE 2 / SLEEP 3 / WAKE 3 / CONTROL 1) and cmd-db locator (0xc3f000c).
++ * Boot-arg sweetbw=1 also votes the DDR and system-cache bus clock managers (BCM "MC0", "SH0")
++ * to their highest level, as an active-only request: without a bus driver nobody asks RPMh for
++ * bandwidth and CoreAnimation's CPU renderer is memory-bound. A copy of 16 MB is timed before
++ * and after the vote.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+ #include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <vm/vm_kern.h>
++#include <string.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* Mach declaration not included by BSD's exported thread.h. */
++extern kern_return_t thread_terminate(thread_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++int sweet_rpmh_bcm_max(const char *const *names, unsigned count);
++void sweet_bw_init(void);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+@@ -44,7 +60,11 @@
+ #define RH_DB_ENTRY     24u
+ #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
+ #define RH_VRM          4u
++#define RH_BCM          5u
+ #define RH_TIMEOUT_US   100000u
++/* Linux include/soc/qcom/tcs.h BCM_TCS_CMD(commit, valid, vote_x, vote_y) */
++#define RH_BCM_CMD(x, y) ((1u << 30) | (1u << 29) | (((x) & 0x3fffu) << 14) | ((y) & 0x3fffu))
++#define RH_MAX_CMDS     4u
+ 
+ static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
+ static uint32_t rh_db_size;
+@@ -159,7 +179,7 @@
+ }
+ 
+ static int
+-rh_lookup(const char *res, uint32_t *address)
++rh_lookup(const char *res, unsigned type, uint32_t *address)
+ {
+ 	uint32_t key[2] = {0, 0};
+ 	for (unsigned i = 0; i < 8 && res[i]; ++i) {
+@@ -186,9 +206,9 @@
+ 				continue;
+ 			}
+ 			uint32_t addr = rh_read(rh_db, e + 16);
+-			if (slave != RH_VRM || (addr >> 16) != RH_VRM || (addr & 15u) ||
++			if (slave != type || (addr >> 16) != type || (addr & (type == RH_VRM ? 15u : 3u)) ||
+ 			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
+-				printf("SWEET RPMH: invalid VRM entry for %s\n", res);
++				printf("SWEET RPMH: invalid entry for %s (slave %u addr %#x, want %u)\n", res, slave, addr, type);
+ 				return EINVAL;
+ 			}
+ 			*address = addr;
+@@ -218,10 +238,15 @@
+ 	    !(rh_read(rh_tcs, RH_IRQ_STATUS) & (1u << t));
+ }
+ 
++/* One ACTIVE (AMC) request of n commands, each a write with response; `what` names it in the log. */
+ static int
+-rh_send(uint32_t address, unsigned mv)
++rh_send(const uint32_t *addresses, const uint32_t *values, unsigned n, const char *what)
+ {
+ 	int chosen = -1;
++	uint32_t mask = (1u << n) - 1u;
++	if (n == 0 || n > RH_MAX_CMDS || n > rh_ncpt) {
++		return EINVAL;
++	}
+ 	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
+ 		uint32_t b = t * RH_TCS_STRIDE;
+ 		uint32_t enabled = rh_read(rh_tcs, b + RH_ENABLE);
+@@ -232,10 +257,12 @@
+ 			return EIO;
+ 		}
+ 		for (unsigned c = 0; c < rh_ncpt; ++c) {
+-			if ((enabled & (1u << c)) &&
+-			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
+-				printf("SWEET RPMH: conflicting inherited L11C request in TCS%u\n", t);
+-				return EBUSY;
++			uint32_t inherited = rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE);
++			for (unsigned k = 0; (enabled & (1u << c)) && k < n; ++k) {
++				if (inherited == addresses[k]) {
++					printf("SWEET RPMH: conflicting inherited %s request in TCS%u\n", what, t);
++					return EBUSY;
++				}
+ 			}
+ 		}
+ 		if (chosen < 0 && rh_free(t)) {
+@@ -266,30 +293,27 @@
+ 	}
+ 	/* From here an uncertain write/timeout quarantines our slot for this boot. */
+ 	rh_poisoned = true;
+-	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
+-	const uint32_t offsets[3] = {0, 8, 4};
+-	const uint32_t values[3] = {mv, 7, 1};
+-	printf("SWEET RPMH: TCS%u ACTIVE %u mV mode=7 enable=1 irq-enable=%#x\n", t, mv, irq_en);
+-	for (unsigned c = 0; c < 3; ++c) {
++	printf("SWEET RPMH: TCS%u ACTIVE %s, %u commands, irq-enable=%#x\n", t, what, n, irq_en);
++	for (unsigned c = 0; c < n; ++c) {
+ 		uint32_t cmd = b + c * RH_CMD_STRIDE;
+ 		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
+-		    !rh_sync(cmd + RH_ADDR, address + offsets[c]) ||
++		    !rh_sync(cmd + RH_ADDR, addresses[c]) ||
+ 		    !rh_sync(cmd + RH_DATA, values[c])) {
+ 			return EIO;
+ 		}
+ 	}
+-	if (!rh_sync(b + RH_WAIT, 7) || !rh_sync(b + RH_ENABLE, 7) ||
++	if (!rh_sync(b + RH_WAIT, mask) || !rh_sync(b + RH_ENABLE, mask) ||
+ 	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
+ 		return EIO;
+ 	}
+ 	rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
+-	uint32_t irq = 0, idle = 0, status[3] = {0, 0, 0};
++	uint32_t irq = 0, idle = 0, status[RH_MAX_CMDS] = {0, 0, 0, 0};
+ 	bool done = false, progress = false;
+ 	for (unsigned us = 0; us < RH_TIMEOUT_US; ++us) {
+ 		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
+ 		idle = rh_read(rh_tcs, b + RH_STATUS);
+ 		bool complete = true;
+-		for (unsigned c = 0; c < 3; ++c) {
++		for (unsigned c = 0; c < n; ++c) {
+ 			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
+ 			complete &= status[c] != 0xffffffffu &&
+ 			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
+@@ -303,8 +327,8 @@
+ 		}
+ 		delay(1);
+ 	}
+-	printf("SWEET RPMH: TCS%u done=%d irq=%#x idle=%#x control=%#x cmd-status=%#x/%#x/%#x\n",
+-	    t, done, irq, idle, rh_read(rh_tcs, b + RH_CONTROL), status[0], status[1], status[2]);
++	printf("SWEET RPMH: TCS%u done=%d irq=%#x idle=%#x control=%#x cmd-status=%#x/%#x/%#x/%#x\n",
++	    t, done, irq, idle, rh_read(rh_tcs, b + RH_CONTROL), status[0], status[1], status[2], status[3]);
+ 	if (!done) {
+ 		printf("SWEET RPMH: timeout; TCS quarantined, IRQ remains masked; no reset/retry\n");
+ 		return ETIMEDOUT;
+@@ -320,7 +344,7 @@
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+-	printf("SWEET RPMH: L11C ACTIVE vote complete (rail voltage requires hardware verification)\n");
++	printf("SWEET RPMH: %s ACTIVE vote complete\n", what);
+ 	return 0;
+ }
+ 
+@@ -343,10 +367,13 @@
+ 	}
+ 	error = rh_map();
+ 	if (!error) {
+-		error = rh_lookup(res, &address);
++		error = rh_lookup(res, RH_VRM, &address);
+ 	}
+ 	if (!error) {
+-		error = rh_send(address, mv);
++		/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
++		const uint32_t addresses[3] = {address, address + 8, address + 4};
++		const uint32_t values[3] = {mv, 7, 1};
++		error = rh_send(addresses, values, 3, "L11C");
+ 	}
+ out:
+ 	if (error) {
+@@ -355,4 +382,95 @@
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++
++/* Highest level of each named bus clock manager (BCM), one active-only request, commit on each. */
++int
++sweet_rpmh_bcm_max(const char *const *names, unsigned count)
++{
++	uint32_t addresses[RH_MAX_CMDS], values[RH_MAX_CMDS];
++	if (count == 0 || count > RH_MAX_CMDS) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = rh_poisoned ? EIO : rh_map();
++	for (unsigned i = 0; !error && i < count; ++i) {
++		error = rh_lookup(names[i], RH_BCM, &addresses[i]);
++		values[i] = RH_BCM_CMD(0x3fffu, 0x3fffu);
++	}
++	if (!error) {
++		error = rh_send(addresses, values, count, "BCM max");
++	}
++	if (error) {
++		printf("SWEET RPMH: BCM vote failed errno=%d\n", error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
++/* MB/s of a 16 MB memcpy, best of 4 (cached kernel memory, the CPU renderer's kind of work). */
++static unsigned
++bw_measure(vm_offset_t a, vm_offset_t b, vm_size_t size)
++{
++	uint64_t best = UINT64_MAX;
++	for (int i = 0; i < 4; i++) {
++		uint64_t t0 = mach_absolute_time();
++		memcpy((void *)b, (const void *)a, size);
++		uint64_t dt = mach_absolute_time() - t0;
++		best = dt < best ? dt : best;
++	}
++	uint64_t ns;
++	absolutetime_to_nanoseconds(best, &ns);
++	return ns ? (unsigned)((uint64_t)size * 1000u / ns) : 0;      /* bytes/ns * 1000 = MB/s */
++}
++
++static int bw_chan;
++
++static void
++bw_thread(void *arg, wait_result_t result)
++{
++	static const char *const bcms[] = { "MC0", "SH0" };
++	const vm_size_t size = 16u << 20;
++	vm_offset_t a = 0, b = 0;
++	uint64_t deadline;
++	(void)arg;
++	(void)result;
++	clock_interval_to_deadline(15, NSEC_PER_SEC, &deadline);        /* after the boot rush */
++	(void)assert_wait_deadline(&bw_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++	if (kmem_alloc(kernel_map, &a, size, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
++	    kmem_alloc(kernel_map, &b, size, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET BW: no memory for the copy test\n");
++		goto out;
++	}
++	memset((void *)a, 0x5a, size);
++	printf("SWEET BW: memcpy 16 MB before the vote: %u MB/s\n", bw_measure(a, b, size));
++	if (sweet_rpmh_bcm_max(bcms, 2) == 0) {
++		clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&bw_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++		printf("SWEET BW: memcpy 16 MB after MC0+SH0 max: %u MB/s\n", bw_measure(a, b, size));
++	}
++	kmem_free(kernel_map, a, size);
++	kmem_free(kernel_map, b, size);
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_bw_init(void)
++{
++	static bool started;
++	int on = 0;
++	thread_t thread;
++	if (started || !PE_parse_boot_argn("sweetbw", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	started = true;
++	if (kernel_thread_start(bw_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -55,6 +55,7 @@
+ extern void sweet_nvt_init(void);
+ extern void sweet_cpufreq_init(void);
+ extern void sweet_adreno_init(void);
++extern void sweet_bw_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -665,6 +666,7 @@
+ 	sweet_nvt_init();        /* vayu NT36672C, boot-arg sweetnvt=1 */
+ 	sweet_cpufreq_init();    /* vayu OSM clocks, boot-arg sweetcpufreq */
+ 	sweet_adreno_init();     /* vayu Adreno 640 bring-up, boot-arg sweetgpu */
++	sweet_bw_init();         /* vayu DDR/LLCC bus votes, boot-arg sweetbw */
+ 	sweet_usb_probe();
+ 	return 0;
+ }
