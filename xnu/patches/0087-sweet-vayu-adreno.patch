@@ -28,7 +28,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_adreno.c
-@@ -0,0 +1,1687 @@
+@@ -0,0 +1,1715 @@
 +/*
 + * SWEET vayu (SM8150, Adreno 640): GPU bring-up, milestone 1 - is the GPU block reachable.
 + * Steps after HakiOS hakios.adreno.c (oosexgang/hackios-xnu-kernel, APSL 2.0, steps 1-6 and 11),
@@ -62,6 +62,7 @@
 + *  17 a640 registers, ring and microcode, CP out of halt, CP_ME_INIT
 + *  18 CP_MEM_WRITE into the scratch page; 19 (only if 18 failed) SECVID_TRUST_CNTL = 0 and again
 + * Milestone 5: 20 the 2D engine fills a frame with three bands; shown on the panel for 10 s
++ *  21 (only if 20's frame stayed empty) RBBM_SECVID_TRUST_CNTL = 0 (out of secure mode) and fill again
 + * Up to step 13 nothing powers GX or changes a voltage. A started GMU is left running (its memory
 + * is never freed); after step 15 GX stays on (the OOB is not cleared).
 + */
@@ -1448,21 +1449,21 @@
 +	ring(3);                                        /* BLIT_OP_SCALE: the 2D engine's one operation */
 +}
 +
-+/* Step 20: three bands of colour filled by the 2D engine; checked, then on the panel. */
++/*
++ * Steps 20-21: three bands of colour filled by the 2D engine and checked. On the phone (iOS/runs/ios-gpu6)
++ * the CP took every word and wrote the flush stamps, but the frame stayed zero: the 3D core starts in
++ * secure mode and its pipeline's writes are then secure ones (dt gfx3d_secure: stream 2, not ours); the
++ * CP's own (CP_MEM_WRITE, event stamps) are not. Step 21 does what kgsl does without a zap shader
++ * (adreno_set_unsecured_mode: RBBM_SECVID_TRUST_CNTL = 0) and fills again.
++ */
 +static bool
-+core_draw(void)
++core_fill(void)
 +{
-+	core_frame = core_buffer(CORE_FRAME_VA, FRAME_ROW * FRAME_H, PTE_CORE);
-+	if (!core_frame) {
-+		return false;
-+	}
-+	to_memory(core_frame, FRAME_ROW * FRAME_H);
-+	for (unsigned i = 0; i < pt_count; i++) {
-+		to_memory((vm_offset_t)pt_table[i], 4096);
-+	}
-+	printf("SWEET GPU: frame %#x (%u bytes) -> pa %#llx; %u tables\n", CORE_FRAME_VA, FRAME_ROW * FRAME_H,
-+	    kvtophys(core_frame), pt_count);
 +	volatile uint32_t *scratch = (volatile uint32_t *)core_scratch;
++	scratch[4] = scratch[8] = 0;
++	bzero((void *)core_frame, 4);
++	to_memory(core_scratch, 64);
++	to_memory(core_frame, 64);
 +	ring_cmd(PM4_SET_MARKER, 1);
 +	ring(MARK_BLIT2DSCALE);
 +	ring_reg(RB_CCU_CNTL, CCU_BYPASS);
@@ -1494,7 +1495,34 @@
 +	bool ok = p[0] == 0x00 && p[1] == 0x80 && p[2] == 0xff && p[mid] == 0xff && p[mid + 1] == 0xff &&
 +	    p[last] == 0xff && p[last + 1] == 0x80 && p[last + 2] == 0x00;
 +	if (!ok) {
-+		printf("SWEET GPU: the frame is not what the 2D engine was told to draw\n");
++		printf("SWEET GPU: the frame is not what the 2D engine was told to draw (secvid_trust_cntl %#x)\n",
++		    rd(gpu3d, RBBM_SECVID_TRUST_CNTL));
++	}
++	return ok;
++}
++
++static bool
++core_draw(unsigned last)
++{
++	core_frame = core_buffer(CORE_FRAME_VA, FRAME_ROW * FRAME_H, PTE_CORE);
++	if (!core_frame) {
++		return false;
++	}
++	to_memory(core_frame, FRAME_ROW * FRAME_H);
++	for (unsigned i = 0; i < pt_count; i++) {
++		to_memory((vm_offset_t)pt_table[i], 4096);
++	}
++	printf("SWEET GPU: frame %#x (%u bytes) -> pa %#llx; %u tables\n", CORE_FRAME_VA, FRAME_ROW * FRAME_H,
++	    kvtophys(core_frame), pt_count);
++	bool ok = core_fill();
++	if (!ok && last >= 21) {
++		announce(21, "out of secure mode as kgsl without a zap shader: RBBM_SECVID_TRUST_CNTL = 0; fill again");
++		printf("SWEET GPU: secvid_trust_cntl %#x before\n", rd(gpu3d, RBBM_SECVID_TRUST_CNTL));
++		wr(gpu3d, RBBM_SECVID_TRUST_CNTL, 0);
++		printf("SWEET GPU: secvid_trust_cntl %#x after writing 0\n", rd(gpu3d, RBBM_SECVID_TRUST_CNTL));
++		ok = core_fill();
++	}
++	if (!ok) {
 +		return false;
 +	}
 +	int shown = sweet_fb_show((const uint8_t *)core_frame, FRAME_W, FRAME_H, FRAME_ROW, 10000);
@@ -1688,7 +1716,7 @@
 +		goto out;
 +	}
 +	announce(20, "2D engine: fill a 1080x2400 frame with three bands, show it on the panel for 10 s");
-+	if (core_draw()) {
++	if (core_draw(last)) {
 +		printf("SWEET GPU: milestone 5 done - the GPU draws\n");
 +	}
 +out:
