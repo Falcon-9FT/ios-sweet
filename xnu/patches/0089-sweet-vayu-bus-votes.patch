@@ -1,6 +1,6 @@
 --- a/bsd/dev/sweet_rpmh.c
 +++ b/bsd/dev/sweet_rpmh.c
-@@ -2,16 +2,34 @@
+@@ -2,16 +2,35 @@
   * SWEET PM6150L L11C bring-up; see report.md for DT and source evidence.
   * Sole XNU apps-DRV owner, called from thread context with deep idle disabled.
   * No sleep/wake programming, SPMI writes, GIC handler, or timeout recovery.
@@ -31,11 +31,12 @@
 +extern struct processor *thread_bind(struct processor *processor);
  int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
 +int sweet_rpmh_bcm_max(const char *const *names, unsigned count);
++int sweet_rpmh_cmd_db(const char *res, unsigned type, uint32_t *address, uint16_t *levels, unsigned max, unsigned *count);
 +void sweet_bw_init(void);
  
  /* Live downstream DT has two positional reg entries, no reg-names. */
  #define RH_RSC_PA       0x18220000u
-@@ -44,7 +62,11 @@
+@@ -44,7 +63,11 @@
  #define RH_DB_ENTRY     24u
  #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
  #define RH_VRM          4u
@@ -47,16 +48,18 @@
  
  static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
  static uint32_t rh_db_size;
-@@ -159,7 +181,7 @@
+@@ -158,8 +181,9 @@
+ 	return 0;
  }
  
++/* aux_off/aux_len (may be NULL): the entry's auxiliary data in the command DB. */
  static int
 -rh_lookup(const char *res, uint32_t *address)
-+rh_lookup(const char *res, unsigned type, uint32_t *address)
++rh_lookup_aux(const char *res, unsigned type, uint32_t *address, uint32_t *aux_off, uint32_t *aux_len)
  {
  	uint32_t key[2] = {0, 0};
  	for (unsigned i = 0; i < 8 && res[i]; ++i) {
-@@ -186,9 +208,9 @@
+@@ -186,12 +210,16 @@
  				continue;
  			}
  			uint32_t addr = rh_read(rh_db, e + 16);
@@ -68,7 +71,27 @@
  				return EINVAL;
  			}
  			*address = addr;
-@@ -218,10 +240,15 @@
++			if (aux_off != NULL) {
++				*aux_off = aux + rh_db16(e + 22);
++				*aux_len = rh_db16(e + 20);
++			}
+ 			++matches;
+ 			printf("SWEET RPMH: %s addr=%#x slave=%u aux-version=%#x priority=%#x:%#x\n",
+ 			    res, addr, slave, rh_db16(h + 8),
+@@ -205,6 +233,12 @@
+ 	return 0;
+ }
+ 
++static int
++rh_lookup(const char *res, unsigned type, uint32_t *address)
++{
++	return rh_lookup_aux(res, type, address, NULL, NULL);
++}
++
+ static bool
+ rh_free(unsigned t)
+ {
+@@ -218,10 +252,15 @@
  	    !(rh_read(rh_tcs, RH_IRQ_STATUS) & (1u << t));
  }
  
@@ -85,7 +108,7 @@
  	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
  		uint32_t b = t * RH_TCS_STRIDE;
  		uint32_t enabled = rh_read(rh_tcs, b + RH_ENABLE);
-@@ -232,10 +259,12 @@
+@@ -232,10 +271,12 @@
  			return EIO;
  		}
  		for (unsigned c = 0; c < rh_ncpt; ++c) {
@@ -102,7 +125,7 @@
  			}
  		}
  		if (chosen < 0 && rh_free(t)) {
-@@ -266,30 +295,27 @@
+@@ -266,30 +307,27 @@
  	}
  	/* From here an uncertain write/timeout quarantines our slot for this boot. */
  	rh_poisoned = true;
@@ -139,7 +162,7 @@
  			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
  			complete &= status[c] != 0xffffffffu &&
  			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
-@@ -303,8 +329,8 @@
+@@ -303,8 +341,8 @@
  		}
  		delay(1);
  	}
@@ -150,7 +173,7 @@
  	if (!done) {
  		printf("SWEET RPMH: timeout; TCS quarantined, IRQ remains masked; no reset/retry\n");
  		return ETIMEDOUT;
-@@ -320,7 +346,7 @@
+@@ -320,7 +358,7 @@
  		return EIO;
  	}
  	rh_poisoned = false;
@@ -159,7 +182,7 @@
  	return 0;
  }
  
-@@ -343,10 +369,13 @@
+@@ -343,10 +381,13 @@
  	}
  	error = rh_map();
  	if (!error) {
@@ -175,7 +198,7 @@
  	}
  out:
  	if (error) {
-@@ -355,4 +384,111 @@
+@@ -355,4 +396,147 @@
  	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
  	return error;
  }
@@ -201,6 +224,42 @@
 +	}
 +	if (error) {
 +		printf("SWEET RPMH: BCM vote failed errno=%d\n", error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
++/*
++ * Read-only command DB queries for the GPU (sweet_adreno.c): a resource's address, and for a rail
++ * (ARC, type 3: "gfx.lvl", "cx.lvl", "mx.lvl") its voltage level table - the auxiliary data, little
++ * endian u16, zero padded; count as kgsl rpmh_arc_cmds (up to the first value followed by 0).
++ */
++int
++sweet_rpmh_cmd_db(const char *res, unsigned type, uint32_t *address, uint16_t *levels, unsigned max, unsigned *count)
++{
++	uint32_t off = 0, len = 0;
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = rh_map();
++	if (!error) {
++		error = rh_lookup_aux(res, type, address, &off, &len);
++	}
++	if (!error && levels != NULL) {
++		unsigned n = len / 2u, i;
++		if (n == 0 || n > max) {
++			error = ERANGE;
++		} else {
++			for (i = 0; i < n; i++) {
++				levels[i] = rh_db16(off + 2u * i);
++			}
++			for (i = 1; i < n; i++) {
++				if (levels[i - 1] != 0 && levels[i] == 0) {
++					break;
++				}
++			}
++			*count = i;
++		}
 +	}
 +	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
 +	return error;

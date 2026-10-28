@@ -28,7 +28,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_adreno.c
-@@ -0,0 +1,884 @@
+@@ -0,0 +1,1226 @@
 +/*
 + * SWEET vayu (SM8150, Adreno 640): GPU bring-up, milestone 1 - is the GPU block reachable.
 + * Steps after HakiOS hakios.adreno.c (oosexgang/hackios-xnu-kernel, APSL 2.0, steps 1-6 and 11),
@@ -54,8 +54,11 @@
 + *  11 a640_gmu.bin into the TCMs (registers) and DDR
 + *  12 GMU registers, CM3 out of reset, wait for 0xbabeface
 + *  13 HFI init
-+ * Nothing powers GX or changes a voltage; the CX rail is the SoC's, already on. A started GMU
-+ * is left running (its memory is never freed): it only moves on HFI messages, none are sent.
++ * Milestone 3, GX (kgsl hfi_start, a6xx_gmu_oob_set):
++ *  14 HFI messages: firmware version, GPU/GMU level table with rail votes, bus table, core start
++ *  15 default GPU level, OOB gpu: the GMU votes the GX rail and powers the GX GDSC; RBBM status
++ * Up to step 13 nothing powers GX or changes a voltage. A started GMU is left running (its memory
++ * is never freed); after step 15 GX stays on (the OOB is not cleared).
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -743,6 +746,333 @@
 +	return (s & 1) != 0;
 +}
 +
++/*
++ * ---- milestone 3: GX on (steps 14-15) ----
++ *
++ * kgsl hfi_start for an a640 (HFI 2.x, no H2F_MSG_INIT): FW_VER, PERF_TBL (GPU and GMU levels with
++ * their rail votes), BW_VOTE_TBL, FEATURE_CTRL ECP off, CORE_FW_START; each is acked through the
++ * message queue (GMU2HOST_INTR_INFO bit 0, polled - no interrupts). Then the default DCVS level
++ * (GX_BW_PERF_VOTE) and OOB "gpu" (a6xx_gmu_oob_set: HOST2GMU bit 30, ack GMU2HOST bit 31): the
++ * GMU votes the GX rail through the GPU RSC/PDC and powers the GX GDSC. GX is on when
++ * SPTPRAC_PWR_CLK_STATUS has neither GX_GDSC_POWER_OFF (6) nor GX_CLK_OFF (7); only then are the
++ * 3D core's registers read (RBBM_STATUS) - with GX off they hang the bus.
++ *
++ * Levels (vayu dt): kgsl-3d0 gpu_opp_table_v2 (opp-microvolt = RPMh level + 1), pwrlevel bin by the
++ * fuse qfprom 0x780000 + 0x4130 (mask 0xe0000000 >> 29); GMU 0 / 200 MHz (CX level MIN_SVS, 48, as
++ * upstream sm8150 gmu_opp_table). Votes as kgsl setup_volt_dependency_tbl: primary rail index of
++ * the first level >= the wanted one, secondary (mx.lvl) index of the first >= that; vote =
++ * level << 16 | secondary << 8 | primary. The bus table is upstream Linux a640_build_bw_table: one
++ * "off" level (DDR: MC0, SH0, ACV; CNOC: CN0) - the apps RSC already holds DDR up (sweet_rpmh.c).
++ */
++#define GMU_GMU2HOST_INTR_CLR   GMU_REG(0x1f991u)
++#define GMU_HOST2GMU_INTR_SET   GMU_REG(0x1f994u)
++#define GMU_SPTPRAC_PWR_CLK_STATUS GMU_REG(0x1f8d0u)
++#define GMU_RPMH_POWER_STATE    GMU_REG(0x1f8ecu)
++#define GMU_GX_OFF              ((1u << 6) | (1u << 7))
++#define GPU_QFPROM_PA           0x00784000u     /* page of qfprom 0x780000 + 0x4130 */
++#define GPU_SPEED_BIN_OFF       0x130u
++#define GPU_3D_PA               0x02c00000u
++#define GPU_3D_SIZE             0x00003000u
++#define GPU_RBBM_STATUS         (0x210u * 4u)
++#define GPU_RBBM_STATUS3        (0x213u * 4u)
++#define GPU_CP_HW_FAULT         (0x821u * 4u)
++#define H2F_FW_VER              1u
++#define H2F_BW_VOTE_TBL         3u
++#define H2F_PERF_TBL            4u
++#define H2F_FEATURE_CTRL        11u
++#define H2F_CORE_FW_START       14u
++#define H2F_GX_BW_PERF_VOTE     30u
++#define F2H_ERR                 100u
++#define F2H_DEBUG               101u
++#define HFI_TYPE_ACK            1u
++#define HFI_FEATURE_ECP         1u
++#define HFI_GMU_VERSION         0x20000000u     /* GMU_VERSION(gpmu_major 2, minor 0), adreno-gpulist a640 */
++#define HFI_INVALID_IDX         0xffu
++#define HFI_HDR(id, dwords)     ((id) | (uint32_t)(dwords) << 8)
++#define OOB_GPU_SET             (1u << 30)
++#define OOB_GPU_ACK             (1u << 31)
++#define ARC_MAX                 16u
++#define RH_ARC                  3u
++#define RH_BCM                  5u
++extern int sweet_rpmh_cmd_db(const char *res, unsigned type, uint32_t *address, uint16_t *levels, unsigned max,
++    unsigned *count);
++
++struct gpu_level {
++	uint32_t khz;
++	uint16_t vlvl;
++};
++/* Lowest first, as kgsl gmu->gpu_freqs; pwrlevels-0 (speed bin 0) and pwrlevels-1. */
++static const struct gpu_level gpu_bin0[] = {
++	{ 0, 0 }, { 257000, 64 }, { 345000, 128 }, { 427000, 192 }, { 499200, 224 }, { 585000, 256 },
++};
++static const struct gpu_level gpu_bin1[] = {
++	{ 0, 0 }, { 257000, 64 }, { 345000, 128 }, { 427000, 192 }, { 499200, 224 }, { 585000, 256 }, { 675000, 320 },
++};
++static const struct gpu_level gmu_levels[] = { { 0, 0 }, { 200000, 48 } };
++static uint32_t hfi_seq;
++
++/* kgsl setup_volt_dependency_tbl for one level; false if the rail has no level that high. */
++static bool
++arc_vote(const uint16_t *pri, unsigned npri, const uint16_t *sec, unsigned nsec, uint16_t want, uint32_t *vote)
++{
++	unsigned k, j;
++	for (k = 0; k < npri && pri[k] < want; k++) {
++	}
++	if (k == npri) {
++		return false;
++	}
++	for (j = 0; j < nsec && sec[j] < pri[k] && j + 1 < nsec; j++) {
++	}
++	*vote = (uint32_t)pri[k] << 16 | j << 8 | k;
++	return true;
++}
++
++/* kgsl hfi_queue_write: dwords into queue i, padded to 4 with 0xfafafafa (HFI 2), then ring the GMU. */
++static bool
++hfi_write(unsigned i, const uint32_t *msg)
++{
++	struct hfi_qtbl *t = (struct hfi_qtbl *)gmu_mem[3].kva;
++	volatile uint32_t *q = (volatile uint32_t *)(gmu_mem[3].kva + HFI_QUEUE_AT(i));
++	uint32_t n = (msg[0] >> 8) & 0xffu, size = t->q[i].queue_size;
++	to_memory(gmu_mem[3].kva, gmu_mem[3].size);
++	uint32_t w = t->q[i].write_index, r = t->q[i].read_index;
++	uint32_t room = w >= r ? size - (w - r) : r - w;
++	if (room <= n + 3u || w >= size) {
++		printf("SWEET GPU: HFI queue %u full (r %u w %u, message %u dwords)\n", i, r, w, n);
++		return false;
++	}
++	for (uint32_t k = 0; k < n; k++) {
++		q[w] = msg[k];
++		w = (w + 1u) % size;
++	}
++	for (; w % 4u; w = (w + 1u) % size) {
++		q[w] = 0xfafafafau;
++	}
++	t->q[i].write_index = w;
++	to_memory(gmu_mem[3].kva, gmu_mem[3].size);
++	wr(gmu, GMU_HOST2GMU_INTR_SET, 1);
++	return true;
++}
++
++/* kgsl hfi_queue_read: one message from queue i into out (max dwords); 0 if the queue is empty. */
++static uint32_t
++hfi_read(unsigned i, uint32_t *out, uint32_t max)
++{
++	struct hfi_qtbl *t = (struct hfi_qtbl *)gmu_mem[3].kva;
++	const volatile uint32_t *q = (const volatile uint32_t *)(gmu_mem[3].kva + HFI_QUEUE_AT(i));
++	to_memory(gmu_mem[3].kva, gmu_mem[3].size);
++	uint32_t r = t->q[i].read_index, w = t->q[i].write_index, size = t->q[i].queue_size;
++	if (r == w || r >= size) {
++		return 0;
++	}
++	uint32_t n = (q[r] >> 8) & 0xffu;
++	for (uint32_t k = 0; k < n; k++) {
++		if (k < max) {
++			out[k] = q[r];
++		}
++		r = (r + 1u) % size;
++	}
++	t->q[i].read_index = ((r + 3u) & ~3u) % size;
++	to_memory(gmu_mem[3].kva, gmu_mem[3].size);
++	return n;
++}
++
++/* What the GMU said on its own: errors in the message queue, debug prints in queue 2. */
++static void
++hfi_print(const char *queue, const uint32_t *m, uint32_t n)
++{
++	uint32_t id = m[0] & 0xffu;
++	if (id == F2H_DEBUG && n >= 4) {
++		printf("SWEET GPU: GMU debug (%s) type %u timestamp %#x data %#x\n", queue, m[1], m[2], m[3]);
++	} else if (id == F2H_ERR && n >= 4) {
++		printf("SWEET GPU: GMU ERROR (%s) code %#x line %u\n", queue, m[1], m[2]);
++	} else {
++		printf("SWEET GPU: GMU message (%s) hdr %#x, %u dwords, %#x %#x\n", queue, m[0], n, n > 1 ? m[1] : 0,
++		    n > 2 ? m[2] : 0);
++	}
++}
++
++static void
++hfi_drain_debug(void)
++{
++	uint32_t m[16], n;
++	for (unsigned k = 0; k < 32 && (n = hfi_read(2, m, 16)) != 0; k++) {
++		hfi_print("debug", m, n);
++	}
++}
++
++/* kgsl hfi_send_generic_req: send, wait up to 100 ms for the ack, its result word; reply in out. */
++static bool
++hfi_send(const char *what, uint32_t *msg, uint32_t *out, uint32_t max)
++{
++	uint32_t seq = ++hfi_seq & 0xfffu;
++	msg[0] = (msg[0] & 0xfffffu) | seq << 20;
++	wr(gmu, GMU_GMU2HOST_INTR_CLR, 1);
++	if (!hfi_write(0, msg)) {
++		return false;
++	}
++	unsigned waited;
++	for (waited = 0; waited < 1000 && !(rd(gmu, GMU_GMU2HOST_INTR_INFO) & 1u); waited++) {
++		delay(100);
++	}
++	wr(gmu, GMU_GMU2HOST_INTR_CLR, 1);
++	uint32_t m[64], n;
++	bool acked = false;
++	while ((n = hfi_read(1, m, 64)) != 0) {
++		if (((m[0] >> 16) & 0xfu) == HFI_TYPE_ACK && n >= 3 && ((m[1] >> 20) & 0xfffu) == seq) {
++			acked = true;
++			for (uint32_t k = 0; k < n && k < max; k++) {
++				out[k] = m[k];
++			}
++			printf("SWEET GPU: HFI %s: ack after %u us, result %#x%s\n", what, waited * 100u, m[2],
++			    m[2] ? " - REFUSED" : "");
++		} else {
++			hfi_print("msg", m, n);
++		}
++	}
++	hfi_drain_debug();
++	if (!acked) {
++		printf("SWEET GPU: HFI %s: NO ACK in %u us (gmu2host %#x, cmd queue r/w %u/%u)\n", what, waited * 100u,
++		    rd(gmu, GMU_GMU2HOST_INTR_INFO), ((struct hfi_qtbl *)gmu_mem[3].kva)->q[0].read_index,
++		    ((struct hfi_qtbl *)gmu_mem[3].kva)->q[0].write_index);
++		return false;
++	}
++	return out[2] == 0;
++}
++
++static const struct gpu_level *gpu_levels;
++static unsigned gpu_nlevels;
++
++/* Step 14: kgsl hfi_start for a640. */
++static bool
++gmu_hfi_tables(void)
++{
++	uint16_t gfx[ARC_MAX], cx[ARC_MAX], mx[ARC_MAX];
++	unsigned ngfx = 0, ncx = 0, nmx = 0;
++	uint32_t a_gfx, a_cx, a_mx, reply[8];
++	vm_offset_t fuse = ml_io_map(GPU_QFPROM_PA, 0x1000);
++	uint32_t bin = fuse ? (rd(fuse, GPU_SPEED_BIN_OFF) & 0xe0000000u) >> 29 : 0;
++	gpu_levels = bin == 1 ? gpu_bin1 : gpu_bin0;
++	gpu_nlevels = bin == 1 ? sizeof(gpu_bin1) / sizeof(gpu_bin1[0]) : sizeof(gpu_bin0) / sizeof(gpu_bin0[0]);
++	printf("SWEET GPU: speed bin %u (fuse %#x): %u GPU levels up to %u kHz\n", bin,
++	    fuse ? rd(fuse, GPU_SPEED_BIN_OFF) : 0, gpu_nlevels, gpu_levels[gpu_nlevels - 1].khz);
++	if (sweet_rpmh_cmd_db("gfx.lvl", RH_ARC, &a_gfx, gfx, ARC_MAX, &ngfx) ||
++	    sweet_rpmh_cmd_db("cx.lvl", RH_ARC, &a_cx, cx, ARC_MAX, &ncx) ||
++	    sweet_rpmh_cmd_db("mx.lvl", RH_ARC, &a_mx, mx, ARC_MAX, &nmx)) {
++		printf("SWEET GPU: no rail levels in the command DB\n");
++		return false;
++	}
++	printf("SWEET GPU: rails gfx %#x %u levels (%u..%u), cx %#x %u (%u..%u), mx %#x %u (%u..%u)\n", a_gfx, ngfx,
++	    gfx[0], gfx[ngfx - 1], a_cx, ncx, cx[0], cx[ncx - 1], a_mx, nmx, mx[0], mx[nmx - 1]);
++
++	uint32_t fw_ver[2] = { HFI_HDR(H2F_FW_VER, 2), HFI_GMU_VERSION };
++	if (!hfi_send("FW_VER", fw_ver, reply, 8)) {
++		return false;
++	}
++	printf("SWEET GPU: GMU firmware version %#x (wanted major 2)\n", reply[3]);
++
++	/* struct hfi_dcvstable_cmd: hdr, gpu_level_num, gmu_level_num, gx {vote, acd, freq}[16], cx {vote, freq}[4] */
++	uint32_t perf[3 + 16 * 3 + 4 * 2];
++	bzero(perf, sizeof(perf));
++	perf[0] = HFI_HDR(H2F_PERF_TBL, sizeof(perf) / 4);
++	perf[1] = gpu_nlevels;
++	perf[2] = sizeof(gmu_levels) / sizeof(gmu_levels[0]);
++	for (unsigned i = 0; i < gpu_nlevels; i++) {
++		if (!arc_vote(gfx, ngfx, mx, nmx, gpu_levels[i].vlvl, &perf[3 + 3 * i])) {
++			printf("SWEET GPU: gfx rail has no level %u\n", gpu_levels[i].vlvl);
++			return false;
++		}
++		perf[3 + 3 * i + 1] = 0xffffffffu;
++		perf[3 + 3 * i + 2] = gpu_levels[i].khz;
++		printf("SWEET GPU: GPU level %u: %u kHz, vote %#x\n", i, gpu_levels[i].khz, perf[3 + 3 * i]);
++	}
++	for (unsigned i = 0; i < perf[2]; i++) {
++		if (!arc_vote(cx, ncx, mx, nmx, gmu_levels[i].vlvl, &perf[3 + 48 + 2 * i])) {
++			printf("SWEET GPU: cx rail has no level %u\n", gmu_levels[i].vlvl);
++			return false;
++		}
++		perf[3 + 48 + 2 * i + 1] = gmu_levels[i].khz;
++		printf("SWEET GPU: GMU level %u: %u kHz, vote %#x\n", i, gmu_levels[i].khz, perf[3 + 48 + 2 * i]);
++	}
++	if (!hfi_send("PERF_TBL", perf, reply, 8)) {
++		return false;
++	}
++
++	/*
++	 * struct hfi_bwtable_cmd: hdr, bw_level_num, cnoc_cmds_num, ddr_cmds_num, cnoc_wait_bitmask,
++	 * ddr_wait_bitmask, cnoc_cmd_addrs[6], cnoc_cmd_data[2][6], ddr_cmd_addrs[8], ddr_cmd_data[16][8]
++	 */
++	uint32_t bw[6 + 6 + 12 + 8 + 128], mc0 = 0x50000u, sh0 = 0x5003cu, acv = 0x5000cu, cn0 = 0x50034u;
++	(void)sweet_rpmh_cmd_db("MC0", RH_BCM, &mc0, NULL, 0, NULL);
++	(void)sweet_rpmh_cmd_db("SH0", RH_BCM, &sh0, NULL, 0, NULL);
++	(void)sweet_rpmh_cmd_db("ACV", RH_BCM, &acv, NULL, 0, NULL);
++	(void)sweet_rpmh_cmd_db("CN0", RH_BCM, &cn0, NULL, 0, NULL);
++	printf("SWEET GPU: bus table: ddr MC0 %#x SH0 %#x ACV %#x, cnoc CN0 %#x (upstream a640: 0x50000 0x5003c 0x5000c, 0x50034)\n",
++	    mc0, sh0, acv, cn0);
++	bzero(bw, sizeof(bw));
++	bw[0] = HFI_HDR(H2F_BW_VOTE_TBL, sizeof(bw) / 4);
++	bw[1] = 1;                      /* bw_level_num */
++	bw[2] = 1;                      /* cnoc_cmds_num */
++	bw[3] = 3;                      /* ddr_cmds_num */
++	bw[4] = 1;                      /* cnoc_wait_bitmask */
++	bw[5] = 1;                      /* ddr_wait_bitmask */
++	bw[6] = cn0;                    /* cnoc_cmd_addrs[0] */
++	bw[12] = 0x40000000u;           /* cnoc_cmd_data[0][0]: commit, off */
++	bw[18] = 0x60000001u;           /* cnoc_cmd_data[1][0]: commit, valid, 1 */
++	bw[24] = mc0;                   /* ddr_cmd_addrs */
++	bw[25] = sh0;
++	bw[26] = acv;
++	bw[32] = bw[33] = bw[34] = 0x40000000u;  /* ddr_cmd_data[0]: commit, off */
++	if (!hfi_send("BW_VOTE_TBL", bw, reply, 8)) {
++		return false;
++	}
++
++	uint32_t ecp[4] = { HFI_HDR(H2F_FEATURE_CTRL, 4), HFI_FEATURE_ECP, 0, 0 };
++	if (!hfi_send("FEATURE_CTRL ECP off", ecp, reply, 8)) {
++		return false;
++	}
++	uint32_t start[2] = { HFI_HDR(H2F_CORE_FW_START, 2), 0 };
++	return hfi_send("CORE_FW_START", start, reply, 8);
++}
++
++/* Step 15: the default level, OOB gpu - the GMU powers GX; then the 3D core's status registers. */
++static bool
++gmu_gx_on(void)
++{
++	uint32_t reply[8];
++	/* kgsl gmu_dcvs_set(default pwrlevel): freq index = levels - initial-pwrlevel - 1 = 257 MHz for both bins */
++	uint32_t vote[4] = { HFI_HDR(H2F_GX_BW_PERF_VOTE, 4), 1 /* DCVS_ACK_BLOCK */, 1, HFI_INVALID_IDX };
++	if (!hfi_send("GX_BW_PERF_VOTE 257 MHz", vote, reply, 8)) {
++		return false;
++	}
++	printf("SWEET GPU: before OOB: sptprac %#x rpmh_power_state %#x gx-gdsc %#x gmu2host %#x\n",
++	    rd(gmu, GMU_SPTPRAC_PWR_CLK_STATUS), rd(gmu, GMU_RPMH_POWER_STATE), rd(gpucc, GPUCC_GX_GDSCR),
++	    rd(gmu, GMU_GMU2HOST_INTR_INFO));
++	wr(gmu, GMU_HOST2GMU_INTR_SET, OOB_GPU_SET);
++	unsigned waited;
++	for (waited = 0; waited < 1000 && !(rd(gmu, GMU_GMU2HOST_INTR_INFO) & OOB_GPU_ACK); waited++) {
++		delay(100);
++	}
++	bool acked = (rd(gmu, GMU_GMU2HOST_INTR_INFO) & OOB_GPU_ACK) != 0;
++	wr(gmu, GMU_GMU2HOST_INTR_CLR, OOB_GPU_ACK);
++	uint32_t sp = rd(gmu, GMU_SPTPRAC_PWR_CLK_STATUS);
++	bool on = !(sp & GMU_GX_OFF);
++	printf("SWEET GPU: OOB gpu %s after %u us; sptprac %#x rpmh_power_state %#x gx-gdsc %#x%s\n",
++	    acked ? "acked" : "NOT ACKED", waited * 100u, sp, rd(gmu, GMU_RPMH_POWER_STATE), rd(gpucc, GPUCC_GX_GDSCR),
++	    on ? " - GX IS ON" : " - GX is off");
++	hfi_drain_debug();
++	smmu_fault_report("after OOB gpu");
++	if (!acked || !on) {
++		return false;
++	}
++	vm_offset_t gpu = ml_io_map(GPU_3D_PA, GPU_3D_SIZE);
++	if (gpu) {
++		printf("SWEET GPU: 3D core: RBBM_STATUS %#x RBBM_STATUS3 %#x CP_HW_FAULT %#x\n", rd(gpu, GPU_RBBM_STATUS),
++		    rd(gpu, GPU_RBBM_STATUS3), rd(gpu, GPU_CP_HW_FAULT));
++	}
++	return true;
++}
++
 +static void
 +gpu_thread(void *arg, wait_result_t result)
 +{
@@ -885,8 +1215,20 @@
 +		goto out;
 +	}
 +	announce(13, "HFI init");
-+	if (gmu_hfi()) {
-+		printf("SWEET GPU: milestone 2 done\n");
++	if (!gmu_hfi()) {
++		goto out;
++	}
++	printf("SWEET GPU: milestone 2 done\n");
++	if (last < 14) {
++		goto out;
++	}
++	announce(14, "HFI: FW_VER, PERF_TBL, BW_VOTE_TBL, ECP off, CORE_FW_START");
++	if (!gmu_hfi_tables() || last < 15) {
++		goto out;
++	}
++	announce(15, "default GPU level, OOB gpu: the GMU powers GX; 3D core status");
++	if (gmu_gx_on()) {
++		printf("SWEET GPU: milestone 3 done - GX is on\n");
 +	}
 +out:
 +	printf("SWEET GPU: stopped after step %u\n", step_now);
