@@ -32,13 +32,14 @@
  #if defined(SWEET)
  #include <IOKit/IOService.h>
  #include <IOKit/IOUserClient.h>
-@@ -116,8 +141,17 @@
+@@ -116,8 +141,18 @@
  	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
  	bool          fPowerOff;      /* RequestPowerChange(0) */
  	uint32_t      fFadeStep;      /* fade-out steps done while off */
 +	volatile uint32_t *fIntf;     /* running DSI timing engine, or NULL: free-running timer */
 +	uint32_t      fVTotal, fActStart, fActEnd;   /* lines per frame, active area [start, end) */
 +	uint64_t      fLineAbs;       /* mach time of one line */
++	uint32_t      fFrameDiv;      /* panel frames per vsync tick (about 60 Hz) */
 +	uint64_t      fLateTicks;     /* ticks that missed the blanking: no copy on them */
  
  	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
@@ -50,7 +51,7 @@
  	void addClient(IOMobileFramebufferUserClient *client);
  	void removeClient(IOMobileFramebufferUserClient *client);
  	void swap(const uint8_t *rec);
-@@ -195,7 +229,8 @@
+@@ -195,7 +230,8 @@
  	uint32_t hz = 10;
  	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
  	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
@@ -60,7 +61,7 @@
  
  	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
  	setProperty("external", false);
-@@ -206,10 +241,111 @@
+@@ -206,10 +242,134 @@
  	return true;
  }
  
@@ -85,10 +86,19 @@
 +		IOLog("SWEET FB: no DSI timing engine running: free-running vsync timer\n");
 +		return;
 +	}
-+	uint32_t hperiod = intf[SWEET_INTF_HSYNC_CTL / 4] & 0xffff;
++	/*
++	 * The timing registers are in interface clocks whose relation to lines depends on the DSI
++	 * mode: on the phone HSYNC_CTL gave a period of 12 (DSC/widebus), so VSYNC_PERIOD / HSYNC
++	 * is no line count (98394; iOS/runs/ios-smooth1). Lines per frame come from the line
++	 * counter itself (its largest value over two frames), and the active area keeps the
++	 * proportions of DISPLAY_V_START/END to VSYNC_PERIOD.
++	 */
++	uint32_t hsync = intf[SWEET_INTF_HSYNC_CTL / 4];
 +	uint32_t vperiod = intf[SWEET_INTF_VSYNC_PERIOD / 4];
 +	uint32_t vstart = intf[SWEET_INTF_V_START / 4], vend = intf[SWEET_INTF_V_END / 4];
-+	if (hperiod == 0) {
++	if (vperiod == 0 || vend <= vstart || vend >= vperiod) {
++		IOLog("SWEET FB: DSI timing registers hsync %#x vsync period %u active %u..%u: free-running vsync timer\n",
++		    hsync, vperiod, vstart, vend);
 +		return;
 +	}
 +	if ((intf[SWEET_INTF_COUNT_EN / 4] & 3) != 3) {
@@ -100,20 +110,33 @@
 +	IOSleep(200);
 +	uint32_t f1 = intf[SWEET_INTF_FRAME_COUNT / 4];
 +	uint64_t t1 = mach_absolute_time(), ns = 0;
-+	uint32_t vtotal = vperiod / hperiod, frames = f1 - f0;
++	uint32_t frames = f1 - f0;
 +	absolutetime_to_nanoseconds(t1 - t0, &ns);
 +	uint32_t mhz = frames ? (uint32_t)(frames * 1000000000ull * 1000 / ns) : 0;        /* refresh in mHz */
-+	IOLog("SWEET FB: DSI interface at %#x: hsync period %u, %u lines, active %u..%u, %u frames in %llu us "
-+	    "(%u.%03u Hz), line now %u\n", SWEET_INTF_BLOCK_PA + (uint32_t)((vm_offset_t)intf - block), hperiod, vtotal,
-+	    vstart / hperiod, (vend + 1) / hperiod, frames, ns / 1000, mhz / 1000, mhz % 1000, intf[SWEET_INTF_LINE_COUNT / 4]);
++	uint32_t vtotal = 0;
++	if (frames != 0) {
++		uint64_t end = mach_absolute_time() + 2 * (t1 - t0) / frames;
++		while (mach_absolute_time() < end) {
++			uint32_t l = intf[SWEET_INTF_LINE_COUNT / 4];
++			vtotal = l > vtotal ? l : vtotal;
++		}
++		vtotal++;
++	}
++	IOLog("SWEET FB: DSI interface at %#x: hsync %#x, vsync period %u, active %u..%u; %u frames in %llu us "
++	    "(%u.%03u Hz), %u lines (line counter maximum + 1)\n", SWEET_INTF_BLOCK_PA + (uint32_t)((vm_offset_t)intf - block),
++	    hsync, vperiod, vstart, vend, frames, ns / 1000, mhz / 1000, mhz % 1000, vtotal);
 +	if (vtotal < fHeight || vtotal > 2 * fHeight || mhz < 20000 || mhz > 150000) {
 +		IOLog("SWEET FB: implausible timing: free-running vsync timer\n");
 +		return;
 +	}
 +	fVTotal = vtotal;
-+	fActStart = vstart / hperiod;
-+	fActEnd = (vend + 1) / hperiod;
++	fActStart = (uint32_t)((uint64_t)vstart * vtotal / vperiod);
++	fActEnd = (uint32_t)(((uint64_t)vend + 1) * vtotal / vperiod);
 +	fLineAbs = (t1 - t0) / frames / vtotal;
++	fFrameDiv = (mhz + 30000) / 60000;     /* about 60 Hz for CoreAnimation: 124 Hz panel -> every 2nd frame */
++	fFrameDiv = fFrameDiv ? fFrameDiv : 1;
++	IOLog("SWEET FB: vsync on the panel: active lines %u..%u of %u, a tick every %u frame(s)\n", fActStart, fActEnd,
++	    fVTotal, fFrameDiv);
 +	fIntf = intf;
 +}
 +
@@ -158,6 +181,7 @@
 +	if (wait < minimum) {
 +		wait += (uint64_t)fVTotal * fLineAbs;   /* this blanking is (nearly) here: aim at the next */
 +	}
++	wait += (uint64_t)(fFrameDiv - 1) * fVTotal * fLineAbs;
 +	AbsoluteTime interval, leeway;
 +	interval = wait - early;
 +	nanoseconds_to_absolutetime(100 * 1000ull, &leeway);
@@ -172,7 +196,7 @@
  	uint64_t now = mach_absolute_time();
  	uint64_t count = ++fb->fVsyncCount;
  	uint64_t values[6] = {
-@@ -239,10 +375,13 @@
+@@ -239,10 +399,13 @@
  				}
  			}
  		}
@@ -188,7 +212,7 @@
  	uint8_t *rec = NULL;
  	if (flush) {
  		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
-@@ -256,7 +395,7 @@
+@@ -256,7 +419,7 @@
  		fb->present(rec);
  		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
  	}
@@ -197,7 +221,7 @@
  }
  
  void
-@@ -304,7 +443,7 @@
+@@ -304,7 +467,7 @@
  	fDirty = true;
  	IOLockUnlock(fLock);
  	if ((++sweet_fb_swap_count % 1000) == 0) {

@@ -1,6 +1,6 @@
 --- a/bsd/dev/sweet_rpmh.c
 +++ b/bsd/dev/sweet_rpmh.c
-@@ -2,16 +2,32 @@
+@@ -2,16 +2,34 @@
   * SWEET PM6150L L11C bring-up; see report.md for DT and source evidence.
   * Sole XNU apps-DRV owner, called from thread context with deep idle disabled.
   * No sleep/wake programming, SPMI writes, GIC handler, or timeout recovery.
@@ -25,15 +25,17 @@
 +#include <string.h>
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
-+/* Mach declaration not included by BSD's exported thread.h. */
++/* Mach declarations not included by BSD's exported headers. */
 +extern kern_return_t thread_terminate(thread_t);
++extern struct processor *cpu_to_processor(int cpu);
++extern struct processor *thread_bind(struct processor *processor);
  int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
 +int sweet_rpmh_bcm_max(const char *const *names, unsigned count);
 +void sweet_bw_init(void);
  
  /* Live downstream DT has two positional reg entries, no reg-names. */
  #define RH_RSC_PA       0x18220000u
-@@ -44,7 +60,11 @@
+@@ -44,7 +62,11 @@
  #define RH_DB_ENTRY     24u
  #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
  #define RH_VRM          4u
@@ -45,7 +47,7 @@
  
  static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
  static uint32_t rh_db_size;
-@@ -159,7 +179,7 @@
+@@ -159,7 +181,7 @@
  }
  
  static int
@@ -54,7 +56,7 @@
  {
  	uint32_t key[2] = {0, 0};
  	for (unsigned i = 0; i < 8 && res[i]; ++i) {
-@@ -186,9 +206,9 @@
+@@ -186,9 +208,9 @@
  				continue;
  			}
  			uint32_t addr = rh_read(rh_db, e + 16);
@@ -66,7 +68,7 @@
  				return EINVAL;
  			}
  			*address = addr;
-@@ -218,10 +238,15 @@
+@@ -218,10 +240,15 @@
  	    !(rh_read(rh_tcs, RH_IRQ_STATUS) & (1u << t));
  }
  
@@ -83,7 +85,7 @@
  	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
  		uint32_t b = t * RH_TCS_STRIDE;
  		uint32_t enabled = rh_read(rh_tcs, b + RH_ENABLE);
-@@ -232,10 +257,12 @@
+@@ -232,10 +259,12 @@
  			return EIO;
  		}
  		for (unsigned c = 0; c < rh_ncpt; ++c) {
@@ -100,7 +102,7 @@
  			}
  		}
  		if (chosen < 0 && rh_free(t)) {
-@@ -266,30 +293,27 @@
+@@ -266,30 +295,27 @@
  	}
  	/* From here an uncertain write/timeout quarantines our slot for this boot. */
  	rh_poisoned = true;
@@ -137,7 +139,7 @@
  			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
  			complete &= status[c] != 0xffffffffu &&
  			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
-@@ -303,8 +327,8 @@
+@@ -303,8 +329,8 @@
  		}
  		delay(1);
  	}
@@ -148,7 +150,7 @@
  	if (!done) {
  		printf("SWEET RPMH: timeout; TCS quarantined, IRQ remains masked; no reset/retry\n");
  		return ETIMEDOUT;
-@@ -320,7 +344,7 @@
+@@ -320,7 +346,7 @@
  		return EIO;
  	}
  	rh_poisoned = false;
@@ -157,7 +159,7 @@
  	return 0;
  }
  
-@@ -343,10 +367,13 @@
+@@ -343,10 +369,13 @@
  	}
  	error = rh_map();
  	if (!error) {
@@ -173,7 +175,7 @@
  	}
  out:
  	if (error) {
-@@ -355,4 +382,95 @@
+@@ -355,4 +384,111 @@
  	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
  	return error;
  }
@@ -239,13 +241,29 @@
 +		printf("SWEET BW: no memory for the copy test\n");
 +		goto out;
 +	}
++	/*
++	 * Both measurements on one A76 core (cpu4): unbound, the first run on the phone gave 6546 and
++	 * the second 3974 MB/s, most likely an A76 and then an A55 (iOS/runs/ios-smooth1). Bound only:
++	 * interrupts stay on (sweet_cpufreq.c's masked measurement stopped the disk).
++	 */
++	struct processor *cpu4 = cpu_to_processor(4);
++	if (cpu4 != NULL) {
++		thread_bind(cpu4);
++		thread_block(THREAD_CONTINUE_NULL);
++	}
 +	memset((void *)a, 0x5a, size);
-+	printf("SWEET BW: memcpy 16 MB before the vote: %u MB/s\n", bw_measure(a, b, size));
++	printf("SWEET BW: memcpy 16 MB on cpu%d before the vote: %u, %u MB/s\n", cpu_number(), bw_measure(a, b, size),
++	    bw_measure(a, b, size));
 +	if (sweet_rpmh_bcm_max(bcms, 2) == 0) {
 +		clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
 +		(void)assert_wait_deadline(&bw_chan, THREAD_UNINT, deadline);
 +		thread_block(THREAD_CONTINUE_NULL);
-+		printf("SWEET BW: memcpy 16 MB after MC0+SH0 max: %u MB/s\n", bw_measure(a, b, size));
++		printf("SWEET BW: memcpy 16 MB on cpu%d after MC0+SH0 max: %u, %u MB/s\n", cpu_number(), bw_measure(a, b, size),
++		    bw_measure(a, b, size));
++	}
++	if (cpu4 != NULL) {
++		thread_bind(NULL);
++		thread_block(THREAD_CONTINUE_NULL);
 +	}
 +	kmem_free(kernel_map, a, size);
 +	kmem_free(kernel_map, b, size);
