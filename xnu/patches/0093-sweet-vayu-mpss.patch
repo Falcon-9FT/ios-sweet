@@ -28,7 +28,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,214 @@
+@@ -0,0 +1,222 @@
 +/*
 + * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 0 - read-only probe of what the modem's start
 + * would need. After HakiOS hakios.mpss.c (oosexgang/hackios-xnu-kernel, APSL 2.0), with the numbers of
@@ -130,14 +130,22 @@
 +	static const struct { unsigned pas; const char *what; } images[] = {
 +		{ PAS_MPSS, "modem" }, { PAS_IPA, "IPA GSI firmware" }, { PAS_GPU, "GPU zap shader" },
 +	};
-+	uint64_t how = SCM_FAST | SCM_64 | SCM_SIP, ans = ~0ull;
-+	int32_t r = scm(how | SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE, how | SCM_PAS_IS_SUPPORTED, &ans);
-+	printf("SWEET MPSS: TrustZone is-call-available(pas-is-supported): ret %d answer %#llx\n", r, ans);
-+	for (unsigned i = 0; i < sizeof(images) / sizeof(images[0]); i++) {
-+		ans = ~0ull;
-+		r = scm(how | SCM_PAS_IS_SUPPORTED, SCM_ONE_VALUE, images[i].pas, &ans);
-+		printf("SWEET MPSS: TrustZone pas-is-supported(%u, %s): ret %d answer %#llx%s\n", images[i].pas, images[i].what,
-+		    r, ans, r == 0 && ans == 1 ? " - SUPPORTED" : "");
++	/*
++	 * ios-mpss1: as fast calls (bit 31) every image answered 0, the modem too - which Android starts through
++	 * TrustZone on this very phone. Linux (vendor scm_call2, upstream qcom_scm_call) and HakiOS make these
++	 * as standard (yielding) calls; fast is only for the atomic ones. Both kinds are asked here.
++	 */
++	for (int kind = 0; kind < 2; kind++) {
++		uint64_t how = (kind ? SCM_FAST : 0) | SCM_64 | SCM_SIP, ans = ~0ull;
++		const char *k = kind ? "fast" : "standard";
++		int32_t r = scm(how | SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE, how | SCM_PAS_IS_SUPPORTED, &ans);
++		printf("SWEET MPSS: TrustZone (%s calls) is-call-available(pas-is-supported): ret %d answer %#llx\n", k, r, ans);
++		for (unsigned i = 0; i < sizeof(images) / sizeof(images[0]); i++) {
++			ans = ~0ull;
++			r = scm(how | SCM_PAS_IS_SUPPORTED, SCM_ONE_VALUE, images[i].pas, &ans);
++			printf("SWEET MPSS: TrustZone (%s calls) pas-is-supported(%u, %s): ret %d answer %#llx%s\n", k,
++			    images[i].pas, images[i].what, r, ans, r == 0 && ans == 1 ? " - SUPPORTED" : "");
++		}
 +	}
 +}
 +
