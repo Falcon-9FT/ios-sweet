@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -38,6 +38,59 @@
+@@ -38,6 +38,62 @@
  
  extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
  
@@ -27,6 +27,9 @@
 +extern "C" int sweet_bl_set(uint32_t level);
 +extern "C" int sweet_bl_enable(int on);
 +#define SWEET_BL_STEPS          16      /* about a quarter of a second at the ~60 Hz tick */
++#define SWEET_WAKE_MAX_TICKS    60      /* display on: wait this long for a new frame before lighting up */
++#define SWEET_BL_FULL           0xfffu
++#define SWEET_BL_LOWEST         48u     /* readable even if a brightness scale is wrong */
 +#define SWEET_INTF_BLOCK_PA     0x0ae6b000u     /* page with INTF_1 at +0x800; INTF_2 is the next page */
 +#define SWEET_INTF_TIMING_EN    0x000u
 +#define SWEET_INTF_HSYNC_CTL    0x008u
@@ -60,7 +63,7 @@
  #if defined(SWEET)
  #include <IOKit/IOService.h>
  #include <IOKit/IOUserClient.h>
-@@ -116,12 +169,35 @@
+@@ -116,12 +172,40 @@
  	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
  	bool          fPowerOff;      /* RequestPowerChange(0) */
  	uint32_t      fFadeStep;      /* fade-out steps done while off */
@@ -74,6 +77,9 @@
 +	uint32_t      fBlRamp;        /* ramp-up steps done after display on (SWEET_BL_STEPS: none due) */
 +	uint32_t      fBlTarget;      /* backlight level wanted (from the swaps; the boot loader's at first) */
 +	uint32_t      fBlApplied;     /* last level set while fully on */
++	bool          fAwaitFresh;    /* display on: no swap since, the panel still holds the frame from before off */
++	uint32_t      fWakeTicks;     /* ticks waited for that swap */
++	uint64_t      fWakeAbs;       /* mach time of display on */
 +	volatile uint32_t *fSspp, *fCtl;        /* page flip: VIG0 and CTL0, or NULL */
 +	uintptr_t     fBuf[2];        /* kernel mappings of the two frames */
 +	uint64_t      fBufPA[2];
@@ -93,11 +99,13 @@
  	void swap(const uint8_t *rec);
 -	void present(const uint8_t *rec);
 +	bool present(const uint8_t *rec, uintptr_t dst);
++	void setBacklightTarget(uint32_t level);
++	void publishBacklight(void);
 +	uintptr_t shown(void) { return fCtl != NULL ? fBuf[fFront] : fPixels; }
  };
  
  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
-@@ -195,7 +271,11 @@
+@@ -195,7 +279,11 @@
  	uint32_t hz = 10;
  	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
  	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
@@ -110,10 +118,144 @@
  
  	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
  	setProperty("external", false);
-@@ -206,10 +286,187 @@
- 	return true;
- }
- 
+@@ -203,13 +291,321 @@
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	if (fBacklight) {
++		publishBacklight();
++	}
++	return true;
++}
++
++/*
++ * The brightness slider: CoreBrightness (CBDisplayContaineriOS, iOS 16.7) drives an LCD's
++ * backlight through the IOService of class AppleARMBacklight - backboardd looks it up by
++ * IOPropertyMatch {backlight-control = true}; without one the slider is inert. It reads
++ * IODisplayParameters {brightness {min, max, value}} and sets the level through
++ * setProperties. Which keys it sends is not known yet: every call is logged (first ones in
++ * full) and a "brightness" number, top level or inside IODisplayParameters (also as
++ * {value}), sets the WLED level in proportion to max.
++ */
++#define SWEET_ARMBL_MAX         65536u
++
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight);
++public:
++	AppleCLCD *fFB;
++	uint32_t   fCalls;
++
++	void publishValue(uint32_t value);
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
++
++void
++AppleARMBacklight::publishValue(uint32_t value)
++{
++	OSDictionary *params = OSDictionary::withCapacity(1);
++	OSDictionary *bright = OSDictionary::withCapacity(3);
++	OSNumber *min = OSNumber::withNumber(0ULL, 32);
++	OSNumber *max = OSNumber::withNumber(SWEET_ARMBL_MAX, 32);
++	OSNumber *val = OSNumber::withNumber(value, 32);
++	if (params != NULL && bright != NULL && min != NULL && max != NULL && val != NULL) {
++		bright->setObject("min", min);
++		bright->setObject("max", max);
++		bright->setObject("value", val);
++		params->setObject("brightness", bright);
++		setProperty("IODisplayParameters", params);
++	}
++	OSSafeReleaseNULL(params);
++	OSSafeReleaseNULL(bright);
++	OSSafeReleaseNULL(min);
++	OSSafeReleaseNULL(max);
++	OSSafeReleaseNULL(val);
++}
++
++/* A number, or the "value" of a {min, max, value} dictionary; false if neither. */
++static bool
++sweet_armbl_number(OSObject *o, uint64_t *out)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, o);
++	if (d != NULL) {
++		o = d->getObject("value");
++	}
++	OSNumber *n = OSDynamicCast(OSNumber, o);
++	if (n == NULL) {
++		return false;
++	}
++	*out = n->unsigned64BitValue();
++	return true;
++}
++
++IOReturn
++AppleARMBacklight::setProperties(OSObject *properties)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	uint32_t call = ++fCalls;
++	if (call <= 12 || (call % 200) == 0) {
++		OSSerialize *s = OSSerialize::withCapacity(512);
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		if (s != NULL && properties->serialize(s)) {
++			IOLog("SWEET BL: %s setProperties #%u %.900s\n", name, call, s->text());
++		}
++		OSSafeReleaseNULL(s);
++	}
++	if (dict == NULL) {
++		return kIOReturnBadArgument;
++	}
++	uint64_t v;
++	OSDictionary *params = OSDynamicCast(OSDictionary, dict->getObject("IODisplayParameters"));
++	bool found = sweet_armbl_number(dict->getObject("brightness"), &v) ||
++	    (params != NULL && sweet_armbl_number(params->getObject("brightness"), &v));
++	if (!found) {
++		return kIOReturnSuccess;
++	}
++	if (v > SWEET_ARMBL_MAX) {
++		v = SWEET_ARMBL_MAX;
++	}
++	uint32_t level = (uint32_t)(v * SWEET_BL_FULL / SWEET_ARMBL_MAX);
++	fFB->setBacklightTarget(level < SWEET_BL_LOWEST ? SWEET_BL_LOWEST : level);
++	publishValue((uint32_t)v);
++	return kIOReturnSuccess;
++}
++
++void
++AppleCLCD::publishBacklight(void)
++{
++	AppleARMBacklight *bl = OSTypeAlloc(AppleARMBacklight);
++	if (bl == NULL || !bl->init()) {
++		OSSafeReleaseNULL(bl);
++		return;
++	}
++	bl->fFB = this;
++	bl->setProperty("backlight-control", true);
++	bl->publishValue(fBlTarget * SWEET_ARMBL_MAX / SWEET_BL_FULL);
++	if (!bl->attach(this)) {
++		bl->release();
++		return;
++	}
++	bl->registerService();
++	bl->release();
++	IOLog("SWEET BL: AppleARMBacklight published, level %u of %u\n", fBlTarget, SWEET_BL_FULL);
++}
++
++void
++AppleCLCD::setBacklightTarget(uint32_t level)
++{
++	IOLockLock(fLock);
++	bool changed = level != fBlTarget;
++	fBlTarget = level;
++	IOLockUnlock(fLock);
++	static uint32_t logged;
++	if (changed && logged < 40) {
++		logged++;
++		IOLog("SWEET BL: slider -> backlight %u of %u\n", level, SWEET_BL_FULL);
++	}
++}
++
 +/* Find the DSI interface the ABL left scanning, its frame geometry and refresh; else fIntf stays NULL. */
 +void
 +AppleCLCD::setupVsync(void)
@@ -264,9 +406,9 @@
 +			return false;
 +		}
 +	}
-+	return true;
-+}
-+
+ 	return true;
+ }
+ 
 +/* The next tick: at the start of the coming blanking (a little early), else 60 Hz. */
 +void
 +AppleCLCD::scheduleNext(IOTimerEventSource *sender)
@@ -298,7 +440,7 @@
  	uint64_t now = mach_absolute_time();
  	uint64_t count = ++fb->fVsyncCount;
  	uint64_t values[6] = {
-@@ -224,6 +481,22 @@
+@@ -224,6 +620,22 @@
  		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
  		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
  	}
@@ -321,7 +463,7 @@
  	if (fb->fPowerOff) {
  		/* Fade out: halve every channel each vsync, then black, then idle. */
  		uint32_t step = fb->fFadeStep;
-@@ -233,16 +506,26 @@
+@@ -233,16 +645,26 @@
  		IOLockUnlock(fb->fLock);
  		if (step <= 6) {
  			for (uint32_t y = 0; y < fb->fHeight; y++) {
@@ -351,7 +493,7 @@
  	uint8_t *rec = NULL;
  	if (flush) {
  		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
-@@ -253,10 +536,33 @@
+@@ -253,10 +675,42 @@
  	}
  	IOLockUnlock(fb->fLock);
  	if (rec != NULL) {
@@ -370,8 +512,17 @@
  		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
  	}
 -	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
-+	/* After display on: once the latest frame is in the panel, light up step by step. */
-+	if (fb->fBacklight && fb->fBlRamp < SWEET_BL_STEPS && !fb->fDirty) {
++	/*
++	 * After display on: once a frame swapped after it is in the panel (the one there is from
++	 * before off, the lock screen comes later), light up step by step; after a second anyway.
++	 */
++	bool fresh = !fb->fDirty && !fb->fAwaitFresh;
++	if (fb->fBacklight && fb->fBlRamp == 0 && !fresh && ++fb->fWakeTicks >= SWEET_WAKE_MAX_TICKS) {
++		IOLog("SWEET FB: no new frame %u ticks after display on, backlight on anyway\n", fb->fWakeTicks);
++		fresh = true;
++		fb->fAwaitFresh = false;
++	}
++	if (fb->fBacklight && fb->fBlRamp < SWEET_BL_STEPS && (fresh || fb->fBlRamp > 0)) {
 +		if (fb->fBlRamp == 0) {
 +			(void)sweet_bl_enable(1);
 +		}
@@ -387,7 +538,7 @@
  }
  
  void
-@@ -296,22 +602,68 @@
+@@ -296,22 +750,74 @@
   * shows the latest frame every fFlushTicks ticks (boot-arg sweetfb_hz,
   * default 10 Hz).
   */
@@ -415,8 +566,6 @@
 + */
 +#define SWEET_SWAP_BRIGHTNESS_SET       0x2e7
 +#define SWEET_SWAP_BRIGHTNESS           0x2ec
-+#define SWEET_BL_FULL                   0xfffu
-+#define SWEET_BL_LOWEST                 48u     /* readable even if the scale above is wrong */
 +
  void
  AppleCLCD::swap(const uint8_t *rec)
@@ -438,6 +587,14 @@
  	IOLockLock(fLock);
  	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
  	fDirty = true;
++	if (fAwaitFresh && !fPowerOff) {
++		fAwaitFresh = false;
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time() - fWakeAbs, &ns);
++		if (logged < 40) {
++			IOLog("SWEET FB: first swap %u %llu ms after display on\n", get32(rec, 0x50), ns / 1000000);
++		}
++	}
 +	if (level != 0) {
 +		fBlTarget = level;
 +	}
@@ -459,7 +616,7 @@
  
  
  	if (!fConsolePaused) {
-@@ -392,13 +744,15 @@
+@@ -392,13 +898,15 @@
  		}
  		if (src != 0 && bpe == 4) {
  			for (int32_t y = 0; y < h; y++) {
@@ -476,11 +633,21 @@
  }
  
  bool
-@@ -540,6 +894,7 @@
+@@ -539,7 +1047,16 @@
+ 			if (off != fFB->fPowerOff) {
  				fFB->fPowerOff = off;
  				fFB->fFadeStep = 0;
- 				fFB->fDirty = true;     /* on: redraw the latest frame */
+-				fFB->fDirty = true;     /* on: redraw the latest frame */
 +				fFB->fBlRamp = off ? SWEET_BL_STEPS : 0;
++				if (!off && fFB->fBacklight) {
++					/* The frames from before off are stale: wait for a new one (vsyncFired). */
++					fFB->fDirty = false;
++					fFB->fAwaitFresh = true;
++					fFB->fWakeTicks = 0;
++					fFB->fWakeAbs = mach_absolute_time();
++				} else {
++					fFB->fDirty = true;     /* on: redraw the latest frame */
++				}
  			}
  			IOLockUnlock(fFB->fLock);
  			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
