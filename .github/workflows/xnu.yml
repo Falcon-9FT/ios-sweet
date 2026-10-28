@@ -15,6 +15,9 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
+      runner:
+        description: runner image (macos-14 = Xcode 15; macos-15 = Xcode 16, needs patch 0092)
+        default: macos-15
   push:
     branches: [main]
     paths:
@@ -34,9 +37,9 @@ env:
 
 jobs:
   build:
-    # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
-    # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
-    runs-on: macos-14
+    # Xcode 16's iig emits IORPC.kernelContent: patch 0092 adds it to this xnu (as xnu-10063).
+    # macos-14 (Xcode 15) is retired by GitHub on 2026-11-02.
+    runs-on: ${{ inputs.runner || 'macos-15' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
