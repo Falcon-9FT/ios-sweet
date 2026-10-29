@@ -295,7 +295,7 @@
  /* MB/s of a 16 MB memcpy, best of 4 (cached kernel memory, the CPU renderer's kind of work). */
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,4387 @@
+@@ -0,0 +1,4594 @@
 +/*
 + * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 1 - the modem is loaded, authenticated and let
 + * out of reset, the link to it taken up, and the application processor's file services started, so that
@@ -347,6 +347,7 @@
 + *                 with sweetwlanread=1 the copy engines' registers read (those of their directions)
 + *   12  htc       the copy engines' rings (CE0-CE3) and read-index page given, receive buffers posted, the
 + *                 firmware's first HTC messages (READY) polled for
++ *   13  wmi       HTC services WMI control and HTT data connected, SETUP COMPLETE, the first WMI events
 + *
 + * RPMh is asked for the modem's two rails (step 6) and the Wi-Fi radio's four supplies (step 9), through
 + * sweet_rpmh.c. Nothing writes a clock or a pin; the
@@ -4571,6 +4572,212 @@
 +	return ready;
 +}
 +
++/*
++ * ---- step 13: HTC services connected, and the Wi-Fi firmware's first WMI events ------------------------
++ *
++ * As ath10k_core_start() after HTC READY: the WMI control service connected (ath10k_wmi_connect: all the target's
++ * credits to it, credit flow on), then HTT data (credit flow off), then HTC SETUP COMPLETE EX
++ * (ath10k_htc_start); then the firmware sends WMI SERVICE READY on the WMI endpoint. HTC messages to the target
++ * go on CE0 (RSVD_CTRL) in a source descriptor - address, length, the endpoint in the meta data - and the write
++ * index through CE0's shadow register (membase + 0x32000, ath10k ce.c shadow_sr_wr_ind_addr). Received buffers
++ * are given back to their ring as they are read.
++ */
++
++#define WLAN_SHADOW             0x32000u        /* membase + this: the shadow write-index registers */
++#define HTC_HDR                 8u
++
++static struct wlan_page wlan_tx;                /* messages to the target, CE_RX_BUF bytes each */
++static uint32_t wlan_tx_write[4], wlan_tx_slot;
++static uint8_t wlan_htc_seq[8];
++
++static volatile uint32_t *
++wlan_shadow_map(void)
++{
++	static volatile uint32_t *map;
++
++	if (map == NULL) {
++		map = (volatile uint32_t *)ml_io_map(WLAN_MEMBASE + WLAN_SHADOW, 0x1000);
++	}
++	return map;
++}
++
++/* An HTC message to endpoint eid on source ring c (CE0: 16 entries); false if the ring is full. */
++static bool
++wlan_htc_send(volatile uint32_t *ce, unsigned c, uint32_t entries, uint8_t eid, const void *payload, uint16_t length)
++{
++	volatile uint32_t *shadow = wlan_shadow_map();
++	volatile uint32_t *rri = (volatile uint32_t *)wlan_rri.va;
++	uint32_t slot = wlan_tx_slot++ % (PAGE_SIZE / CE_RX_BUF), read, write = wlan_tx_write[c];
++	uint8_t *m = (uint8_t *)wlan_tx.va + slot * CE_RX_BUF, *d;
++	uint64_t pa = wlan_tx.pa + slot * CE_RX_BUF;
++
++	wlan_flush(wlan_rri.va, 64);
++	read = rri[c] & 0xffff;
++	if (shadow == NULL || ((write + 1) & (entries - 1)) == (read & (entries - 1)) || HTC_HDR + length > CE_RX_BUF) {
++		return false;
++	}
++	bzero(m, HTC_HDR);
++	m[0] = eid;
++	m[2] = (uint8_t)length;
++	m[3] = (uint8_t)(length >> 8);
++	m[5] = wlan_htc_seq[eid & 7]++;
++	memcpy(m + HTC_HDR, payload, length);
++	wlan_flush((vm_offset_t)m, HTC_HDR + length);
++	d = (uint8_t *)wlan_ring[c].va + write * CE_DESC;
++	for (unsigned b = 0; b < 4; b++) {
++		d[b] = (uint8_t)(pa >> (8 * b));
++	}
++	d[4] = (uint8_t)((pa >> 32) & 0x1f);
++	d[5] = d[6] = d[7] = 0;
++	d[8] = (uint8_t)(HTC_HDR + length);
++	d[9] = (uint8_t)((HTC_HDR + length) >> 8);
++	d[10] = (uint8_t)(eid << 4);                    /* meta data (the endpoint), bits 15:4 */
++	d[11] = (uint8_t)(eid >> 4);
++	d[12] = d[13] = d[14] = d[15] = 0;
++	wlan_flush((vm_offset_t)d, CE_DESC);
++	wlan_tx_write[c] = (write + 1) & (entries - 1);
++	shadow[(c * 4) / 4] = wlan_tx_write[c];         /* CE0 0x32000, CE3 0x3200c: 4 bytes per engine */
++	(void)ce;
++	return true;
++}
++
++/*
++ * The next message on destination ring c, if any: its bytes copied into out (at most size), its length
++ * returned; the buffer given back to the ring at once. 0: nothing.
++ */
++static uint32_t
++wlan_htc_receive(volatile uint32_t *ce, unsigned c, uint32_t entries, uint8_t *out, uint32_t size)
++{
++	uint8_t *d = (uint8_t *)wlan_ring[c].va + wlan_rx_read[c] * CE_DESC, *w;
++	uint16_t nbytes;
++	uint64_t pa = 0;
++	uint32_t got = 0;
++
++	wlan_flush((vm_offset_t)d, CE_DESC);
++	nbytes = (uint16_t)(d[8] | d[9] << 8);
++	if (nbytes == 0) {
++		return 0;
++	}
++	for (unsigned b = 0; b < 8; b++) {
++		pa |= (uint64_t)d[b] << (8 * b);
++	}
++	pa &= 0x7ffffffffull;
++	for (uint32_t n = 0; n < WLAN_RX_POSTED; n++) {
++		vm_offset_t va;
++
++		if (wlan_rx_buffer(c - 1, n, &va) == pa) {
++			got = nbytes < size ? nbytes : size;
++			wlan_flush(va, CE_RX_BUF);
++			memcpy(out, (const void *)va, got);
++			bzero((void *)va, CE_RX_BUF);
++			wlan_flush(va, CE_RX_BUF);
++			break;
++		}
++	}
++	d[8] = d[9] = 0;
++	wlan_flush((vm_offset_t)d, CE_DESC);
++	wlan_rx_read[c] = (wlan_rx_read[c] + 1) & (entries - 1);
++	/* the same buffer, back at the write index */
++	w = (uint8_t *)wlan_ring[c].va + wlan_rx_write[c] * CE_DESC;
++	for (unsigned b = 0; b < 8; b++) {
++		w[b] = (uint8_t)(pa >> (8 * b));
++	}
++	w[8] = w[9] = 0;
++	wlan_flush((vm_offset_t)w, CE_DESC);
++	wlan_rx_write[c] = (wlan_rx_write[c] + 1) & (entries - 1);
++	ce[(c * 0x1000 + 0x40) / 4] = wlan_rx_write[c];
++	return got ? got : nbytes;
++}
++
++/* Waits up to ms for an HTC message on CE1 or CE2; its length, the bytes in out; 0 if none came. */
++static uint32_t
++wlan_htc_wait(volatile uint32_t *ce, uint8_t *out, uint32_t size, uint32_t ms, unsigned *from)
++{
++	for (uint32_t t = 0; t <= ms; t++) {
++		for (unsigned c = 2; c >= 1; c--) {
++			uint32_t n = wlan_htc_receive(ce, c, c == 1 ? 512 : 64, out, size);
++
++			if (n != 0) {
++				*from = c;
++				return n;
++			}
++		}
++		sleep_ms(1);
++	}
++	return 0;
++}
++
++static bool
++wlan_htc_connect(volatile uint32_t *ce, uint16_t service, uint16_t flags, uint8_t *eid)
++{
++	uint8_t msg[8] = { 2, 0, (uint8_t)service, (uint8_t)(service >> 8), (uint8_t)flags, (uint8_t)(flags >> 8), 0, 0 };
++	uint8_t in[256];
++	unsigned from = 0;
++
++	if (!wlan_htc_send(ce, 0, 16, 0, msg, sizeof(msg))) {
++		printf("SWEET MPSS: %u: HTC connect %#x: CE0 full\n", step, service);
++		return false;
++	}
++	for (unsigned tries = 0; tries < 8; tries++) {
++		uint32_t n = wlan_htc_wait(ce, in, sizeof(in), 3000, &from);
++
++		if (n == 0) {
++			break;
++		}
++		if (n >= HTC_HDR + 8 && in[0] == 0 && (in[8] | in[9] << 8) == 3) {
++			*eid = in[13];
++			printf("SWEET MPSS: %u: HTC service %#x: status %u, endpoint %u, max message %u bytes\n", step,
++			    in[10] | in[11] << 8, in[12], in[13], in[14] | in[15] << 8);
++			return in[12] == 0;
++		}
++		wlan_htc_show(from, in, n);
++	}
++	printf("SWEET MPSS: %u: HTC service %#x: no answer\n", step, service);
++	return false;
++}
++
++static bool
++step_wmi(void)
++{
++	volatile uint32_t *ce = wlan_ce_map();
++	uint8_t wmi_eid = 0, htt_eid = 0, in[512];
++	uint8_t setup[12] = { 5, 0 };     /* SETUP COMPLETE EX: id, 2 pad, flags 0, bundling 0, 3 pad */
++	unsigned events = 0, from = 0;
++
++	if (ce == NULL || wlan_shadow_map() == NULL || !wlan_page_get(&wlan_tx)) {
++		return false;
++	}
++	announce("connect the HTC services WMI control (all credits) and HTT data, say SETUP COMPLETE, and listen 10 s for "
++	    "the Wi-Fi firmware's WMI events (SERVICE READY)");
++	if (!wlan_htc_connect(ce, 0x100, 2u << 8, &wmi_eid)) {
++		return false;
++	}
++	if (!wlan_htc_connect(ce, 0x300, 1u << 3, &htt_eid)) {
++		return false;
++	}
++	if (!wlan_htc_send(ce, 0, 16, 0, setup, sizeof(setup))) {
++		return false;
++	}
++	printf("SWEET MPSS: %u: SETUP COMPLETE sent; WMI is endpoint %u, HTT %u\n", step, wmi_eid, htt_eid);
++	for (unsigned waited = 0; waited < 10 && events < 6; waited++) {
++		uint32_t n = wlan_htc_wait(ce, in, sizeof(in), 1000, &from);
++
++		if (n == 0) {
++			continue;
++		}
++		events++;
++		if (n >= HTC_HDR + 4 && in[0] == wmi_eid) {
++			uint32_t id = (uint32_t)(in[8] | in[9] << 8 | in[10] << 16 | in[11] << 24);
++
++			printf("SWEET MPSS: %u: WMI event %#x (%u bytes)%s\n", step, id & 0xffffff, n - HTC_HDR,
++			    (id & 0xffffff) == 0x3001 ? " = SERVICE READY" : (id & 0xffffff) == 0x3002 ? " = READY" : "");
++		}
++		wlan_htc_show(from, in, n);
++	}
++	printf("SWEET MPSS: %u: %u messages after SETUP COMPLETE\n", step, events);
++	return events != 0;
++}
++
 +/* ---- step 1: survey -------------------------------------------------------------------------------- */
 +
 +static bool
@@ -4595,10 +4802,10 @@
 +
 +/* ---- the steps, and bring-up ----------------------------------------------------------------------- */
 +
-+#define STEPS                   12
++#define STEPS                   13
 +static bool (*const steps[STEPS])(void) = {
 +	step_survey, step_firmware, step_header, step_image, step_our_item, step_start, step_link, step_qrtr, step_wlfw,
-+	step_smmu, step_wlan, step_htc,
++	step_smmu, step_wlan, step_htc, step_wmi,
 +};
 +
 +static bool keep;
