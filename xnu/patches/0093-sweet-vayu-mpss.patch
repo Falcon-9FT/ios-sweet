@@ -295,7 +295,7 @@
  /* MB/s of a 16 MB memcpy, best of 4 (cached kernel memory, the CPU renderer's kind of work). */
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,3938 @@
+@@ -0,0 +1,3954 @@
 +/*
 + * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 1 - the modem is loaded, authenticated and let
 + * out of reset, the link to it taken up, and the application processor's file services started, so that
@@ -4046,6 +4046,7 @@
 +		return false;
 +	}
 +	announce("tell the Wi-Fi firmware the copy engines (pipes, services, shadow registers) and put it in MISSION mode");
++	sleep_ms(3000);                                         /* the log reaches the storage first (see below) */
 +	m = kalloc_data(1024, Z_WAITOK | Z_ZERO);
 +	if (m == NULL) {
 +		return false;
@@ -4090,6 +4091,13 @@
 +		kfree_data(m, 1024);
 +		return false;
 +	}
++	/*
++	 * ios-mpss13: the phone panicked within the last two seconds of the log after the calibration report - the
++	 * log goes to the storage every two seconds, so what came after was lost. Each access that may end the
++	 * kernel is now announced and waited 3 s for, so that the log says which one it was.
++	 */
++	printf("SWEET MPSS: %u: the copy engines are taken; MISSION mode is asked for in 3 s\n", step);
++	sleep_ms(3000);
 +	at = 7;
 +	tlv_u32(m, &at, 0x01, 0);                               /* QMI_WLFW_MISSION_V01 */
 +	e = wlfw_call(WLFW_WLAN_MODE, m, at, 5000, &result, &error);
@@ -4099,19 +4107,27 @@
 +		return false;
 +	}
 +	PE_parse_boot_argn("sweetwlanread", &read, sizeof(read));
++	printf("SWEET MPSS: %u: the radio is in MISSION mode; %s\n", step, read ? "its registers are read in 3 s" :
++	    "its registers are not read (sweetwlanread=0)");
++	sleep_ms(3000);
 +	if (read) {
 +		volatile uint32_t *ce;
 +
-+		sleep_ms(200);
 +		ce = (volatile uint32_t *)ml_io_map(WLAN_MEMBASE + WLAN_CE0, WLAN_CE_WRAPPER - WLAN_CE0 + 0x1000);
 +		if (ce == NULL) {
 +			return false;
 +		}
++		printf("SWEET MPSS: %u: reading the copy engines' wrapper (%#x) in 3 s\n", step, WLAN_MEMBASE + WLAN_CE_WRAPPER);
++		sleep_ms(3000);
 +		printf("SWEET MPSS: %u: the radio's copy engines: wrapper %#x %#x %#x\n", step, ce[(WLAN_CE_WRAPPER - WLAN_CE0) / 4],
 +		    ce[(WLAN_CE_WRAPPER - WLAN_CE0 + 4) / 4], ce[(WLAN_CE_WRAPPER - WLAN_CE0 + 8) / 4]);
 +		for (unsigned c = 0; c < 12; c++) {
 +			volatile uint32_t *r = ce + c * 0x1000 / 4;
 +
++			if (c < 2) {
++				printf("SWEET MPSS: %u: reading CE%u (%#x) in 3 s\n", step, c, WLAN_MEMBASE + WLAN_CE0 + 0x1000 * c);
++				sleep_ms(3000);
++			}
 +			printf("SWEET MPSS: %u:   CE%u: source ring %#x size %u, destination ring %#x size %u, ie %#x, misc %#x, "
 +			    "write %u/%u, read %u/%u\n", step, c, r[0x00 / 4], r[0x08 / 4], r[0x0c / 4], r[0x14 / 4], r[0x2c / 4],
 +			    r[0x34 / 4], r[0x3c / 4], r[0x40 / 4], r[0x44 / 4], r[0x48 / 4]);
