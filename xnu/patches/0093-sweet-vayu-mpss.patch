@@ -28,7 +28,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,222 @@
+@@ -0,0 +1,315 @@
 +/*
 + * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 0 - read-only probe of what the modem's start
 + * would need. After HakiOS hakios.mpss.c (oosexgang/hackios-xnu-kernel, APSL 2.0), with the numbers of
@@ -38,6 +38,8 @@
 + *     firmware (15) and, for comparison, the GPU's zap shader (13, answered 0 on this phone)
 + *   2 SMEM: header (versions, initialized), the partition table at its last 4K ($TOC), the
 + *     partition shared by the apps (host 0) and the modem (host 1) and the items in it
++ *   3 TrustZone PAS init image with the modem's and the zap shader's .mdt (signature check only),
++ *     each undone at once by PAS shutdown
 + * Boot-arg sweetmpss=1 (default 0: off); sweetmpssdelay=S start delay (30 s, so iOS is up first).
 + * Linux: drivers/soc/qcom/smem.c (layout), qcom_scm (calls), vendor subsys-pil-tz.c (pas_supported).
 + */
@@ -49,6 +51,7 @@
 +#include <kern/sched_prim.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
++#include <vm/vm_kern.h>
 +#include <string.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
@@ -101,14 +104,14 @@
 +}
 +
 +static int32_t
-+scm(uint64_t function, uint64_t arguments, uint64_t first, uint64_t *answer)
++scm2(uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t *answer)
 +{
 +	uint64_t session = 0;
 +	for (int i = 0; i < 100; i++) {
 +		register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
 +		register uint64_t x1 __asm__("x1") = arguments;
 +		register uint64_t x2 __asm__("x2") = first;
-+		register uint64_t x3 __asm__("x3") = 0;
++		register uint64_t x3 __asm__("x3") = second;
 +		register uint64_t x4 __asm__("x4") = 0;
 +		register uint64_t x5 __asm__("x5") = 0;
 +		register uint64_t x6 __asm__("x6") = session;
@@ -122,6 +125,12 @@
 +		}
 +	}
 +	return -1;
++}
++
++static int32_t
++scm(uint64_t function, uint64_t arguments, uint64_t first, uint64_t *answer)
++{
++	return scm2(function, arguments, first, 0, answer);
 +}
 +
 +static void
@@ -212,6 +221,85 @@
 +	printf("SWEET MPSS: apps/modem partition %s\n", found ? "PRESENT" : "MISSING");
 +}
 +
++/*
++ * Step 3: the real question. The vendor kernel never asks pas-is-supported (subsys-pil-tz.c has no such
++ * call; this TrustZone answers 0 for every image, ios-mpss1/2): it hands the image's header (.mdt: ELF
++ * headers + hash segment with the signature) to PAS_INIT_IMAGE in one physically contiguous buffer -
++ * args pas id (value) and its address (read-write buffer), SCM_ARGS(2, VAL, RW) - and TrustZone checks
++ * the signature. Done here for the modem (4) and the GPU zap shader (13), each followed at once by
++ * PAS_SHUTDOWN (pil_deinit_image_trusted), so nothing stays set up; no memory is given, nothing runs.
++ * The headers come in the payload after the CP microcode (build-payload.sh EXTRAFW=SWEETMDM=modem.mdt
++ * SWEETZAP=a640_zap.mdt), found by walking the blocks after the touch firmware (sweet_adreno.c).
++ */
++#define SCM_PAS_INIT_IMAGE      SCM_CALL(2, 1)
++#define SCM_PAS_SHUTDOWN        SCM_CALL(2, 6)
++#define SCM_VAL_RW              (2u | 2u << 6)  /* SCM_ARGS(2, SCM_VAL, SCM_RW) */
++#define BLOB_MAP                0x40000u
++extern uint64_t kvtophys(vm_offset_t va);
++
++/* A tagged block of the payload copied into one kernel page (so physically contiguous); 0 if absent. */
++static vm_offset_t
++payload_blob(const char *tag, uint32_t *size)
++{
++	uint64_t nvt_pa = 0;
++	uint32_t nvt_size = 0;
++	(void)PE_parse_boot_argn("sweetnvtfw", &nvt_pa, sizeof(nvt_pa));
++	(void)PE_parse_boot_argn("sweetnvtfwsz", &nvt_size, sizeof(nvt_size));
++	if (nvt_pa == 0) {
++		return 0;
++	}
++	uint64_t pa = nvt_pa + ((nvt_size + 15u) & ~15u), base = pa & ~0x3fffull;
++	vm_offset_t io = ml_io_map((vm_offset_t)base, BLOB_MAP);
++	uint32_t want[2];
++	memcpy(want, tag, 8);
++	for (uint32_t at = (uint32_t)(pa - base); io != 0 && at + 16u <= BLOB_MAP;) {
++		volatile const uint32_t *w = (volatile const uint32_t *)(io + at);
++		uint32_t len = w[2];
++		if ((w[0] & 0xffffffu) != 0x455753u /* "SWE" */ || len > BLOB_MAP) {
++			break;
++		}
++		if (w[0] == want[0] && w[1] == want[1]) {
++			vm_offset_t copy = 0;
++			if (len == 0 || len > PAGE_SIZE || (len & 3) || at + 16u + len > BLOB_MAP ||
++			    kmem_alloc(kernel_map, &copy, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++			    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++				printf("SWEET MPSS: %.8s: %u bytes, not usable\n", tag, len);
++				return 0;
++			}
++			for (uint32_t i = 0; i < len / 4u; i++) {
++				((uint32_t *)copy)[i] = w[4 + i];
++			}
++			*size = len;
++			return copy;
++		}
++		at += 16u + ((len + 15u) & ~15u);
++	}
++	printf("SWEET MPSS: no %.8s block in the payload\n", tag);
++	return 0;
++}
++
++static void
++probe_signature(unsigned pas, const char *what, const char *tag)
++{
++	uint32_t size = 0;
++	vm_offset_t mdt = payload_blob(tag, &size);
++	if (mdt == 0) {
++		return;
++	}
++	for (vm_offset_t line = mdt; line < mdt + size; line += 64) {
++		__asm__ volatile("dc civac, %0" : : "r"(line) : "memory");
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	uint64_t how = SCM_64 | SCM_SIP, ans = ~0ull, phys = kvtophys(mdt);
++	printf("SWEET MPSS: %s header: %u bytes at pa %#llx, ELF %#x\n", what, size, phys, *(uint32_t *)mdt);
++	int32_t r = scm2(how | SCM_PAS_INIT_IMAGE, SCM_VAL_RW, pas, phys, &ans);
++	printf("SWEET MPSS: TrustZone pas-init-image(%u, %s): ret %d answer %#llx%s\n", pas, what, r, ans,
++	    r == 0 && ans == 0 ? " - SIGNATURE ACCEPTED" : " - refused");
++	ans = ~0ull;
++	r = scm(how | SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, pas, &ans);
++	printf("SWEET MPSS: TrustZone pas-shutdown(%u): ret %d answer %#llx\n", pas, r, ans);
++}
++
 +static void
 +mpss_thread(void *arg, wait_result_t result)
 +{
@@ -227,6 +315,11 @@
 +	printf("SWEET MPSS: step 2: SMEM\n");
 +	sleep_ms(3000);
 +	probe_smem();
++	printf("SWEET MPSS: step 3: TrustZone PAS init image (signature check) + shutdown: modem, GPU zap\n");
++	sleep_ms(3000);
++	probe_signature(PAS_MPSS, "modem", "SWEETMDM");
++	sleep_ms(1000);
++	probe_signature(PAS_GPU, "GPU zap shader", "SWEETZAP");
 +	printf("SWEET MPSS: probe done\n");
 +	(void)thread_terminate(current_thread());
 +	thread_block(THREAD_CONTINUE_NULL);
