@@ -295,7 +295,7 @@
  /* MB/s of a 16 MB memcpy, best of 4 (cached kernel memory, the CPU renderer's kind of work). */
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,4372 @@
+@@ -0,0 +1,4387 @@
 +/*
 + * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 1 - the modem is loaded, authenticated and let
 + * out of reset, the link to it taken up, and the application processor's file services started, so that
@@ -4200,6 +4200,9 @@
 +#define WLAN_STREAM             0x640u
 +#define WLAN_STREAM_MASK        0x1u
 +
++static volatile uint32_t *wlan_smmu;            /* apps-smmu's registers */
++static uint32_t wlan_smmu_cb;                   /* byte offset of the bank the radio's stream goes through; 0: none */
++
 +static bool
 +step_smmu(void)
 +{
@@ -4207,12 +4210,10 @@
 +	uint32_t cr0, idr0, idr1, groups, banks, page, half, found = 0;
 +
 +	announce("read how the boot chain left the SMMU for the radio's stream 0x640 (apps-smmu@0x15000000; nothing written)");
-+	static volatile uint32_t *smmu_map;     /* ml_io_map() is permanent: mapped once, never unmapped */
-+
-+	if (smmu_map == NULL) {
-+		smmu_map = (volatile uint32_t *)ml_io_map(APPS_SMMU, APPS_SMMU_SIZE);
++	if (wlan_smmu == NULL) {                /* ml_io_map() is permanent: mapped once, never unmapped */
++		wlan_smmu = (volatile uint32_t *)ml_io_map(APPS_SMMU, APPS_SMMU_SIZE);
 +	}
-+	s = smmu_map;
++	s = wlan_smmu;
 +	if (s == NULL) {
 +		return false;
 +	}
@@ -4302,6 +4303,7 @@
 +
 +		s[(page + 4 * bank) / 4] = (1u << 16) | (0xfu << 12) | (3u << 8);    /* CBAR: S1 trans S2 bypass, WB, NSH */
 +		b[0x00 / 4] = 0;                                /* SCTLR: translation off */
++		wlan_smmu_cb = half + bank * page;
 +		s[(0xc00 + 4 * group) / 4] = bank;              /* S2CR: translate through that bank */
 +		__asm__ volatile ("dsb sy" ::: "memory");
 +		printf("SWEET MPSS: %u: bank %u: CBAR %#x SCTLR %#x; group %u S2CR %#x\n", step, bank, s[(page + 4 * bank) / 4],
@@ -4355,8 +4357,14 @@
 +	if (p->va != 0) {
 +		return true;
 +	}
-+	if (kmem_alloc(kernel_map, &p->va, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++	/*
++	 * ios-mpss20: in pages above 4 GiB (0x11afc8000 ...) CE2 took a buffer (read index 1) but nothing arrived in
++	 * memory, not even the read indices: below 4 GiB now, in case the radio's writes go no higher.
++	 */
++	if (kmem_alloc_contig(kernel_map, &p->va, PAGE_SIZE, 0, (ppnum_t)((0x100000000ull >> PAGE_SHIFT) - 1), 0,
++	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 +		p->va = 0;
++		printf("SWEET MPSS: %u: no page below 4 GiB\n", step);
 +		return false;
 +	}
 +	p->pa = kvtophys(p->va);
@@ -4546,9 +4554,16 @@
 +			volatile uint32_t *rri = (volatile uint32_t *)wlan_rri.va;
 +
 +			wlan_flush(wlan_rri.va, 64);
-+			printf("SWEET MPSS: %u: %u ms: read indices in memory %#x %#x %#x %#x; CE1 DR read %u, CE2 DR read %u, misc %#x %#x\n",
-+			    step, ms, rri[0], rri[1], rri[2], rri[3], ce[(0x1000 + 0x48) / 4], ce[(0x2000 + 0x48) / 4],
-+			    ce[(0x1000 + 0x34) / 4], ce[(0x2000 + 0x34) / 4]);
++			printf("SWEET MPSS: %u: %u ms: read indices in memory %#x %#x %#x %#x; CE1 DR read %u, CE2 DR read %u; "
++			    "host IS %#x %#x, misc IS %#x %#x\n", step, ms, rri[0], rri[1], rri[2], rri[3], ce[(0x1000 + 0x48) / 4],
++			    ce[(0x2000 + 0x48) / 4], ce[(0x1000 + 0x30) / 4], ce[(0x2000 + 0x30) / 4], ce[(0x1000 + 0x38) / 4],
++			    ce[(0x2000 + 0x38) / 4]);
++			if (wlan_smmu != NULL && wlan_smmu_cb != 0) {
++				volatile uint32_t *b = wlan_smmu + wlan_smmu_cb / 4;
++
++				printf("SWEET MPSS: %u:   SMMU: sGFSR %#x; the radio's bank FSR %#x FAR %#x%08x FSYNR0 %#x\n", step,
++				    wlan_smmu[0x48 / 4], b[0x58 / 4], b[0x64 / 4], b[0x60 / 4], b[0x68 / 4]);
++			}
 +		}
 +		sleep_ms(1);
 +	}
