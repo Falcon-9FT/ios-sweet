@@ -295,7 +295,7 @@
  /* MB/s of a 16 MB memcpy, best of 4 (cached kernel memory, the CPU renderer's kind of work). */
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,4050 @@
+@@ -0,0 +1,4122 @@
 +/*
 + * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 1 - the modem is loaded, authenticated and let
 + * out of reset, the link to it taken up, and the application processor's file services started, so that
@@ -341,7 +341,8 @@
 + *    8  qrtr      the modem's hello answered and the services it tells of listened for (WLFW wanted)
 + *    9  wlfw      the Wi-Fi firmware's service (QMI 0x45), as ath10k: indications, host capabilities, MSA (given by
 + *                 TrustZone to the modem and the WLAN), capabilities, board data, calibration report, "fw ready"
-+ *   10  smmu      how the boot chain left apps-smmu for the radio's stream 0x640 (read only)
++ *   10  smmu      how the boot chain left apps-smmu for the radio's stream 0x640; with no entry for it, one that lets
++ *                 it through untranslated (bypass, or a free bank with translation off) in a free group
 + *   11  wlan      the copy engines told (pipes, services, shadow registers, as ath10k snoc.c) and the mode MISSION;
 + *                 with sweetwlanread=1 the copy engines' registers read (those of their directions)
 + *
@@ -4010,6 +4011,8 @@
 +#define WLAN_CE0                0x240000u       /* ath10k hw.c wcn3990_regs: CE n at 0x240000 + 0x1000 n */
 +#define WLAN_CE_WRAPPER         0x24c000u
 +
++static bool wlan_smmu_open;                     /* the SMMU step let the radio's stream through */
++
 +static const uint32_t wlan_ce_pipes[12][5] = {  /* pipe, direction (1 in, 2 out, 3 both), entries, bytes, flags */
 +	{ 0, 2, 32, 2048, 0 }, { 1, 1, 32, 2048, 0 }, { 2, 1, 64, 2048, 0 }, { 3, 2, 32, 2048, 0 },
 +	{ 4, 2, 256, 256, 8 }, { 5, 2, 1024, 64, 8 }, { 6, 3, 32, 16384, 0 }, { 7, 4, 0, 0, 8 },
@@ -4039,7 +4042,12 @@
 +step_wlan(void)
 +{
 +	uint8_t *m;
-+	uint32_t at = 7, n, read = 0;   /* ios-mpss16: even ctrl1 right after MISSION stalled once: off unless asked */
++	uint32_t at = 7, n, read;
++	/*
++	 * ios-mpss16: with the radio's stream faulting in the SMMU even ctrl1 right after MISSION stalled once: the
++	 * registers are read by default only once the SMMU step has let the stream through.
++	 */
++	read = wlan_smmu_open ? 1 : 0;
 +	uint16_t result = 0, error = 0;
 +	int e;
 +
@@ -4231,6 +4239,70 @@
 +		}
 +	}
 +	printf("SWEET MPSS: %u: %u stream match entr%s take the radio's stream\n", step, found, found == 1 ? "y" : "ies");
++
++	/*
++	 * ios-mpss18: no entry takes 0x640, and sCR0 faults unmatched streams - the radio's engines can reach no
++	 * memory at all (after MISSION, reads of its registers stalled now and then). So, as Linux's arm-smmu-qcom
++	 * does for a device it lets through untranslated: in a stream match group nobody uses, the radio's stream
++	 * (0x640, mask 0x1) routed to bypass; where the hypervisor turns a bypass S2CR into a fault (it reads back so),
++	 * routed instead to a context bank nobody uses, made "stage 1 translate, stage 2 bypass" with translation off
++	 * (SCTLR 0: Linux's bypass_cbndx). Only that group and that bank are written; the match register last.
++	 * sweetwlansmmu=0: nothing written.
++	 */
++	uint32_t write = 1, group = groups, bank = banks;
++
++	PE_parse_boot_argn("sweetwlansmmu", &write, sizeof(write));
++	if (found != 0 || !write) {
++		return true;
++	}
++	for (uint32_t g = groups; g-- > 0 && group == groups;) {
++		if (!(s[(0x800 + 4 * g) / 4] & (1u << 31))) {
++			group = g;
++		}
++	}
++	for (uint32_t cb = banks; cb-- > 0 && bank == banks;) {
++		bool used = (s[(half + cb * page) / 4] & 1) != 0;  /* SCTLR.M: translating for someone */
++
++		for (uint32_t g = 0; g < groups && !used; g++) {
++			uint32_t s2cr = s[(0xc00 + 4 * g) / 4];
++
++			used = (s[(0x800 + 4 * g) / 4] & (1u << 31)) && ((s2cr >> 16) & 3) == 0 && (s2cr & 0xff) == cb;
++		}
++		if (!used && s[(page + 4 * cb) / 4] == 0) {
++			bank = cb;
++		}
++	}
++	if (group == groups) {
++		printf("SWEET MPSS: %u: NO FREE STREAM MATCH GROUP: the radio's stream is left as it is\n", step);
++		return false;
++	}
++	s[(0xc00 + 4 * group) / 4] = 1u << 16;                 /* S2CR: bypass */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	uint32_t s2cr = s[(0xc00 + 4 * group) / 4];
++	bool bypass = ((s2cr >> 16) & 3) == 1;
++
++	printf("SWEET MPSS: %u: group %u S2CR bypass written, reads back %#x: %s\n", step, group, s2cr,
++	    bypass ? "BYPASS TAKEN" : "not taken (the hypervisor's), a context bank with translation off instead");
++	if (!bypass) {
++		if (bank == banks || half + (bank + 1) * page > APPS_SMMU_SIZE) {
++			printf("SWEET MPSS: %u: NO FREE CONTEXT BANK: the radio's stream is left faulting\n", step);
++			s[(0xc00 + 4 * group) / 4] = s2cr;
++			return false;
++		}
++		volatile uint32_t *b = s + (half + bank * page) / 4;
++
++		s[(page + 4 * bank) / 4] = (1u << 16) | (0xfu << 12) | (3u << 8);    /* CBAR: S1 trans S2 bypass, WB, NSH */
++		b[0x00 / 4] = 0;                                /* SCTLR: translation off */
++		s[(0xc00 + 4 * group) / 4] = bank;              /* S2CR: translate through that bank */
++		__asm__ volatile ("dsb sy" ::: "memory");
++		printf("SWEET MPSS: %u: bank %u: CBAR %#x SCTLR %#x; group %u S2CR %#x\n", step, bank, s[(page + 4 * bank) / 4],
++		    b[0x00 / 4], group, s[(0xc00 + 4 * group) / 4]);
++	}
++	s[(0x800 + 4 * group) / 4] = (1u << 31) | (WLAN_STREAM_MASK << 16) | WLAN_STREAM;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wlan_smmu_open = true;
++	printf("SWEET MPSS: %u: group %u SMR %#x: THE RADIO'S STREAM GOES THROUGH UNTRANSLATED (%s)\n", step, group,
++	    s[(0x800 + 4 * group) / 4], bypass ? "bypass" : "bank with translation off");
 +	return true;
 +}
 +
