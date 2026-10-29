@@ -226,7 +226,7 @@
  /* MB/s of a 16 MB memcpy, best of 4 (cached kernel memory, the CPU renderer's kind of work). */
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,3171 @@
+@@ -0,0 +1,3284 @@
 +/*
 + * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 1 - the modem is loaded, authenticated and let
 + * out of reset, the link to it taken up, and the application processor's file services started, so that
@@ -2804,13 +2804,30 @@
 +	return path + strlen(prefix);
 +}
 +
++/*
++ * The modem's writes (/readwrite/NAME: tqftpserv keeps them in /data/vendor/tombstones/rfs/modem) are taken and
++ * thrown away: nothing is written to the storage. The modem checks that the server takes writes before it reads
++ * (Linux's tqftpserv: /readwrite/server_check.txt); refused, it retries without end and never reads wlanmdsp.mbn.
++ */
++static bool
++tftp_writable(const char *path)
++{
++	static const char *const prefix = "/readwrite/";
++
++	return strncmp(path, prefix, strlen(prefix)) == 0 && path[strlen(prefix)] != 0;
++}
++
++static uint32_t tftp_writes, tftp_written_bytes;
++
 +struct tftp_transfer {
-+	struct qrtr_port *port;                 /* the port of this transfer (a read); NULL: free */
++	struct qrtr_port *port;                 /* the port of this transfer; NULL: free */
 +	uint32_t node, peer;
-+	uint8_t *data;                          /* the file, whole, in memory of ours */
++	uint8_t *data;                          /* a read: the file, whole, in memory of ours */
 +	uint64_t size, sent;
 +	uint32_t block, blksize, wsize;
 +	bool done;
++	bool write;                             /* a write: blocks are acknowledged and dropped */
++	uint64_t received;
 +};
 +static struct tftp_transfer tftp_transfers[4];
 +
@@ -2864,6 +2881,14 @@
 +}
 +
 +static void
++tftp_ack(struct tftp_transfer *t, uint16_t block)
++{
++	uint8_t packet[4] = { 0, TFTP_ACK, (uint8_t)(block >> 8), (uint8_t)block };
++
++	qrtr_send(t->port, t->node, t->peer, packet, sizeof(packet));
++}
++
++static void
 +tftp_transfer_receive(void *context, uint32_t node, uint32_t port, const void *data, uint32_t length)
 +{
 +	struct tftp_transfer *t = context;
@@ -2877,6 +2902,25 @@
 +	block = (uint16_t)(m[2] << 8 | m[3]);
 +	if (op == TFTP_ERROR) {
 +		tftp_transfer_end(t);
++		return;
++	}
++	if (t->write) {
++		if (op != TFTP_DATA) {
++			tftp_error(t->port, node, port, TFTP_EBADOP, "expected DATA");
++			tftp_transfer_end(t);
++			return;
++		}
++		if (block == (uint16_t)(t->block + 1)) {
++			t->block = block;
++			t->received += length - 4;
++			tftp_written_bytes += length - 4;
++			t->done = length - 4 < t->blksize;
++		}
++		tftp_ack(t, t->block);          /* a duplicate block: the last one taken acknowledged again */
++		if (t->done) {
++			tftp_writes++;
++			tftp_transfer_end(t);
++		}
 +		return;
 +	}
 +	if (op != TFTP_ACK) {
@@ -2896,6 +2940,73 @@
 +	tftp_send_block(t);
 +}
 +
++/* A write request: taken on a port of its own if under /readwrite/; its blocks are acknowledged and dropped. */
++static void
++tftp_write_start(uint32_t node, uint32_t port, const uint8_t *m, uint32_t length)
++{
++	const char *name = (const char *)m + 2, *options;
++	struct tftp_transfer *t = NULL;
++	uint32_t blksize = 512, at = 2;
++	bool asked = false;
++	uint8_t oack[64];
++
++	if (!tftp_writable(name)) {
++		if (tftp_refused < 20) {
++			printf("SWEET MPSS: tftp: the modem writes \"%s\": NOT A PATH TAKEN HERE\n", name);
++		}
++		tftp_error(tftp_port, node, port, TFTP_ENOENT, "file not found");
++		tftp_refused++;
++		return;
++	}
++	for (options = name + strlen(name) + 1; options < (const char *)m + length;) {
++		const char *key = options + strlen(options) + 1;
++
++		if (key >= (const char *)m + length) {
++			break;
++		}
++		if (strcmp(options, "blksize") == 0) {
++			uint32_t b = (uint32_t)strtoul(key, NULL, 10);
++
++			blksize = b >= 8 && b <= 4096 ? b : blksize;
++			asked = true;
++		}
++		options = key + strlen(key) + 1;
++	}
++	for (unsigned i = 0; i < sizeof(tftp_transfers) / sizeof(tftp_transfers[0]) && t == NULL; i++) {
++		if (tftp_transfers[i].port == NULL) {
++			t = &tftp_transfers[i];
++		}
++	}
++	if (t == NULL) {
++		tftp_error(tftp_port, node, port, TFTP_ENOENT, "busy");
++		tftp_refused++;
++		return;
++	}
++	bzero(t, sizeof(*t));
++	t->port = qrtr_open(tftp_transfer_receive, t);
++	if (t->port == NULL) {
++		tftp_error(tftp_port, node, port, TFTP_ENOENT, "no port");
++		tftp_refused++;
++		return;
++	}
++	t->node = node;
++	t->peer = port;
++	t->blksize = blksize;
++	t->write = true;
++	if (tftp_writes < 20) {
++		printf("SWEET MPSS: tftp: the modem writes \"%s\" (blocks of %u): taken, kept nowhere\n", name, blksize);
++	}
++	if (!asked) {
++		tftp_ack(t, 0);
++		return;
++	}
++	oack[0] = 0;
++	oack[1] = TFTP_OACK;
++	at += (unsigned)snprintf((char *)oack + at, sizeof(oack) - at, "blksize") + 1;
++	at += (unsigned)snprintf((char *)oack + at, sizeof(oack) - at, "%u", blksize) + 1;
++	qrtr_send(t->port, node, port, oack, at);
++}
++
 +static void
 +tftp_receive(__unused void *context, uint32_t node, uint32_t port, const void *data, uint32_t length)
 +{
@@ -2912,18 +3023,20 @@
 +		return;
 +	}
 +	tftp_requests++;
-+	if ((m[0] << 8 | m[1]) != TFTP_RRQ) {
-+		printf("SWEET MPSS: tftp: the modem's request %u: not a read, refused\n", m[0] << 8 | m[1]);
-+		tftp_error(tftp_port, node, port, TFTP_EBADOP, "not a read");
-+		tftp_refused++;
-+		return;
-+	}
 +	name = (const char *)m + 2;
 +	for (left = 2; left < length && m[left] != 0; left++) {
 +		;
 +	}
-+	if (left >= length) {
++	if (left >= length || ((m[0] << 8 | m[1]) != TFTP_RRQ && (m[0] << 8 | m[1]) != TFTP_WRQ)) {
++		if (tftp_refused < 20) {
++			printf("SWEET MPSS: tftp: the modem's request %u: not understood, refused\n", m[0] << 8 | m[1]);
++		}
++		tftp_error(tftp_port, node, port, TFTP_EBADOP, "bad request");
 +		tftp_refused++;
++		return;
++	}
++	if ((m[0] << 8 | m[1]) == TFTP_WRQ) {
++		tftp_write_start(node, port, m, length);
 +		return;
 +	}
 +	file = tftp_file_of(name);
