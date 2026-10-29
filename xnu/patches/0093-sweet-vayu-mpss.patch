@@ -295,7 +295,7 @@
  /* MB/s of a 16 MB memcpy, best of 4 (cached kernel memory, the CPU renderer's kind of work). */
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,4122 @@
+@@ -0,0 +1,4372 @@
 +/*
 + * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 1 - the modem is loaded, authenticated and let
 + * out of reset, the link to it taken up, and the application processor's file services started, so that
@@ -345,6 +345,8 @@
 + *                 it through untranslated (bypass, or a free bank with translation off) in a free group
 + *   11  wlan      the copy engines told (pipes, services, shadow registers, as ath10k snoc.c) and the mode MISSION;
 + *                 with sweetwlanread=1 the copy engines' registers read (those of their directions)
++ *   12  htc       the copy engines' rings (CE0-CE3) and read-index page given, receive buffers posted, the
++ *                 firmware's first HTC messages (READY) polled for
 + *
 + * RPMh is asked for the modem's two rails (step 6) and the Wi-Fi radio's four supplies (step 9), through
 + * sweet_rpmh.c. Nothing writes a clock or a pin; the
@@ -4013,6 +4015,18 @@
 +
 +static bool wlan_smmu_open;                     /* the SMMU step let the radio's stream through */
 +
++/* The copy engines' registers (CE0 .. CE11 and the wrapper), mapped once: ml_io_map() may not be unmapped. */
++static volatile uint32_t *
++wlan_ce_map(void)
++{
++	static volatile uint32_t *map;
++
++	if (map == NULL) {
++		map = (volatile uint32_t *)ml_io_map(WLAN_MEMBASE + WLAN_CE0, WLAN_CE_WRAPPER - WLAN_CE0 + 0x1000);
++	}
++	return map;
++}
++
 +static const uint32_t wlan_ce_pipes[12][5] = {  /* pipe, direction (1 in, 2 out, 3 both), entries, bytes, flags */
 +	{ 0, 2, 32, 2048, 0 }, { 1, 1, 32, 2048, 0 }, { 2, 1, 64, 2048, 0 }, { 3, 2, 32, 2048, 0 },
 +	{ 4, 2, 256, 256, 8 }, { 5, 2, 1024, 64, 8 }, { 6, 3, 32, 16384, 0 }, { 7, 4, 0, 0, 8 },
@@ -4118,12 +4132,7 @@
 +	sleep_ms(3000);
 +	volatile uint32_t *ce = NULL;
 +	if (read) {
-+		static volatile uint32_t *ce_map;       /* ml_io_map() is permanent: mapped once, never unmapped */
-+
-+		if (ce_map == NULL) {
-+			ce_map = (volatile uint32_t *)ml_io_map(WLAN_MEMBASE + WLAN_CE0, WLAN_CE_WRAPPER - WLAN_CE0 + 0x1000);
-+		}
-+		ce = ce_map;
++		ce = wlan_ce_map();
 +		if (ce == NULL) {
 +			kfree_data(m, 1024);
 +			return false;
@@ -4306,6 +4315,247 @@
 +	return true;
 +}
 +
++/*
++ * ---- step 12: the copy engines' rings, and the Wi-Fi firmware's first HTC message ----------------------
++ *
++ * As ath10k's ath10k_ce_alloc_rri(), ath10k_ce_init_pipe() and ath10k_snoc_rx_post() (wcn3990, 64-bit
++ * descriptors): a page of read indices the engines keep up to date (RRI: its address in the wrapper at
++ * 0x24c004/0x24c008, bit 19 of each engine's ctrl1); the rings of the engines HTC needs - CE0 (host to target,
++ * HTC control: 16), CE1 (target to host, HTT + HTC: 512), CE2 (target to host, WMI and HTC control: 64), CE3 (host
++ * to target, WMI: 32) - each in a page of its own, their base, size, dmax, byte swap off and watermarks written;
++ * then receive buffers of 2048 bytes posted to CE1 and CE2. The radio's stream goes through the SMMU untranslated
++ * (step 10), so the engines are given physical addresses. The firmware then sends HTC READY (ath10k:
++ * ath10k_htc_wait_target) on its own; nothing is sent to it here. The descriptors are polled (no interrupts).
++ */
++
++#define CE_DESC                 16u             /* struct ce_desc_64: u64 addr, u16 nbytes, u16 flags, u32 hash */
++#define CE_RX_BUF               2048u
++#define WLAN_RX_POSTED          24u             /* receive buffers posted to CE1 and to CE2 each */
++
++struct wlan_page {
++	vm_offset_t va;
++	uint64_t pa;
++};
++
++static struct wlan_page wlan_rri, wlan_ring[4], wlan_rx_page[2][(WLAN_RX_POSTED * CE_RX_BUF + 0x3fff) / 0x4000 + 1];
++static uint32_t wlan_rx_write[4], wlan_rx_read[4];
++
++static void
++wlan_flush(vm_offset_t va, size_t length)
++{
++	for (vm_offset_t line = va & ~(vm_offset_t)63; line < va + length; line += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (line) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static bool
++wlan_page_get(struct wlan_page *p)
++{
++	if (p->va != 0) {
++		return true;
++	}
++	if (kmem_alloc(kernel_map, &p->va, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		p->va = 0;
++		return false;
++	}
++	p->pa = kvtophys(p->va);
++	wlan_flush(p->va, PAGE_SIZE);
++	return p->pa != 0;
++}
++
++/* A receive buffer of CE1 (k 0) or CE2 (k 1): n-th of WLAN_RX_POSTED, physical and virtual. */
++static uint64_t
++wlan_rx_buffer(unsigned k, uint32_t n, vm_offset_t *va)
++{
++	uint32_t per_page = PAGE_SIZE / CE_RX_BUF;
++	struct wlan_page *p = &wlan_rx_page[k][n / per_page];
++
++	*va = p->va + (n % per_page) * CE_RX_BUF;
++	return p->pa + (n % per_page) * CE_RX_BUF;
++}
++
++static void
++wlan_ring_src(volatile uint32_t *ce, unsigned c, struct wlan_page *ring, uint32_t entries, uint32_t dmax)
++{
++	volatile uint32_t *r = ce + c * 0x1000 / 4;
++
++	r[0x00 / 4] = (uint32_t)ring->pa;
++	r[0x04 / 4] = (uint32_t)(ring->pa >> 32) & 0x1f;
++	r[0x08 / 4] = entries;
++	r[0x18 / 4] = (r[0x18 / 4] & ~0xffffu & ~(1u << 17)) | dmax;    /* dmax, source byte swap off */
++	r[0x4c / 4] = (0u << 16) | entries;                              /* low watermark 0, high = entries */
++}
++
++static void
++wlan_ring_dst(volatile uint32_t *ce, unsigned c, struct wlan_page *ring, uint32_t entries)
++{
++	volatile uint32_t *r = ce + c * 0x1000 / 4;
++
++	r[0x0c / 4] = (uint32_t)ring->pa;
++	r[0x10 / 4] = (uint32_t)(ring->pa >> 32) & 0x1f;
++	r[0x14 / 4] = entries;
++	r[0x18 / 4] = r[0x18 / 4] & ~(1u << 18);                         /* destination byte swap off */
++	r[0x50 / 4] = (0u << 16) | entries;
++}
++
++/* Receive buffers into CE c's ring (k: their pool), from its write index on; the write index written last. */
++static void
++wlan_rx_post(volatile uint32_t *ce, unsigned c, unsigned k, uint32_t entries, uint32_t count)
++{
++	volatile uint32_t *r = ce + c * 0x1000 / 4;
++	uint8_t *ring = (uint8_t *)wlan_ring[c].va;
++	uint32_t write = r[0x40 / 4] & (entries - 1);
++
++	wlan_rx_read[c] = write;
++	for (uint32_t n = 0; n < count; n++) {
++		vm_offset_t va;
++		uint64_t pa = wlan_rx_buffer(k, n, &va);
++		uint8_t *d = ring + ((write + n) & (entries - 1)) * CE_DESC;
++
++		bzero((void *)va, CE_RX_BUF);
++		wlan_flush(va, CE_RX_BUF);
++		for (unsigned b = 0; b < 8; b++) {
++			d[b] = (uint8_t)(pa >> (8 * b));
++		}
++		d[8] = d[9] = 0;                                /* nbytes 0: the engine fills it */
++	}
++	wlan_flush(wlan_ring[c].va, entries * CE_DESC);
++	wlan_rx_write[c] = (write + count) & (entries - 1);
++	r[0x40 / 4] = wlan_rx_write[c];
++}
++
++static void
++wlan_htc_show(unsigned c, const uint8_t *b, uint32_t n)
++{
++	char hex[3 * 32 + 1];
++	uint32_t shown = n < 32 ? n : 32;
++
++	for (uint32_t i = 0; i < shown; i++) {
++		snprintf(hex + 3 * i, sizeof(hex) - 3 * i, " %02x", b[i]);
++	}
++	hex[3 * shown] = 0;
++	printf("SWEET MPSS: %u: CE%u: %u bytes:%s\n", step, c, n, hex);
++	if (n >= 10) {
++		uint16_t length = (uint16_t)(b[2] | b[3] << 8), id = (uint16_t)(b[8] | b[9] << 8);
++
++		printf("SWEET MPSS: %u:   HTC endpoint %u flags %#x length %u trailer %u seq %u; message %u%s\n", step, b[0], b[1],
++		    length, b[4], b[5], id, b[0] == 0 && id == 1 ? " = READY" : "");
++		if (b[0] == 0 && id == 1 && n >= 16) {
++			printf("SWEET MPSS: %u: HTC READY: %u credits of %u bytes, %u endpoints\n", step, b[10] | b[11] << 8,
++			    b[12] | b[13] << 8, b[14]);
++		}
++	}
++}
++
++static bool
++step_htc(void)
++{
++	volatile uint32_t *ce = wlan_ce_map();
++	static const struct {
++		unsigned c;
++		bool src;
++		uint32_t entries;
++	} rings[] = { { 0, true, 16 }, { 1, false, 512 }, { 2, false, 64 }, { 3, true, 32 } };
++	unsigned seen = 0;
++	bool ready = false;
++
++	if (ce == NULL || !wlan_smmu_open || PAGE_SIZE < 0x4000) {     /* the pools are sized for 16 KiB pages */
++		printf("SWEET MPSS: %u: the radio's stream is not let through the SMMU: no rings\n", step);
++		return false;
++	}
++	announce("give the copy engines their rings (CE0 16, CE1 512, CE2 64, CE3 32) and the read-index page, post receive "
++	    "buffers to CE1 and CE2, and wait 10 s for the Wi-Fi firmware's HTC READY");
++	if (!wlan_page_get(&wlan_rri)) {
++		return false;
++	}
++	for (unsigned i = 0; i < 4; i++) {
++		if (!wlan_page_get(&wlan_ring[rings[i].c])) {
++			return false;
++		}
++	}
++	for (unsigned k = 0; k < 2; k++) {
++		for (unsigned p = 0; p * (PAGE_SIZE / CE_RX_BUF) < WLAN_RX_POSTED; p++) {
++			if (!wlan_page_get(&wlan_rx_page[k][p])) {
++				return false;
++			}
++		}
++	}
++	/* ath10k_ce_alloc_rri: the page's address, then "update the read index in memory" in every engine */
++	ce[(WLAN_CE_WRAPPER - WLAN_CE0 + 4) / 4] = (uint32_t)wlan_rri.pa;
++	ce[(WLAN_CE_WRAPPER - WLAN_CE0 + 8) / 4] = (uint32_t)(wlan_rri.pa >> 32) & 0x1f;
++	for (unsigned c = 0; c < 12; c++) {
++		ce[(c * 0x1000 + 0x18) / 4] |= 1u << 19;
++	}
++	for (unsigned i = 0; i < 4; i++) {
++		if (rings[i].src) {
++			wlan_ring_src(ce, rings[i].c, &wlan_ring[rings[i].c], rings[i].entries, 2048);
++		} else {
++			wlan_ring_dst(ce, rings[i].c, &wlan_ring[rings[i].c], rings[i].entries);
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wlan_rx_post(ce, 1, 0, 512, WLAN_RX_POSTED);
++	wlan_rx_post(ce, 2, 1, 64, WLAN_RX_POSTED);
++	for (unsigned i = 0; i < 4; i++) {
++		volatile uint32_t *r = ce + rings[i].c * 0x1000 / 4;
++
++		if (rings[i].src) {
++			printf("SWEET MPSS: %u: CE%u source ring %#x%08x size %u ctrl1 %#x write %u read %u\n", step, rings[i].c,
++			    r[0x04 / 4], r[0x00 / 4], r[0x08 / 4], r[0x18 / 4], r[0x3c / 4], r[0x44 / 4]);
++		} else {
++			printf("SWEET MPSS: %u: CE%u destination ring %#x%08x size %u ctrl1 %#x write %u read %u\n", step, rings[i].c,
++			    r[0x10 / 4], r[0x0c / 4], r[0x14 / 4], r[0x18 / 4], r[0x40 / 4], r[0x48 / 4]);
++		}
++	}
++	printf("SWEET MPSS: %u: read-index page %#llx; waiting for the firmware\n", step, wlan_rri.pa);
++
++	for (unsigned ms = 0; ms < 10000 && seen < 8; ms++) {
++		for (unsigned c = 1; c <= 2 && seen < 8; c++) {
++			uint32_t entries = c == 1 ? 512 : 64;
++			uint8_t *d = (uint8_t *)wlan_ring[c].va + wlan_rx_read[c] * CE_DESC;
++			uint16_t nbytes;
++
++			wlan_flush((vm_offset_t)d, CE_DESC);
++			nbytes = (uint16_t)(d[8] | d[9] << 8);
++			if (nbytes == 0) {
++				continue;
++			}
++			uint64_t pa = 0;
++			for (unsigned b = 0; b < 8; b++) {
++				pa |= (uint64_t)d[b] << (8 * b);
++			}
++			/* the buffer is ours by its physical address: find it in the pool */
++			for (uint32_t n = 0; n < WLAN_RX_POSTED; n++) {
++				vm_offset_t va;
++
++				if ((wlan_rx_buffer(c - 1, n, &va) & 0x7ffffffffull) == (pa & 0x7ffffffffull)) {
++					wlan_flush(va, CE_RX_BUF);
++					wlan_htc_show(c, (const uint8_t *)va, nbytes);
++					ready |= ((const uint8_t *)va)[0] == 0 && nbytes >= 10 &&
++					    (((const uint8_t *)va)[8] | ((const uint8_t *)va)[9] << 8) == 1;
++					break;
++				}
++			}
++			seen++;
++			d[8] = d[9] = 0;
++			wlan_flush((vm_offset_t)d, CE_DESC);
++			wlan_rx_read[c] = (wlan_rx_read[c] + 1) & (entries - 1);
++		}
++		if ((ms % 2000) == 0) {
++			volatile uint32_t *rri = (volatile uint32_t *)wlan_rri.va;
++
++			wlan_flush(wlan_rri.va, 64);
++			printf("SWEET MPSS: %u: %u ms: read indices in memory %#x %#x %#x %#x; CE1 DR read %u, CE2 DR read %u, misc %#x %#x\n",
++			    step, ms, rri[0], rri[1], rri[2], rri[3], ce[(0x1000 + 0x48) / 4], ce[(0x2000 + 0x48) / 4],
++			    ce[(0x1000 + 0x34) / 4], ce[(0x2000 + 0x34) / 4]);
++		}
++		sleep_ms(1);
++	}
++	printf("SWEET MPSS: %u: %u messages from the firmware; %s\n", step, seen, ready ? "HTC READY CAME" : "no HTC READY");
++	return ready;
++}
++
 +/* ---- step 1: survey -------------------------------------------------------------------------------- */
 +
 +static bool
@@ -4330,10 +4580,10 @@
 +
 +/* ---- the steps, and bring-up ----------------------------------------------------------------------- */
 +
-+#define STEPS                   11
++#define STEPS                   12
 +static bool (*const steps[STEPS])(void) = {
 +	step_survey, step_firmware, step_header, step_image, step_our_item, step_start, step_link, step_qrtr, step_wlfw,
-+	step_smmu, step_wlan,
++	step_smmu, step_wlan, step_htc,
 +};
 +
 +static bool keep;
