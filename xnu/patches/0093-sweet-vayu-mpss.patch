@@ -295,7 +295,7 @@
  /* MB/s of a 16 MB memcpy, best of 4 (cached kernel memory, the CPU renderer's kind of work). */
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,5292 @@
+@@ -0,0 +1,5820 @@
 +/*
 + * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 1 - the modem is loaded, authenticated and let
 + * out of reset, the link to it taken up, and the application processor's file services started, so that
@@ -350,6 +350,9 @@
 + *   13  wmi       HTC services WMI control and HTT data connected, SETUP COMPLETE, the first WMI events
 + *   14  init      the memory the firmware asked for, WMI INIT (ath10k's resource configuration), READY and the MAC
 + *   15  scan      channel list, a station vdev, a passive scan; the networks heard (beacons) logged
++ *   16  connect   join the router named in /fw/network (open, no encryption yet): the station vdev started on its
++ *                 channel, a peer for the router, open-system authentication and association by management frames
++ *                 (WMI MGMT TX, the replies over MGMT RX), then PEER ASSOC and VDEV UP
 + *
 + * RPMh is asked for the modem's two rails (step 6) and the Wi-Fi radio's four supplies (step 9), through
 + * sweet_rpmh.c. Nothing writes a clock or a pin; the
@@ -4994,14 +4997,43 @@
 +#define WMI_START_SCAN          0x3001u
 +#define WMI_EV_SCAN             0x3001u
 +#define WMI_EV_MGMT_RX          0x7001u
++#define WMI_VDEV_START          0x5003u         /* step 16 (ids from ath10k wmi-tlv.h) */
++#define WMI_VDEV_UP             0x5005u
++#define WMI_PEER_CREATE         0x6001u
++#define WMI_PEER_ASSOC          0x6005u
++#define WMI_MGMT_TX             0x7008u          /* MGMT_TX_SEND: the frame carried by physical address */
++#define WMI_EV_VDEV_START_RESP  0x5001u
++#define WMI_TLV_MGMT_TX_MAX     64u              /* bytes of the frame copied inline; the rest read by address */
 +
 +static const uint16_t wlan_scan_mhz[] = {
 +	2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
 +	5180, 5200, 5220, 5240, 5745, 5765, 5785, 5805, 5825,
 +};
-+static uint8_t wlan_seen[48][6];
++/* Each network heard once, with enough of its beacon (capability, channel, the information elements) for step 16
++ * to start a connection without scanning again. */
++struct wlan_net {
++	uint8_t  bssid[6];
++	uint8_t  channel;                               /* from the DS Parameter Set, else the MGMT RX channel */
++	uint16_t cap;                                   /* capability information */
++	uint8_t  ssid_len;
++	uint8_t  ssid[32];
++	uint16_t ie_len;
++	uint8_t  ie[256];                               /* the beacon's information elements (from offset 36 on) */
++};
++static struct wlan_net wlan_nets[48];
 +static unsigned wlan_seen_count, wlan_beacons;
 +static bool wlan_scan_done;
++
++/* step 16 (connect): what the WMI event handler captures while a connection is being made */
++static uint8_t  wlan_conn_bssid[6];                     /* the router we are joining; zero when not connecting */
++static bool     wlan_vdev_started;
++static uint32_t wlan_vdev_status;
++static bool     wlan_auth_seen;
++static uint16_t wlan_auth_status;
++static bool     wlan_assoc_seen;
++static uint16_t wlan_assoc_status, wlan_assoc_aid;
++static bool     wlan_deauth_seen;
++static uint16_t wlan_deauth_reason;
 +
 +/*
 + * HTT receive (ath10k htt.c/htt_rx.c/htt_tx.c for wcn3990, 64-bit; layouts checked by compiling ath10k's
@@ -5026,6 +5058,7 @@
 +static bool wlan_htt_version;
 +
 +static bool wlan_beacon(const uint8_t *frame, uint32_t len, uint32_t channel, int signal, const char *how);
++static void wlan_rx_mgmt(const uint8_t *frame, uint32_t buf_len, uint32_t channel, int signal);
 +
 +/* A buffer (by its index in the pool) put at the ring's head; the head published once the caller is done. */
 +static void
@@ -5256,6 +5289,21 @@
 +	if (id == 0x4002) {
 +		return;                                 /* CHAN INFO, one per channel visited: not shown */
 +	}
++	if (id == WMI_EV_VDEV_START_RESP) {             /* step 16: the station vdev started (or not) */
++		for (at = HTC_HDR + 4; at + 4 <= n;) {
++			uint16_t len = (uint16_t)(in[at] | in[at + 1] << 8), tag = (uint16_t)(in[at + 2] | in[at + 3] << 8);
++
++			if (at + 4 + len > n) {
++				break;
++			}
++			if (tag == 0x28 && len >= 16) {     /* VDEV_START_RESPONSE_EVENT: vdev, req, resp_type, status */
++				wlan_vdev_status = le32(in + at + 4 + 0x0c);
++				wlan_vdev_started = true;
++			}
++			at += 4 + len;
++		}
++		return;
++	}
 +	if (id != WMI_EV_SCAN && id != WMI_EV_MGMT_RX) {
 +		printf("SWEET MPSS: %u: WMI event %#x (%u bytes)\n", step, id, n - HTC_HDR);
 +		return;
@@ -5291,7 +5339,7 @@
 +	if (frame == NULL || buf_len > frame_len) {
 +		return;
 +	}
-+	(void)wlan_beacon(frame, buf_len, channel, (int)snr - 95, "WMI MGMT RX");
++	wlan_rx_mgmt(frame, buf_len, channel, (int)snr - 95);
 +}
 +
 +/* A beacon or probe response: its BSSID and SSID logged once; true if it was one. */
@@ -5303,14 +5351,21 @@
 +		return false;
 +	}
 +	const uint8_t *bssid = frame + 16;
++	struct wlan_net *net = NULL;
 +
 +	for (unsigned i = 0; i < wlan_seen_count; i++) {
-+		if (memcmp(wlan_seen[i], bssid, 6) == 0) {
++		if (memcmp(wlan_nets[i].bssid, bssid, 6) == 0) {
 +			return true;
 +		}
 +	}
-+	if (wlan_seen_count < sizeof(wlan_seen) / sizeof(wlan_seen[0])) {
-+		memcpy(wlan_seen[wlan_seen_count++], bssid, 6);
++	if (wlan_seen_count < sizeof(wlan_nets) / sizeof(wlan_nets[0])) {
++		net = &wlan_nets[wlan_seen_count++];
++		bzero(net, sizeof(*net));
++		memcpy(net->bssid, bssid, 6);
++		net->cap = (uint16_t)(frame[34] | frame[35] << 8);      /* capability information (fixed field) */
++		net->channel = (uint8_t)channel;
++		net->ie_len = (uint16_t)(buf_len - 36 < sizeof(net->ie) ? buf_len - 36 : sizeof(net->ie));
++		memcpy(net->ie, frame + 36, net->ie_len);
 +	}
 +	char ssid[33] = "";
 +	for (uint32_t ie = 36; ie + 2 <= buf_len;) {
@@ -5322,11 +5377,16 @@
 +		if (eid == 0) {
 +			uint32_t l = elen < 32 ? elen : 32;
 +
++			if (net != NULL) {
++				net->ssid_len = (uint8_t)l;
++				memcpy(net->ssid, frame + ie + 2, l);
++			}
 +			for (uint32_t k = 0; k < l; k++) {
 +				ssid[k] = frame[ie + 2 + k] >= 0x20 && frame[ie + 2 + k] < 0x7f ? (char)frame[ie + 2 + k] : '?';
 +			}
 +			ssid[l] = 0;
-+			break;
++		} else if (eid == 3 && elen >= 1 && net != NULL) {
++			net->channel = frame[ie + 2];                   /* DS Parameter Set: the true channel number */
 +		}
 +		ie += 2 + elen;
 +	}
@@ -5476,6 +5536,474 @@
 +	return wlan_seen_count != 0;
 +}
 +
++/*
++ * ---- step 16: join the router (open, no encryption yet) ------------------------------------------------
++ *
++ * The connection follows ath10k + mac80211 (mac.c), one WMI command or management frame at a time:
++ *   1. VDEV START (ath10k_vdev_start_restart): the station vdev (0, made in step 15) started on the router's
++ *      channel; the firmware answers VDEV START RESP.
++ *   2. PEER CREATE (ath10k_peer_create): a peer for the router's BSSID - the firmware talks to the router
++ *      through it.
++ *   3. open-system authentication and association by 802.11 management frames we build ourselves (no mac80211):
++ *      sent with WMI MGMT TX (the frame read by the radio from memory by address, as ath10k_wmi_tlv_op_gen_
++ *      mgmt_tx_send); the router's replies arrive the same way the beacons did, over MGMT RX. For a WPA2 router
++ *      the association request carries an RSN element (CCMP + PSK) so the router accepts it; the key handshake
++ *      itself is a later step.
++ *   4. PEER ASSOC (ath10k_peer_assoc_prepare: rates and HT from the beacon) and VDEV UP (aid, bssid) - the link
++ *      is then up. A WPA2 router sends the first EAPOL message at once (over the HTT data path); it is only
++ *      watched for here as a sign the association took.
++ *
++ * The router is named in /fw/network (set-wifi-network.sh: SSID on line 1, password on line 2); only the SSID
++ * is read here, and the password line is never kept or printed.
++ */
++
++#define WMI_PEER_FLAG_AUTH      0x00000001u
++#define WMI_PEER_FLAG_QOS       0x00000002u
++#define WMI_PEER_FLAG_HT        0x00001000u
++
++static struct wlan_page wlan_mgmt;                      /* a management frame the radio reads by address */
++static uint32_t wlan_desc_id = 1;
++static const uint8_t wlan_our_mac[6] = { 0x02, 0x50, 0x43, 0x4f, 0x01, 0x01 };   /* vdev 0's address (step 15) */
++
++static void
++put16(uint8_t *p, uint16_t v)
++{
++	p[0] = (uint8_t)v;
++	p[1] = (uint8_t)(v >> 8);
++}
++
++/* The centre frequency (MHz) of a channel number, 2.4 GHz or 5 GHz. */
++static uint32_t
++chan_to_freq(unsigned ch)
++{
++	if (ch == 0) {
++		return 0;
++	}
++	if (ch == 14) {
++		return 2484;
++	}
++	return ch < 14 ? 2407 + 5 * ch : 5000 + 5 * ch;
++}
++
++/* The SSID written on the first line of /fw/network; 0 if there is no such file. The password (line 2) is
++ * read into the local buffer only to be wiped - never kept, never printed. */
++static unsigned
++wlan_network_ssid(uint8_t *ssid, unsigned cap)
++{
++	char buf[160];
++	vfs_context_t context = vfs_context_kernel();
++	vnode_t vnode = NULLVP;
++	int left = 0, got = 0, n = 0;
++
++	if (rootvnode == NULLVP || vnode_lookup("/fw/network", 0, &vnode, context) != 0) {
++		return 0;
++	}
++	if (vn_rdwr(UIO_READ, vnode, (caddr_t)buf, (int)sizeof(buf), 0, UIO_SYSSPACE, 0, vfs_context_ucred(context),
++	    &left, vfs_context_proc(context)) == 0) {
++		got = (int)sizeof(buf) - left;
++	}
++	vnode_put(vnode);
++	for (; n < got && n < (int)cap && buf[n] != '\n' && buf[n] != '\r' && buf[n] != 0; n++) {
++		ssid[n] = (uint8_t)buf[n];
++	}
++	bzero(buf, sizeof(buf));
++	return (unsigned)n;
++}
++
++/* A network's information element with the given id: a pointer to its body, its length in *len; NULL if absent. */
++static const uint8_t *
++wlan_ie_find(const struct wlan_net *net, uint8_t id, unsigned *len)
++{
++	for (unsigned at = 0; at + 2 <= net->ie_len;) {
++		uint8_t eid = net->ie[at], elen = net->ie[at + 1];
++
++		if (at + 2 + elen > net->ie_len) {
++			break;
++		}
++		if (eid == id) {
++			*len = elen;
++			return net->ie + at + 2;
++		}
++		at += 2 + elen;
++	}
++	return NULL;
++}
++
++/* Append an information element (id, len bytes of body) to a frame being built. */
++static uint32_t
++wlan_ie_put(uint8_t *f, uint32_t at, uint8_t id, const uint8_t *body, unsigned len)
++{
++	f[at++] = id;
++	f[at++] = (uint8_t)len;
++	memcpy(f + at, body, len);
++	return at + len;
++}
++
++/* Send an 802.11 management frame: copied into the DMA page the radio reads by address, then WMI MGMT TX
++ * (the first WMI_TLV_MGMT_TX_MAX bytes also inline, as ath10k does). */
++static bool
++wlan_mgmt_tx(volatile uint32_t *ce, const uint8_t *frame, uint32_t len)
++{
++	uint8_t cmd[128];
++	/* buf_len: the bytes inline, unrounded (ath10k: min(frame, 64)); the ARRAY_BYTE TLV is padded to 4 */
++	uint32_t buflen = len < WMI_TLV_MGMT_TX_MAX ? len : WMI_TLV_MGMT_TX_MAX;
++	uint32_t inlen = (buflen + 3) & ~3u;
++	uint32_t at;
++
++	if (len == 0 || len > PAGE_SIZE) {
++		return false;
++	}
++	memcpy((void *)wlan_mgmt.va, frame, len);
++	wlan_flush(wlan_mgmt.va, len);
++	bzero(cmd, sizeof(cmd));
++	at = 4;
++	tlv_hdr(cmd + at, 0x1a6, 0x1c);                 /* MGMT_TX_CMD (wmi_tlv_mgmt_tx_cmd, 28 bytes) */
++	put32(cmd + at + 4 + 0x00, 0);                  /* vdev 0 */
++	put32(cmd + at + 4 + 0x04, wlan_desc_id++);     /* descriptor id, echoed in the tx completion */
++	put32(cmd + at + 4 + 0x08, 0);                  /* chanfreq 0: the firmware uses the vdev's channel */
++	put64(cmd + at + 4 + 0x0c, wlan_mgmt.pa);       /* the frame, read by address (the SMMU is in bypass) */
++	put32(cmd + at + 4 + 0x14, len);                /* the whole frame's length */
++	put32(cmd + at + 4 + 0x18, buflen);             /* bytes copied inline below */
++	at += 4 + 0x1c;
++	tlv_hdr(cmd + at, 0x11, (uint16_t)inlen);       /* ARRAY_BYTE: the first bytes of the frame */
++	memcpy(cmd + at + 4, frame, buflen);
++	at += 4 + inlen;
++	return wlan_wmi_send(ce, WMI_MGMT_TX, cmd, at);
++}
++
++/* A management frame from the radio (MGMT RX): beacons and probe responses logged as in the scan; the router's
++ * replies to our authentication and association kept for step 16. */
++static void
++wlan_rx_mgmt(const uint8_t *frame, uint32_t buf_len, uint32_t channel, int signal)
++{
++	uint8_t subtype = frame[0];
++
++	if (subtype == 0x80 || subtype == 0x50) {       /* beacon, probe response */
++		(void)wlan_beacon(frame, buf_len, channel, signal, "WMI MGMT RX");
++		return;
++	}
++	if (buf_len < 24 || memcmp(frame + 10, wlan_conn_bssid, 6) != 0) {   /* addr2: only from the router we join */
++		return;
++	}
++	switch (subtype) {
++	case 0xb0:                                      /* authentication: algorithm(24), seq(26), status(28) */
++		if (buf_len >= 30) {
++			wlan_auth_status = (uint16_t)(frame[28] | frame[29] << 8);
++			wlan_auth_seen = true;
++		}
++		break;
++	case 0x10:                                      /* association response: cap(24), status(26), aid(28) */
++	case 0x30:                                      /* reassociation response */
++		if (buf_len >= 30) {
++			wlan_assoc_status = (uint16_t)(frame[26] | frame[27] << 8);
++			wlan_assoc_aid = (uint16_t)((frame[28] | frame[29] << 8) & 0x3fff);
++			wlan_assoc_seen = true;
++		}
++		break;
++	case 0xc0:                                      /* deauthentication */
++	case 0xa0:                                      /* disassociation */
++		wlan_deauth_reason = buf_len >= 26 ? (uint16_t)(frame[24] | frame[25] << 8) : 0;
++		wlan_deauth_seen = true;
++		break;
++	}
++}
++
++/* Handle whatever the target has to say for about ms milliseconds. */
++static void
++wlan_pump(volatile uint32_t *ce, unsigned ms)
++{
++	static uint8_t in[2048];
++	unsigned from = 0;
++
++	for (unsigned t = 0; t < ms; t++) {
++		uint32_t n = wlan_htc_wait(ce, in, sizeof(in), 1, &from);
++
++		if (n != 0) {
++			wlan_wmi_event(in, n);
++		}
++	}
++}
++
++static bool
++step_connect(void)
++{
++	volatile uint32_t *ce = wlan_ce_map();
++	uint8_t ssid[32], frame[256], *m;
++	unsigned ssid_len, htlen = 0, rsnlen = 0, nlegacy, nht, mode;
++	uint32_t at, freq, aid;
++	struct wlan_net *net = NULL;
++	const uint8_t *ht, *rsn;
++	uint16_t cap;
++	/* RSN element for WPA2-PSK with CCMP: version 1, group CCMP, one pairwise CCMP, one AKM PSK, no caps */
++	static const uint8_t rsn_ie[20] = {
++		0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04,
++		0x01, 0x00, 0x00, 0x0f, 0xac, 0x02, 0x00, 0x00,
++	};
++
++	if (ce == NULL || wlan_wmi_eid == 0) {
++		return false;
++	}
++	announce("join the router named in /fw/network: start the station vdev on its channel, make a peer for it, "
++	    "authenticate and associate by management frames, then PEER ASSOC and VDEV UP");
++	ssid_len = wlan_network_ssid(ssid, sizeof(ssid));
++	if (ssid_len == 0) {
++		printf("SWEET MPSS: %u: no network to join - write the SSID and password into /fw/network "
++		    "(set-wifi-network.sh)\n", step);
++		return false;
++	}
++	for (unsigned i = 0; i < wlan_seen_count; i++) {
++		if (wlan_nets[i].ssid_len == ssid_len && memcmp(wlan_nets[i].ssid, ssid, ssid_len) == 0) {
++			net = &wlan_nets[i];
++			break;
++		}
++	}
++	if (net == NULL) {
++		printf("SWEET MPSS: %u: the network \"%.*s\" was not among the %u the scan heard\n", step, ssid_len, ssid,
++		    wlan_seen_count);
++		return false;
++	}
++	memcpy(wlan_conn_bssid, net->bssid, 6);
++	freq = chan_to_freq(net->channel);
++	ht = wlan_ie_find(net, 45, &htlen);             /* HT capabilities */
++	rsn = wlan_ie_find(net, 48, &rsnlen);           /* RSN (WPA2) */
++	bool has_ht = ht != NULL && htlen >= 26;
++	bool has_rsn = rsn != NULL;
++	mode = freq < 5000 ? (has_ht ? 5 : 1) : (has_ht ? 4 : 0);        /* 11NG_HT20/11G, 11NA_HT20/11A */
++	cap = (uint16_t)(0x0001 | (has_rsn ? 0x0010 : 0));              /* ESS, Privacy for WPA2 */
++	printf("SWEET MPSS: %u: joining \"%.*s\" bssid %02x:%02x:%02x:%02x:%02x:%02x, channel %u (%u MHz)%s%s\n", step,
++	    ssid_len, ssid, net->bssid[0], net->bssid[1], net->bssid[2], net->bssid[3], net->bssid[4], net->bssid[5],
++	    net->channel, freq, has_ht ? ", HT" : "", has_rsn ? ", WPA2" : " (open)");
++
++	wlan_vdev_started = wlan_auth_seen = wlan_assoc_seen = wlan_deauth_seen = false;
++	m = kalloc_data(2048, Z_WAITOK | Z_ZERO);
++	if (m == NULL || !wlan_page_get(&wlan_mgmt)) {
++		if (m != NULL) {
++			kfree_data(m, 2048);
++		}
++		return false;
++	}
++
++	/* 1. VDEV START on the router's channel (no SSID for a station, as ath10k) */
++	at = 4;
++	tlv_hdr(m + at, 0x58, 0x48);                    /* VDEV_START_REQUEST_CMD, 72 bytes */
++	put32(m + at + 4 + 0x08, 100);                  /* bcn_intval (ath10k: the BSS's beacon interval) */
++	put32(m + at + 4 + 0x0c, 1);                    /* dtim_period */
++	at += 4 + 0x48;                                 /* the rest 0 (station defaults) */
++	tlv_hdr(m + at, 0x50, 0x18);                    /* CHANNEL, 24 bytes */
++	{
++		uint8_t *c = m + at + 4;
++
++		put32(c + 0x00, freq);
++		put32(c + 0x04, freq);                  /* band_center_freq1 (20 MHz: the channel itself) */
++		put32(c + 0x0c, (has_ht ? (1u << 11) : 0) | (mode & 0x3f));     /* flags (ALLOW_HT) | mode */
++		c[0x11] = c[0x12] = c[0x15] = 0x28;     /* max, regulatory, tx power: 20 dBm in 0.5 dBm */
++	}
++	at += 4 + 0x18;
++	tlv_hdr(m + at, 0x12, 0);                       /* ARRAY_STRUCT: no P2P NOA descriptors */
++	at += 4;
++	if (!wlan_wmi_send(ce, WMI_VDEV_START, m, at)) {
++		goto fail;
++	}
++	for (unsigned t = 0; t < 2000 && !wlan_vdev_started; t++) {
++		wlan_pump(ce, 1);
++	}
++	if (!wlan_vdev_started) {
++		printf("SWEET MPSS: %u: no VDEV START RESP\n", step);
++		goto fail;
++	}
++	if (wlan_vdev_status != 0) {
++		printf("SWEET MPSS: %u: VDEV START refused, status %u\n", step, wlan_vdev_status);
++		goto fail;
++	}
++	printf("SWEET MPSS: %u: VDEV START done (channel %u)\n", step, net->channel);
++
++	/* 2. PEER CREATE for the router */
++	bzero(m, 2048);
++	at = 4;
++	/* PEER_CREATE_CMD (wmi_tlv_peer_create_cmd): vdev, mac (wmi_mac_addr: 6 bytes + 2 pad), type - 16 bytes */
++	tlv_hdr(m + at, 0x61, 16);
++	put32(m + at + 4 + 0x00, 0);
++	memcpy(m + at + 4 + 0x04, net->bssid, 6);
++	put32(m + at + 4 + 0x0c, 0);                    /* WMI_TLV_PEER_TYPE_DEFAULT */
++	at += 4 + 16;
++	if (!wlan_wmi_send(ce, WMI_PEER_CREATE, m, at)) {
++		goto fail;
++	}
++	printf("SWEET MPSS: %u: PEER CREATE done\n", step);
++
++	/* 3. open-system authentication */
++	bzero(frame, sizeof(frame));
++	frame[0] = 0xb0;                                /* management, authentication */
++	memcpy(frame + 4, net->bssid, 6);               /* addr1: the router */
++	memcpy(frame + 10, wlan_our_mac, 6);            /* addr2: us */
++	memcpy(frame + 16, net->bssid, 6);              /* addr3: BSSID */
++	put16(frame + 24, 0);                           /* open system */
++	put16(frame + 26, 1);                           /* transaction sequence 1 */
++	put16(frame + 28, 0);                           /* status */
++	if (!wlan_mgmt_tx(ce, frame, 30)) {
++		goto fail;
++	}
++	for (unsigned t = 0; t < 2000 && !wlan_auth_seen; t++) {
++		wlan_pump(ce, 1);
++	}
++	if (!wlan_auth_seen) {
++		printf("SWEET MPSS: %u: no authentication reply from the router\n", step);
++		goto fail;
++	}
++	if (wlan_auth_status != 0) {
++		printf("SWEET MPSS: %u: authentication refused, status %u\n", step, wlan_auth_status);
++		goto fail;
++	}
++	printf("SWEET MPSS: %u: authenticated\n", step);
++
++	/* 3b. association request: SSID, the router's rates, its HT capabilities, and (for WPA2) our RSN element */
++	bzero(frame, sizeof(frame));
++	memcpy(frame + 4, net->bssid, 6);
++	memcpy(frame + 10, wlan_our_mac, 6);
++	memcpy(frame + 16, net->bssid, 6);
++	put16(frame + 24, cap);                         /* capability information */
++	put16(frame + 26, 1);                           /* listen interval */
++	at = 28;
++	at = wlan_ie_put(frame, at, 0, ssid, ssid_len); /* SSID */
++	{
++		unsigned len;
++		const uint8_t *rates = wlan_ie_find(net, 1, &len);
++
++		if (rates != NULL) {
++			at = wlan_ie_put(frame, at, 1, rates, len);
++		} else {
++			static const uint8_t basic[8] = { 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24 };
++
++			at = wlan_ie_put(frame, at, 1, basic, sizeof(basic));
++		}
++		rates = wlan_ie_find(net, 50, &len);
++		if (rates != NULL) {
++			at = wlan_ie_put(frame, at, 50, rates, len);
++		}
++		if (has_ht) {
++			at = wlan_ie_put(frame, at, 45, ht, htlen);
++		}
++		if (has_rsn) {
++			at = wlan_ie_put(frame, at, 48, rsn_ie, sizeof(rsn_ie));
++		}
++	}
++	if (!wlan_mgmt_tx(ce, frame, at)) {
++		goto fail;
++	}
++	for (unsigned t = 0; t < 2000 && !wlan_assoc_seen && !wlan_deauth_seen; t++) {
++		wlan_pump(ce, 1);
++	}
++	if (wlan_deauth_seen) {
++		printf("SWEET MPSS: %u: the router turned us away (reason %u)\n", step, wlan_deauth_reason);
++		goto fail;
++	}
++	if (!wlan_assoc_seen) {
++		printf("SWEET MPSS: %u: no association reply from the router\n", step);
++		goto fail;
++	}
++	if (wlan_assoc_status != 0) {
++		printf("SWEET MPSS: %u: association refused, status %u\n", step, wlan_assoc_status);
++		goto fail;
++	}
++	aid = wlan_assoc_aid;
++	printf("SWEET MPSS: %u: associated, aid %u\n", step, aid);
++
++	/* 4. PEER ASSOC: tell the firmware the link's parameters (rates and HT from the beacon) */
++	nlegacy = 0;
++	{
++		static const uint8_t which[2] = { 1, 50 };
++		uint8_t legacy[16];
++
++		for (unsigned w = 0; w < 2; w++) {
++			unsigned len = 0;
++			const uint8_t *r = wlan_ie_find(net, which[w], &len);
++
++			for (unsigned i = 0; r != NULL && i < len && nlegacy < sizeof(legacy); i++) {
++				uint8_t v = r[i] & 0x7f;        /* drop the basic-rate bit */
++
++				if (v == 0) {
++					continue;
++				}
++				legacy[nlegacy++] = (uint8_t)(v | (v == 2 || v == 4 || v == 11 || v == 22 ? 0x80 : 0));
++			}
++		}
++		if (nlegacy == 0) {
++			static const uint8_t basic[8] = { 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24 };
++
++			memcpy(legacy, basic, sizeof(basic));
++			nlegacy = sizeof(basic);
++		}
++		nht = has_ht ? 8 : 0;                   /* MCS 0..7, the mandatory 20 MHz set */
++
++		bzero(m, 2048);
++		at = 4;
++		/*
++		 * PEER_ASSOC_COMPLETE_CMD (wmi_tlv_peer_assoc_cmd, 0x4c bytes): mac_addr is a wmi_mac_addr (8 bytes)
++		 * and vdev_id follows it - offsets as ath10k's struct
++		 */
++		tlv_hdr(m + at, 0x65, 0x4c);
++		{
++			uint8_t *c = m + at + 4;
++			uint32_t flags = WMI_PEER_FLAG_AUTH | (has_ht ? WMI_PEER_FLAG_HT | WMI_PEER_FLAG_QOS : 0);
++			uint32_t ampdu = has_ht ? ht[2] : 0;
++
++			memcpy(c + 0x00, net->bssid, 6);        /* mac_addr */
++			put32(c + 0x08, 0);                     /* vdev_id */
++			put32(c + 0x0c, 1);                     /* new_assoc */
++			put32(c + 0x10, aid);                   /* assoc_id */
++			put32(c + 0x14, flags);
++			put32(c + 0x18, net->cap);              /* caps */
++			put32(c + 0x1c, 1);                     /* listen interval */
++			put32(c + 0x20, has_ht ? (ht[0] | ht[1] << 8) : 0);     /* HT capability info */
++			put32(c + 0x24, has_ht ? (1u << (13 + (ampdu & 0x3))) - 1 : 0);  /* max A-MPDU length */
++			put32(c + 0x28, has_ht ? (ampdu >> 2) & 0x7 : 0);       /* MPDU density */
++			put32(c + 0x30, 1);                     /* nss: one spatial stream */
++			put32(c + 0x38, mode);                  /* phy mode */
++			put32(c + 0x44, nlegacy);
++			put32(c + 0x48, nht);
++		}
++		at += 4 + 0x4c;
++		tlv_hdr(m + at, 0x11, (uint16_t)((nlegacy + 3) & ~3u));          /* legacy rates */
++		memcpy(m + at + 4, legacy, nlegacy);
++		at += 4 + ((nlegacy + 3) & ~3u);
++		tlv_hdr(m + at, 0x11, (uint16_t)((nht + 3) & ~3u));             /* HT MCS rates */
++		for (unsigned i = 0; i < nht; i++) {
++			m[at + 4 + i] = (uint8_t)i;
++		}
++		at += 4 + ((nht + 3) & ~3u);
++		tlv_hdr(m + at, 0x66, 16);              /* VHT rate set: none */
++		at += 4 + 16;
++		if (!wlan_wmi_send(ce, WMI_PEER_ASSOC, m, at)) {
++			goto fail;
++		}
++	}
++	printf("SWEET MPSS: %u: PEER ASSOC done (%u legacy rates%s)\n", step, nlegacy, has_ht ? ", MCS 0-7" : "");
++
++	/* VDEV UP: the interface is now associated */
++	bzero(m, 2048);
++	at = 4;
++	tlv_hdr(m + at, 0x5c, 16);                      /* VDEV_UP_CMD (wmi_vdev_up_cmd): vdev, aid, bssid (8) */
++	put32(m + at + 4 + 0x00, 0);
++	put32(m + at + 4 + 0x04, aid);
++	memcpy(m + at + 4 + 0x08, net->bssid, 6);
++	at += 4 + 16;
++	if (!wlan_wmi_send(ce, WMI_VDEV_UP, m, at)) {
++		goto fail;
++	}
++	kfree_data(m, 2048);
++	printf("SWEET MPSS: %u: VDEV UP - CONNECTED to \"%.*s\"%s\n", step, ssid_len, ssid,
++	    has_rsn ? "; waiting for the WPA2 handshake to begin (EAPOL)" : "");
++	/* a WPA2 router sends the first EAPOL message at once (HTT data): watch a few seconds as a sign it took */
++	wlan_pump(ce, 5000);
++	printf("SWEET MPSS: %u: %u frames received since the link came up%s\n", step, wlan_htt_frames,
++	    wlan_deauth_seen ? " (then the router disconnected us)" : "");
++	return !wlan_deauth_seen;
++
++fail:
++	kfree_data(m, 2048);
++	return false;
++}
++
 +/* ---- step 1: survey -------------------------------------------------------------------------------- */
 +
 +static bool
@@ -5500,10 +6028,10 @@
 +
 +/* ---- the steps, and bring-up ----------------------------------------------------------------------- */
 +
-+#define STEPS                   15
++#define STEPS                   16
 +static bool (*const steps[STEPS])(void) = {
 +	step_survey, step_firmware, step_header, step_image, step_our_item, step_start, step_link, step_qrtr, step_wlfw,
-+	step_smmu, step_wlan, step_htc, step_wmi, step_init, step_scan,
++	step_smmu, step_wlan, step_htc, step_wmi, step_init, step_scan, step_connect,
 +};
 +
 +static bool keep;
