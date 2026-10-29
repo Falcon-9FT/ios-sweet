@@ -226,7 +226,7 @@
  /* MB/s of a 16 MB memcpy, best of 4 (cached kernel memory, the CPU renderer's kind of work). */
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,3364 @@
+@@ -0,0 +1,3770 @@
 +/*
 + * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 1 - the modem is loaded, authenticated and let
 + * out of reset, the link to it taken up, and the application processor's file services started, so that
@@ -270,6 +270,8 @@
 + *    7  link      GLINK taken up (our version, the channel IPCRTR); a thread of ours listens from here;
 + *                 the file services (rmtfs, tftp, the service registry) started
 + *    8  qrtr      the modem's hello answered and the services it tells of listened for (WLFW wanted)
++ *    9  wlfw      the Wi-Fi firmware's service (QMI 0x45), as ath10k: indications, host capabilities, MSA (given by
++ *                 TrustZone to the modem and the WLAN), capabilities, board data, calibration report, "fw ready"
 + *
 + * One request goes to RPMh (the two rails, through sweet_rpmh.c). Nothing writes a clock or a pin; the
 + * SIM is not touched, no call is made, no data session opened.
@@ -2449,7 +2451,10 @@
 +#define QMI_ERR_MALFORMED       2
 +#define VMID_HLOS               3
 +#define VMID_MSS_MSA            15
++#define VMID_WLAN               0x18
++#define VMID_WLAN_CE            0x19
 +#define VM_PERM_RW              6
++#define WLFW_SERVICE            0x45    /* the Wi-Fi firmware's QMI service (Linux ath10k qmi_wlfw_v01.h) */
 +
 +/*
 + * The buffer: the modem's addresses are 32 bits, so it must be below 4 GB and in one piece of 3 MB.
@@ -3471,13 +3476,414 @@
 +	lck_mtx_lock(&qrtr_lock);
 +	for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
 +		services += qrtr_servers[i].there;
-+		wlfw += qrtr_servers[i].there && qrtr_servers[i].service == 0x27;       /* WLFW is QMI service 0x27 (39) */
++		wlfw += qrtr_servers[i].there && qrtr_servers[i].service == WLFW_SERVICE;
 +	}
 +	lck_mtx_unlock(&qrtr_lock);
 +	printf("SWEET MPSS: %u: after %u s: %s; the modem is node %u, told of %u services (WLFW %s); it looked for %u of ours; QRTR "
 +	    "received %u and sent %u datagrams\n", step, listen_seconds, qrtr_hellos ? "HELLO BOTH WAYS" : "NO HELLO FROM THE MODEM",
 +	    qrtr_peer, services, wlfw ? "PRESENT - the Wi-Fi firmware service is up" : "not yet", qrtr_lookups, qrtr_in, qrtr_out);
 +	return qrtr_hellos != 0;
++}
++
++/*
++ * ---- step 9: the Wi-Fi firmware's service (WLFW), as Linux's ath10k/qmi.c speaks to it -----------------
++ *
++ * The WLAN PD the modem started (WCN3998's firmware, wlanmdsp.mbn) offers QMI service 0x45. Before the radio is
++ * touched the driver: registers for its indications (fw ready, MSA ready), says what the host can do (host cap),
++ * tells it where the MSA memory is (dt: qcom,icnss@18800000 qcom,wlan-msa-fixed-region = pil_wlan_fw_region
++ * 0x8bc00000, qcom,wlan-msa-memory 0x100000) and has TrustZone give the regions it names to the modem and the
++ * WLAN (no qcom,msa-fixed-perm), says MSA ready, asks the capabilities (chip, board, SoC, firmware version),
++ * then, on the MSA-ready indication, downloads the board data (bdwlan.bNN by board id, else bdwlan.bin, from
++ * /fw/image) and sends the calibration report; the firmware answers with "fw ready". The radio's mode (wlan-cfg,
++ * wlan-mode) and its copy engines are for the steps after this one: nothing here switches the radio on.
++ */
++
++#define WLFW_IND_REGISTER       0x0020
++#define WLFW_FW_READY_IND       0x0021
++#define WLFW_CAP                0x0024
++#define WLFW_BDF_DOWNLOAD       0x0025
++#define WLFW_CAL_REPORT         0x0026
++#define WLFW_MSA_READY_IND      0x002b
++#define WLFW_PIN_CONNECT_IND    0x002c
++#define WLFW_MSA_INFO           0x002d
++#define WLFW_MSA_READY          0x002e
++#define WLFW_HOST_CAP           0x0034
++#define WLFW_CLIENT_ID          0x4b4e454cu     /* ath10k's ATH10K_QMI_CLIENT_ID */
++#define WLFW_MSA_PA             0x8bc00000ull
++#define WLFW_MSA_SIZE           0x100000u
++#define WLFW_BDF_PIECE          6144u           /* QMI_WLFW_MAX_DATA_SIZE_V01 */
++#define QMI_INDICATION          4
++
++static struct qrtr_port *wlfw_port;
++static uint32_t wlfw_node, wlfw_peer;
++static uint16_t wlfw_txn;
++static struct {
++	uint16_t txn;                           /* the request waited for */
++	bool answered;
++	uint8_t answer[1024];
++	uint32_t length;
++	bool msa_ready, fw_ready;               /* indications seen */
++	uint32_t indications;
++} wlfw;
++static LCK_MTX_DECLARE(wlfw_lock, &mpss_grp);
++
++static void
++wlfw_receive(__unused void *context, uint32_t node, uint32_t port, const void *data, uint32_t length)
++{
++	const uint8_t *m = data;
++	uint16_t txn, id;
++
++	if (length < 7 || node != wlfw_node || port != wlfw_peer) {
++		return;
++	}
++	txn = (uint16_t)(m[1] | m[2] << 8);
++	id = (uint16_t)(m[3] | m[4] << 8);
++	lck_mtx_lock(&wlfw_lock);
++	if (m[0] == QMI_RESPONSE && txn == wlfw.txn && !wlfw.answered) {
++		wlfw.length = length < sizeof(wlfw.answer) ? length : (uint32_t)sizeof(wlfw.answer);
++		memcpy(wlfw.answer, m, wlfw.length);
++		wlfw.answered = true;
++	} else if (m[0] == QMI_INDICATION) {
++		wlfw.indications++;
++		wlfw.msa_ready |= id == WLFW_MSA_READY_IND;
++		wlfw.fw_ready |= id == WLFW_FW_READY_IND;
++	}
++	lck_mtx_unlock(&wlfw_lock);
++	if (m[0] == QMI_INDICATION) {
++		printf("SWEET MPSS: wlfw: indication 0x%04x (%s), %u bytes\n", id, id == WLFW_MSA_READY_IND ? "MSA ready" :
++		    id == WLFW_FW_READY_IND ? "FIRMWARE READY" : id == WLFW_PIN_CONNECT_IND ? "pin connect result" : "other",
++		    length);
++	}
++}
++
++static void
++tlv_put(uint8_t *m, uint32_t *at, uint8_t type, const void *value, uint16_t size)
++{
++	m[*at] = type;
++	m[*at + 1] = (uint8_t)size;
++	m[*at + 2] = (uint8_t)(size >> 8);
++	memcpy(m + *at + 3, value, size);
++	*at += 3u + size;
++}
++
++static void
++tlv_u8(uint8_t *m, uint32_t *at, uint8_t type, uint8_t value)
++{
++	tlv_put(m, at, type, &value, 1);
++}
++
++static void
++tlv_u32(uint8_t *m, uint32_t *at, uint8_t type, uint32_t value)
++{
++	uint8_t v[4] = { (uint8_t)value, (uint8_t)(value >> 8), (uint8_t)(value >> 16), (uint8_t)(value >> 24) };
++
++	tlv_put(m, at, type, v, 4);
++}
++
++/*
++ * A request of the TLVs in m[7 .. at) and its answer, waited for up to ms: 0 and the QMI result (TLV 2) in
++ * result and error, or an errno. The answer stays in wlfw.answer for the caller to read.
++ */
++static int
++wlfw_call(uint16_t id, uint8_t *m, uint32_t at, uint32_t ms, uint16_t *result, uint16_t *error)
++{
++	const uint8_t *r;
++	uint16_t size = 0, txn;
++	bool answered = false;
++
++	txn = ++wlfw_txn == 0 ? ++wlfw_txn : wlfw_txn;
++	m[0] = QMI_REQUEST;
++	m[1] = (uint8_t)txn;
++	m[2] = (uint8_t)(txn >> 8);
++	m[3] = (uint8_t)id;
++	m[4] = (uint8_t)(id >> 8);
++	m[5] = (uint8_t)(at - 7);
++	m[6] = (uint8_t)((at - 7) >> 8);
++	lck_mtx_lock(&wlfw_lock);
++	wlfw.txn = txn;
++	wlfw.answered = false;
++	lck_mtx_unlock(&wlfw_lock);
++	if (qrtr_send(wlfw_port, wlfw_node, wlfw_peer, m, at) != 0) {
++		return EIO;
++	}
++	for (uint32_t waited = 0; waited < ms && !answered; waited++) {
++		sleep_ms(1);
++		lck_mtx_lock(&wlfw_lock);
++		answered = wlfw.answered;
++		lck_mtx_unlock(&wlfw_lock);
++	}
++	if (!answered) {
++		return ETIMEDOUT;
++	}
++	r = qmi_tlv(wlfw.answer, wlfw.length, 2, &size);
++	if (r == NULL || size < 4) {
++		return EBADMSG;
++	}
++	*result = (uint16_t)(r[0] | r[1] << 8);
++	*error = (uint16_t)(r[2] | r[3] << 8);
++	return 0;
++}
++
++/* The MSA regions the firmware named, given by TrustZone from us to the modem and the WLAN (ath10k's map). */
++static bool
++wlfw_assign(uint64_t pa, uint32_t size, bool secure)
++{
++	struct {
++		uint64_t address, size;
++		uint64_t pad0[6];
++		uint32_t sources[3];
++		uint32_t pad1[13];
++		struct {
++			uint32_t vmid, permission;
++			uint64_t context;
++			uint32_t context_size, unused;
++		} destinations[3];
++		uint8_t pad2[40];
++		uint64_t more[7];
++	} *page;
++	vm_offset_t memory = 0;
++	uint64_t answer = ~0ull, at;
++	unsigned destinations = secure ? 2 : 3;
++	int32_t result;
++
++	if (kmem_alloc(kernel_map, &memory, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return false;
++	}
++	page = (void *)memory;
++	page->address = pa;
++	page->size = size;
++	page->sources[0] = VMID_HLOS;
++	page->destinations[0].vmid = VMID_MSS_MSA;
++	page->destinations[0].permission = VM_PERM_RW;
++	page->destinations[1].vmid = VMID_WLAN;
++	page->destinations[1].permission = VM_PERM_RW;
++	page->destinations[2].vmid = VMID_WLAN_CE;
++	page->destinations[2].permission = VM_PERM_RW;
++	at = kvtophys(memory);
++	page->more[0] = 4;
++	page->more[1] = at + 128;
++	page->more[2] = destinations * sizeof(page->destinations[0]);
++	page->more[3] = 0;
++	for (vm_offset_t line = memory; line < memory + PAGE_SIZE; line += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (line) : "memory");
++	}
++	settle();
++	result = scm(SCM_MP_ASSIGN, SCM_ASSIGN_ARGUMENTS, at, 16, at + 64, at + 240, &answer);
++	kmem_free(kernel_map, memory, PAGE_SIZE);
++	printf("SWEET MPSS: %u: MSA %#llx + %#x to the modem and the WLAN%s: %s (ret %d, answer %#llx)\n", step, pa, size,
++	    secure ? "" : " and its copy engines", result == 0 && answer == 0 ? "GIVEN" : "REFUSED", result, answer);
++	return result == 0 && answer == 0;
++}
++
++/* The board data, in pieces of 6144 bytes; the last one with "end", which makes the firmware check it. */
++static bool
++wlfw_board_data(uint32_t board_id)
++{
++	char name[24];
++	uint8_t *data, *m;
++	uint64_t size = 0;
++	uint16_t result = 0, error = 0;
++	bool ok = true;
++
++	snprintf(name, sizeof(name), "bdwlan.b%02x", board_id & 0xff);
++	data = board_id < 0xff ? root_file(name, &size) : NULL;
++	if (data == NULL) {
++		strlcpy(name, "bdwlan.bin", sizeof(name));
++		data = root_file(name, &size);
++	}
++	if (data == NULL || size == 0 || size > (1u << 20)) {
++		printf("SWEET MPSS: %u: no board data (/fw/image/bdwlan.*) for board %#x\n", step, board_id);
++		if (data != NULL) {
++			kfree_data(data, size);
++		}
++		return false;
++	}
++	m = kalloc_data(7 + 64 + WLFW_BDF_PIECE, Z_WAITOK | Z_ZERO);
++	if (m == NULL) {
++		kfree_data(data, size);
++		return false;
++	}
++	for (uint32_t seg = 0, done = 0; ok && done < size; seg++) {
++		uint32_t piece = (uint32_t)MIN(size - done, (uint64_t)WLFW_BDF_PIECE), at = 7;
++		uint8_t end = done + piece == size;
++		uint8_t v[2] = { (uint8_t)piece, (uint8_t)(piece >> 8) };
++		int e;
++
++		tlv_u8(m, &at, 0x01, 1);                        /* valid */
++		tlv_u32(m, &at, 0x10, 0);                       /* file id */
++		tlv_u32(m, &at, 0x11, (uint32_t)size);          /* total size */
++		tlv_u32(m, &at, 0x12, seg);                     /* segment */
++		m[at] = 0x13;                                   /* data: u16 length, then the bytes */
++		m[at + 1] = (uint8_t)(piece + 2);
++		m[at + 2] = (uint8_t)((piece + 2) >> 8);
++		memcpy(m + at + 3, v, 2);
++		memcpy(m + at + 5, data + done, piece);
++		at += 5 + piece;
++		tlv_u8(m, &at, 0x14, end);
++		e = wlfw_call(WLFW_BDF_DOWNLOAD, m, at, 5000, &result, &error);
++		/* a failed check on the last piece is not fatal (ath10k): released BDFs often fail it */
++		ok = e == 0 && (result == 0 || end);
++		if (!ok || end) {
++			printf("SWEET MPSS: %u: board data %s (%llu bytes), piece %u: %s (errno %d, result %u, error %u)\n", step, name,
++			    size, seg, ok ? "TAKEN" : "REFUSED", e, result, error);
++		}
++		done += piece;
++	}
++	kfree_data(m, 7 + 64 + WLFW_BDF_PIECE);
++	kfree_data(data, size);
++	return ok;
++}
++
++static bool
++step_wlfw(void)
++{
++	uint8_t m[128];
++	uint32_t at, board_id = 0xff;
++	uint16_t result = 0, error = 0, size = 0;
++	const uint8_t *v;
++	int e;
++
++	announce("find the Wi-Fi firmware's service (WLFW, QMI 0x45) and do what ath10k does before the radio: indications, "
++	    "host capabilities, MSA, capabilities, board data, calibration report; then wait for \"fw ready\"");
++	for (unsigned ms = 0; ms < 20000 && wlfw_peer == 0; ms += 10) {
++		lck_mtx_lock(&qrtr_lock);
++		for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
++			if (qrtr_servers[i].there && qrtr_servers[i].service == WLFW_SERVICE) {
++				wlfw_node = qrtr_servers[i].node;
++				wlfw_peer = qrtr_servers[i].port;
++			}
++		}
++		lck_mtx_unlock(&qrtr_lock);
++		if (wlfw_peer == 0) {
++			sleep_ms(10);
++		}
++	}
++	if (wlfw_peer == 0) {
++		printf("SWEET MPSS: %u: no WLFW within 20 s\n", step);
++		return false;
++	}
++	wlfw_port = qrtr_open(wlfw_receive, NULL);
++	if (wlfw_port == NULL) {
++		return false;
++	}
++	printf("SWEET MPSS: %u: WLFW at node %u port %u\n", step, wlfw_node, wlfw_peer);
++
++	at = 7;
++	tlv_u8(m, &at, 0x10, 1);                                /* fw ready */
++	tlv_u8(m, &at, 0x13, 1);                                /* MSA ready */
++	tlv_u8(m, &at, 0x14, 1);                                /* pin connect result */
++	tlv_u32(m, &at, 0x15, WLFW_CLIENT_ID);
++	e = wlfw_call(WLFW_IND_REGISTER, m, at, 5000, &result, &error);
++	v = e == 0 ? qmi_tlv(wlfw.answer, wlfw.length, 0x10, &size) : NULL;
++	printf("SWEET MPSS: %u: indications registered: errno %d, result %u, error %u; firmware status %#llx\n", step, e, result,
++	    error, v != NULL && size >= 8 ? (uint64_t)le32(v) | (uint64_t)le32(v + 4) << 32 : 0ull);
++	if (e != 0 || result != 0) {
++		return false;
++	}
++
++	at = 7;
++	tlv_u32(m, &at, 0x10, 0);                               /* daemon support: none */
++	e = wlfw_call(WLFW_HOST_CAP, m, at, 5000, &result, &error);
++	if (e == 0 && result != 0 && error != 0x5e) {           /* QMI_ERR_NOT_SUPPORTED: older firmware */
++		at = 7;
++		tlv_u8(m, &at, 0x10, 0);                        /* the 8-bit form (ath10k's host-cap quirk) */
++		e = wlfw_call(WLFW_HOST_CAP, m, at, 5000, &result, &error);
++	}
++	printf("SWEET MPSS: %u: host capabilities: errno %d, result %u, error %u\n", step, e, result, error);
++	if (e != 0) {
++		return false;
++	}
++
++	at = 7;
++	{
++		uint8_t pa[8];
++
++		for (unsigned b = 0; b < 8; b++) {
++			pa[b] = (uint8_t)(WLFW_MSA_PA >> (8 * b));
++		}
++		tlv_put(m, &at, 0x01, pa, 8);
++	}
++	tlv_u32(m, &at, 0x02, WLFW_MSA_SIZE);
++	e = wlfw_call(WLFW_MSA_INFO, m, at, 5000, &result, &error);
++	v = e == 0 && result == 0 ? qmi_tlv(wlfw.answer, wlfw.length, 0x03, &size) : NULL;
++	printf("SWEET MPSS: %u: MSA %#llx + %#x: errno %d, result %u, error %u, %u regions\n", step, WLFW_MSA_PA, WLFW_MSA_SIZE,
++	    e, result, error, v != NULL && size >= 1 ? v[0] : 0);
++	if (v == NULL || size < 1 || v[0] > 2 || size < 1u + 13u * v[0]) {
++		return false;
++	}
++	for (unsigned r = 0, n = v[0]; r < n; r++) {
++		const uint8_t *region = v + 1 + 13 * r;
++		uint64_t pa = (uint64_t)le32(region) | (uint64_t)le32(region + 4) << 32;
++		uint32_t bytes = le32(region + 8);
++
++		printf("SWEET MPSS: %u:   region %u: %#llx + %#x, %s\n", step, r, pa, bytes, region[12] ? "secure" : "not secure");
++		if (pa < WLFW_MSA_PA || bytes > WLFW_MSA_SIZE || pa + bytes > WLFW_MSA_PA + WLFW_MSA_SIZE) {
++			printf("SWEET MPSS: %u: OUTSIDE THE MSA: not given\n", step);
++			return false;
++		}
++		/* ath10k waits a little between the answer and the XPU change (SDM845 crashed without) */
++		sleep_ms(20);
++		if (!wlfw_assign(pa, bytes, region[12] != 0)) {
++			return false;
++		}
++	}
++
++	at = 7;
++	e = wlfw_call(WLFW_MSA_READY, m, at, 5000, &result, &error);
++	printf("SWEET MPSS: %u: MSA ready: errno %d, result %u, error %u\n", step, e, result, error);
++	if (e != 0 || result != 0) {
++		return false;
++	}
++
++	at = 7;
++	e = wlfw_call(WLFW_CAP, m, at, 5000, &result, &error);
++	if (e == 0 && result == 0) {
++		uint32_t chip = 0, family = 0, soc = 0, fw = 0;
++		char build[130] = "";
++
++		if ((v = qmi_tlv(wlfw.answer, wlfw.length, 0x10, &size)) != NULL && size >= 8) {
++			chip = le32(v);
++			family = le32(v + 4);
++		}
++		if ((v = qmi_tlv(wlfw.answer, wlfw.length, 0x11, &size)) != NULL && size >= 4) {
++			board_id = le32(v);
++		}
++		if ((v = qmi_tlv(wlfw.answer, wlfw.length, 0x12, &size)) != NULL && size >= 4) {
++			soc = le32(v);
++		}
++		if ((v = qmi_tlv(wlfw.answer, wlfw.length, 0x13, &size)) != NULL && size >= 4) {
++			fw = le32(v);
++		}
++		if ((v = qmi_tlv(wlfw.answer, wlfw.length, 0x14, &size)) != NULL) {
++			memcpy(build, v, MIN((size_t)size, sizeof(build) - 1));
++		}
++		printf("SWEET MPSS: %u: THE WI-FI FIRMWARE: chip %#x family %#x board %#x SoC %#x, firmware %#x, build \"%s\"\n", step,
++		    chip, family, board_id, soc, fw, build);
++	} else {
++		printf("SWEET MPSS: %u: capabilities: errno %d, result %u, error %u\n", step, e, result, error);
++		return false;
++	}
++
++	for (unsigned ms = 0; ms < 5000 && !wlfw.msa_ready; ms++) {
++		sleep_ms(1);
++	}
++	printf("SWEET MPSS: %u: MSA-ready indication: %s\n", step, wlfw.msa_ready ? "came" : "NOT IN 5 s (going on)");
++	if (!wlfw_board_data(board_id)) {
++		return false;
++	}
++	at = 7;
++	tlv_u8(m, &at, 0x01, 0);                                /* no calibration data of ours */
++	e = wlfw_call(WLFW_CAL_REPORT, m, at, 5000, &result, &error);
++	printf("SWEET MPSS: %u: calibration report: errno %d, result %u, error %u\n", step, e, result, error);
++	if (e != 0 || result != 0) {
++		return false;
++	}
++	for (unsigned ms = 0; ms < 15000 && !wlfw.fw_ready; ms++) {
++		sleep_ms(1);
++	}
++	printf("SWEET MPSS: %u: %s (%u indications in all)\n", step, wlfw.fw_ready ? "THE WI-FI FIRMWARE IS READY" :
++	    "no \"fw ready\" within 15 s", wlfw.indications);
++	return wlfw.fw_ready;
 +}
 +
 +/* ---- step 1: survey -------------------------------------------------------------------------------- */
@@ -3504,9 +3910,9 @@
 +
 +/* ---- the steps, and bring-up ----------------------------------------------------------------------- */
 +
-+#define STEPS                   8
++#define STEPS                   9
 +static bool (*const steps[STEPS])(void) = {
-+	step_survey, step_firmware, step_header, step_image, step_our_item, step_start, step_link, step_qrtr,
++	step_survey, step_firmware, step_header, step_image, step_our_item, step_start, step_link, step_qrtr, step_wlfw,
 +};
 +
 +static bool keep;
