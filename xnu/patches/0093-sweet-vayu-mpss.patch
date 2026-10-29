@@ -295,7 +295,7 @@
  /* MB/s of a 16 MB memcpy, best of 4 (cached kernel memory, the CPU renderer's kind of work). */
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,5041 @@
+@@ -0,0 +1,5292 @@
 +/*
 + * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 1 - the modem is loaded, authenticated and let
 + * out of reset, the link to it taken up, and the application processor's file services started, so that
@@ -4342,7 +4342,7 @@
 +	uint64_t pa;
 +};
 +
-+static struct wlan_page wlan_rri, wlan_ring[4], wlan_rx_page[2][(WLAN_RX_POSTED * CE_RX_BUF + 0x3fff) / 0x4000 + 1];
++static struct wlan_page wlan_rri, wlan_ring[5], wlan_rx_page[2][(WLAN_RX_POSTED * CE_RX_BUF + 0x3fff) / 0x4000 + 1];
 +static uint32_t wlan_rx_write[4], wlan_rx_read[4];
 +
 +static void
@@ -4591,8 +4591,8 @@
 +static struct wlan_page wlan_tx;                /* messages to the target, CE_RX_BUF bytes each */
 +static uint8_t wlan_svc_rdy[1024];              /* WMI SERVICE READY as it came (HTC header included) */
 +static uint32_t wlan_svc_rdy_len;
-+static uint8_t wlan_wmi_eid;
-+static uint32_t wlan_tx_write[4], wlan_tx_slot;
++static uint8_t wlan_wmi_eid, wlan_htt_eid;
++static uint32_t wlan_tx_write[5], wlan_tx_slot;
 +static uint8_t wlan_htc_seq[8];
 +static uint32_t wlan_credits[8];                /* HTC send credits per endpoint (only WMI's are counted) */
 +
@@ -4787,6 +4787,7 @@
 +		return false;
 +	}
 +	wlan_wmi_eid = wmi_eid;
++	wlan_htt_eid = htt_eid;
 +	wlan_credits[wmi_eid & 7] = 2;                 /* ath10k: all the target's credits (READY: 2) to WMI */
 +	printf("SWEET MPSS: %u: SETUP COMPLETE sent; WMI is endpoint %u, HTT %u\n", step, wmi_eid, htt_eid);
 +	for (unsigned waited = 0; waited < 10 && events < 6; waited++) {
@@ -5002,7 +5003,241 @@
 +static unsigned wlan_seen_count, wlan_beacons;
 +static bool wlan_scan_done;
 +
-+/* One message from the target: scan events and beacons shown, the rest named. */
++/*
++ * HTT receive (ath10k htt.c/htt_rx.c/htt_tx.c for wcn3990, 64-bit; layouts checked by compiling ath10k's
++ * structs): on this low-latency chip every received frame is first put by the hardware into a buffer of the
++ * host's RX ring - with no ring, nothing is received, management frames included (ios-mpss24: a full scan,
++ * no MGMT RX). The ring: WLAN_HTT_RING u64 physical addresses of 2048-byte buffers, a u32 "alloc index" the host
++ * alone writes (the producer head; the target reads it by its physical address). The host then sends on the HTT
++ * endpoint (CE4): VERSION REQ (answered by VERSION CONF), FRAG DESC BANK CFG (64-bit), RX RING CFG (64-bit:
++ * where the ring and the index are, buffer size, the rx descriptor's layout), AGGR CFG. Received frames are then
++ * reported by RX IN ORD PADDR IND (0x12: the buffers by address) or RX IND (0x01: in ring order); the buffers are
++ * given back at once. A buffer: rx descriptor (attention at +4, MSDU_DONE bit 31), the frame at +0x168.
++ */
++
++#define WLAN_HTT_RING           0x800u          /* entries (ath10k HTT_RX_RING_SIZE) */
++#define WLAN_HTT_POSTED         256u            /* buffers posted (ath10k: 0x7ff; 512 KiB here) */
++#define WLAN_HTT_FRAG_BANK      0x12900u        /* 0x420 tx extension descriptors of 0x48 bytes */
++
++static struct wlan_page wlan_htt_ring, wlan_htt_idx;
++static vm_offset_t wlan_htt_buf_va, wlan_htt_frag_va;
++static uint64_t wlan_htt_buf_pa, wlan_htt_frag_pa;
++static uint32_t wlan_htt_alloc, wlan_htt_read, wlan_htt_msgs, wlan_htt_frames;
++static bool wlan_htt_version;
++
++static bool wlan_beacon(const uint8_t *frame, uint32_t len, uint32_t channel, int signal, const char *how);
++
++/* A buffer (by its index in the pool) put at the ring's head; the head published once the caller is done. */
++static void
++wlan_htt_post(uint32_t b)
++{
++	uint8_t *buf = (uint8_t *)(wlan_htt_buf_va + (vm_offset_t)b * CE_RX_BUF);
++	uint8_t *slot = (uint8_t *)wlan_htt_ring.va + (wlan_htt_alloc & (WLAN_HTT_RING - 1)) * 8;
++	uint64_t pa = wlan_htt_buf_pa + (uint64_t)b * CE_RX_BUF;
++
++	bzero(buf, 64);                                 /* the attention word (+4) among it: not done */
++	wlan_flush((vm_offset_t)buf, CE_RX_BUF);
++	for (unsigned k = 0; k < 8; k++) {
++		slot[k] = (uint8_t)(pa >> (8 * k));
++	}
++	wlan_flush((vm_offset_t)slot, 8);
++	wlan_htt_alloc = (wlan_htt_alloc + 1) & (WLAN_HTT_RING - 1);
++}
++
++static void
++wlan_htt_publish(void)
++{
++	volatile uint32_t *idx = (volatile uint32_t *)wlan_htt_idx.va;
++
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*idx = wlan_htt_alloc;
++	wlan_flush(wlan_htt_idx.va, 64);
++}
++
++/* A received buffer, read and given back: its frame shown if it is a beacon or a probe response. */
++static void
++wlan_htt_frame(uint32_t b, uint32_t len)
++{
++	const uint8_t *buf = (const uint8_t *)(wlan_htt_buf_va + (vm_offset_t)b * CE_RX_BUF);
++
++	wlan_flush((vm_offset_t)buf, CE_RX_BUF);
++	wlan_htt_frames++;
++	if (len == 0) {
++		len = le32(buf + 0x1c) & 0x3fff;                /* msdu_start.info0 */
++	}
++	if (len != 0 && 0x168 + len <= CE_RX_BUF) {
++		(void)wlan_beacon(buf + 0x168, len, 0, 0, "over HTT");
++	}
++	wlan_htt_post(b);
++}
++
++static void
++wlan_htt_event(const uint8_t *in, uint32_t n)
++{
++	const uint8_t *h = in + HTC_HDR;
++	uint32_t plen = n - HTC_HDR;
++
++	if (plen < 4) {
++		return;
++	}
++	wlan_htt_msgs++;
++	switch (h[0]) {
++	case 0x00:                                      /* VERSION CONF */
++		printf("SWEET MPSS: %u: HTT VERSION CONF: %u.%u\n", step, h[2], h[1]);
++		wlan_htt_version = true;
++		break;
++	case 0x12: {                                    /* RX IN ORD PADDR IND */
++		uint32_t count = (uint32_t)(h[6] | h[7] << 8);
++
++		for (uint32_t i = 0; i < count && 8 + 12 * (i + 1) <= plen; i++) {
++			const uint8_t *e = h + 8 + 12 * i;
++			uint64_t pa = (uint64_t)le32(e) | (uint64_t)le32(e + 4) << 32;
++
++			if (pa >= wlan_htt_buf_pa && pa < wlan_htt_buf_pa + (uint64_t)WLAN_HTT_POSTED * CE_RX_BUF) {
++				wlan_htt_frame((uint32_t)((pa - wlan_htt_buf_pa) / CE_RX_BUF), (uint32_t)(e[8] | e[9] << 8));
++			}
++		}
++		wlan_htt_publish();
++		break;
++	}
++	case 0x01: {                                    /* RX IND: the buffers in ring order, as many as reported */
++		/* the MPDU ranges are at the end of the message: count the buffers that are done instead */
++		for (unsigned guard = 0; guard < WLAN_HTT_POSTED; guard++) {
++			uint32_t b = wlan_htt_read;
++			const uint8_t *buf = (const uint8_t *)(wlan_htt_buf_va + (vm_offset_t)b * CE_RX_BUF);
++
++			wlan_flush((vm_offset_t)buf, 64);
++			if (!(le32(buf + 4) & (1u << 31))) {
++				break;
++			}
++			wlan_htt_read = (wlan_htt_read + 1) % WLAN_HTT_POSTED;
++			wlan_htt_frame(b, 0);
++		}
++		wlan_htt_publish();
++		break;
++	}
++	default:
++		if (wlan_htt_msgs <= 12) {
++			printf("SWEET MPSS: %u: HTT message %#x (%u bytes)\n", step, h[0], plen);
++		}
++		break;
++	}
++}
++
++/* HTT on its endpoint through CE4 (no credits: flow control off on that service). */
++static bool
++wlan_htt_send(volatile uint32_t *ce, const uint8_t *msg, uint16_t length)
++{
++	if (!wlan_htc_send(ce, 4, 256, wlan_htt_eid, msg, length)) {
++		printf("SWEET MPSS: %u: HTT message %#x could not be sent (CE4)\n", step, msg[0]);
++		return false;
++	}
++	return true;
++}
++
++static void wlan_wmi_event(const uint8_t *in, uint32_t n);
++
++static void
++put64(uint8_t *p, uint64_t v)
++{
++	put32(p, (uint32_t)v);
++	put32(p + 4, (uint32_t)(v >> 32));
++}
++
++/* As ath10k_htt_rx_alloc + ath10k_htt_rx_ring_refill + ath10k_htt_setup (wcn3990, 64-bit). */
++static bool
++wlan_htt_setup(volatile uint32_t *ce)
++{
++	static uint8_t in[2048];
++	uint8_t msg[64];
++	unsigned from = 0;
++	vm_size_t bufs = round_page(WLAN_HTT_POSTED * CE_RX_BUF), frag = round_page(WLAN_HTT_FRAG_BANK);
++	const ppnum_t below4g = (ppnum_t)((0x100000000ull >> PAGE_SHIFT) - 1);
++
++	if (wlan_htt_eid == 0 || !wlan_page_get(&wlan_ring[4]) || !wlan_page_get(&wlan_htt_ring) || !wlan_page_get(&wlan_htt_idx)) {
++		return false;
++	}
++	if (kmem_alloc_contig(kernel_map, &wlan_htt_buf_va, bufs, 0, below4g, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
++	    kmem_alloc_contig(kernel_map, &wlan_htt_frag_va, frag, 0, below4g, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET MPSS: %u: no memory below 4 GiB for HTT receive\n", step);
++		return false;
++	}
++	wlan_flush(wlan_htt_frag_va, frag);
++	wlan_htt_buf_pa = kvtophys(wlan_htt_buf_va);
++	wlan_htt_frag_pa = kvtophys(wlan_htt_frag_va);
++	wlan_ring_src(ce, 4, &wlan_ring[4], 256, 256);  /* CE4: host to target HTT, 256-byte messages */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wlan_htt_alloc = 0;
++	for (uint32_t b = 0; b < WLAN_HTT_POSTED; b++) {
++		wlan_htt_post(b);
++	}
++	wlan_htt_publish();
++	printf("SWEET MPSS: %u: HTT receive ring %#llx (%u entries), index at %#llx = %u, %u buffers of 2048 from %#llx\n",
++	    step, wlan_htt_ring.pa, WLAN_HTT_RING, wlan_htt_idx.pa, wlan_htt_alloc, WLAN_HTT_POSTED, wlan_htt_buf_pa);
++
++	bzero(msg, sizeof(msg));                        /* VERSION REQ */
++	if (!wlan_htt_send(ce, msg, 4)) {
++		return false;
++	}
++	for (unsigned ms = 0; ms < 3000 && !wlan_htt_version; ms++) {
++		uint32_t n = wlan_htc_wait(ce, in, sizeof(in), 1, &from);
++
++		if (n != 0) {
++			wlan_wmi_event(in, n);
++		}
++	}
++	if (!wlan_htt_version) {
++		printf("SWEET MPSS: %u: no HTT VERSION CONF within 3 s\n", step);
++		return false;
++	}
++	bzero(msg, sizeof(msg));                        /* FRAG DESC BANK CFG, 64-bit: one bank of 0x420 x 0x48 */
++	msg[0] = 0x06;
++	msg[2] = 1;
++	msg[3] = 0x48;
++	put64(msg + 0x04, wlan_htt_frag_pa);
++	msg[0x26] = 0x1f;                               /* bank 0: ids 0 .. 0x41f */
++	msg[0x27] = 0x04;
++	msg[0x3c] = 1;                                  /* record size */
++	if (!wlan_htt_send(ce, msg, 0x40)) {
++		return false;
++	}
++	bzero(msg, sizeof(msg));                        /* RX RING CFG, 64-bit */
++	msg[0] = 0x02;
++	msg[1] = 1;
++	put64(msg + 0x04, wlan_htt_idx.pa);             /* the alloc index, which the target reads */
++	put64(msg + 0x0c, wlan_htt_ring.pa);
++	msg[0x14] = 0x00;                               /* ring length 0x800 */
++	msg[0x15] = 0x08;
++	msg[0x16] = 0x00;                               /* buffer size 0x800 */
++	msg[0x17] = 0x08;
++	msg[0x18] = 0xff;                               /* flags: every kind of frame and every part of the descriptor */
++	msg[0x19] = 0xff;
++	msg[0x1a] = (uint8_t)wlan_htt_alloc;            /* the index's initial value */
++	msg[0x1b] = (uint8_t)(wlan_htt_alloc >> 8);
++	{
++		/* the rx descriptor's parts, in 4-byte units: 802.11 header, payload, PPDU start/end, MPDU start/end,
++		 * MSDU start/end, attention, fragment info (htt_rx_desc_v2 with its 4-byte host pad) */
++		static const uint8_t offs[10] = { 0x4a, 0x5a, 0x1b, 0x25, 0x04, 0x1a, 0x07, 0x0c, 0x01, 0x02 };
++
++		for (unsigned i = 0; i < 10; i++) {
++			msg[0x1c + 2 * i] = offs[i];
++		}
++	}
++	if (!wlan_htt_send(ce, msg, 0x30)) {
++		return false;
++	}
++	static const uint8_t aggr[4] = { 0x05, 0x40, 0x03, 0x00 };  /* AGGR CFG: A-MPDU 64, A-MSDU 3 */
++	if (!wlan_htt_send(ce, aggr, 4)) {
++		return false;
++	}
++	printf("SWEET MPSS: %u: HTT set up: frag desc bank at %#llx, receive ring configured, aggregation 64/3\n", step,
++	    wlan_htt_frag_pa);
++	return true;
++}
++
++/* One message from the target: scan events and beacons shown, HTT handled, the rest named. */
 +static void
 +wlan_wmi_event(const uint8_t *in, uint32_t n)
 +{
@@ -5010,6 +5245,10 @@
 +	const uint8_t *hdr = NULL, *frame = NULL;
 +	uint32_t frame_len = 0;
 +
++	if (n >= HTC_HDR && in[0] == wlan_htt_eid && wlan_htt_eid != 0) {
++		wlan_htt_event(in, n);
++		return;
++	}
 +	if (n < HTC_HDR + 4 || in[0] != wlan_wmi_eid) {
 +		return;
 +	}
@@ -5052,15 +5291,22 @@
 +	if (frame == NULL || buf_len > frame_len) {
 +		return;
 +	}
++	(void)wlan_beacon(frame, buf_len, channel, (int)snr - 95, "WMI MGMT RX");
++}
++
++/* A beacon or probe response: its BSSID and SSID logged once; true if it was one. */
++static bool
++wlan_beacon(const uint8_t *frame, uint32_t buf_len, uint32_t channel, int signal, const char *how)
++{
 +	wlan_beacons++;
 +	if (buf_len < 36 || (frame[0] != 0x80 && frame[0] != 0x50)) {
-+		return;
++		return false;
 +	}
 +	const uint8_t *bssid = frame + 16;
 +
 +	for (unsigned i = 0; i < wlan_seen_count; i++) {
 +		if (memcmp(wlan_seen[i], bssid, 6) == 0) {
-+			return;
++			return true;
 +		}
 +	}
 +	if (wlan_seen_count < sizeof(wlan_seen) / sizeof(wlan_seen[0])) {
@@ -5084,9 +5330,10 @@
 +		}
 +		ie += 2 + elen;
 +	}
-+	printf("SWEET MPSS: %u: A NETWORK: \"%s\" bssid %02x:%02x:%02x:%02x:%02x:%02x, channel %u, signal %d dBm (%s)\n", step,
-+	    ssid[0] ? ssid : "(hidden)", bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], channel, (int)snr - 95,
-+	    frame[0] == 0x80 ? "beacon" : "probe response");
++	printf("SWEET MPSS: %u: A NETWORK: \"%s\" bssid %02x:%02x:%02x:%02x:%02x:%02x, channel %u, signal %d dBm (%s, %s)\n",
++	    step, ssid[0] ? ssid : "(hidden)", bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], channel, signal,
++	    frame[0] == 0x80 ? "beacon" : "probe response", how);
++	return true;
 +}
 +
 +/* A WMI command: waits (handling what comes) for a credit, then sends it on the WMI endpoint through CE3. */
@@ -5129,7 +5376,11 @@
 +	if (ce == NULL || wlan_wmi_eid == 0) {
 +		return false;
 +	}
-+	announce("a passive scan: the channel list, a station interface (vdev 0), START SCAN; 20 s of what the radio hears");
++	announce("a passive scan: HTT receive set up, the channel list, a station interface (vdev 0), START SCAN; 20 s of "
++	    "what the radio hears");
++	if (!wlan_htt_setup(ce)) {
++		return false;
++	}
 +	m = kalloc_data(2048, Z_WAITOK | Z_ZERO);
 +	if (m == NULL) {
 +		return false;
