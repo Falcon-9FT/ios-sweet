@@ -295,7 +295,7 @@
  /* MB/s of a 16 MB memcpy, best of 4 (cached kernel memory, the CPU renderer's kind of work). */
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,4594 @@
+@@ -0,0 +1,4765 @@
 +/*
 + * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 1 - the modem is loaded, authenticated and let
 + * out of reset, the link to it taken up, and the application processor's file services started, so that
@@ -348,6 +348,7 @@
 + *   12  htc       the copy engines' rings (CE0-CE3) and read-index page given, receive buffers posted, the
 + *                 firmware's first HTC messages (READY) polled for
 + *   13  wmi       HTC services WMI control and HTT data connected, SETUP COMPLETE, the first WMI events
++ *   14  init      the memory the firmware asked for, WMI INIT (ath10k's resource configuration), READY and the MAC
 + *
 + * RPMh is asked for the modem's two rails (step 6) and the Wi-Fi radio's four supplies (step 9), through
 + * sweet_rpmh.c. Nothing writes a clock or a pin; the
@@ -4587,6 +4588,9 @@
 +#define HTC_HDR                 8u
 +
 +static struct wlan_page wlan_tx;                /* messages to the target, CE_RX_BUF bytes each */
++static uint8_t wlan_svc_rdy[1024];              /* WMI SERVICE READY as it came (HTC header included) */
++static uint32_t wlan_svc_rdy_len;
++static uint8_t wlan_wmi_eid;
 +static uint32_t wlan_tx_write[4], wlan_tx_slot;
 +static uint8_t wlan_htc_seq[8];
 +
@@ -4758,6 +4762,7 @@
 +	if (!wlan_htc_send(ce, 0, 16, 0, setup, sizeof(setup))) {
 +		return false;
 +	}
++	wlan_wmi_eid = wmi_eid;
 +	printf("SWEET MPSS: %u: SETUP COMPLETE sent; WMI is endpoint %u, HTT %u\n", step, wmi_eid, htt_eid);
 +	for (unsigned waited = 0; waited < 10 && events < 6; waited++) {
 +		uint32_t n = wlan_htc_wait(ce, in, sizeof(in), 1000, &from);
@@ -4769,13 +4774,179 @@
 +		if (n >= HTC_HDR + 4 && in[0] == wmi_eid) {
 +			uint32_t id = (uint32_t)(in[8] | in[9] << 8 | in[10] << 16 | in[11] << 24);
 +
++			/* ids of ath10k wmi-tlv.h enum wmi_tlv_event_id (ios-mpss22: 0x3, 0x1, 0x4009 came) */
 +			printf("SWEET MPSS: %u: WMI event %#x (%u bytes)%s\n", step, id & 0xffffff, n - HTC_HDR,
-+			    (id & 0xffffff) == 0x3001 ? " = SERVICE READY" : (id & 0xffffff) == 0x3002 ? " = READY" : "");
++			    (id & 0xffffff) == 1 ? " = SERVICE READY" : (id & 0xffffff) == 2 ? " = READY" :
++			    (id & 0xffffff) == 3 ? " = SERVICE AVAILABLE" : "");
++			if ((id & 0xffffff) == 1) {
++				wlan_svc_rdy_len = n < sizeof(wlan_svc_rdy) ? n : (uint32_t)sizeof(wlan_svc_rdy);
++				memcpy(wlan_svc_rdy, in, wlan_svc_rdy_len);
++			}
 +		}
 +		wlan_htc_show(from, in, n);
 +	}
 +	printf("SWEET MPSS: %u: %u messages after SETUP COMPLETE\n", step, events);
 +	return events != 0;
++}
++
++/*
++ * ---- step 14: WMI INIT, and the firmware's READY (with the radio's MAC address) -------------------------
++ *
++ * As ath10k_wmi_tlv_op_gen_init(): the host memory the firmware asked for in SERVICE READY (TLV array of
++ * wlan_host_mem_req: req_id, unit_size, num_unit_info, num_units) given to it in chunks below 4 GiB, and the
++ * INIT command - TLV init_cmd (ABI 1.0 / 53, "QCA_ML"), TLV resource_config with ath10k's values for a
++ * wcn3990 (TARGET_TLV_* and the hw_params of "wcn3990 hw1.0"), the TLV array of host memory chunks - sent on
++ * the WMI endpoint, which goes to the target on CE3 (shadow register 0x3200c). READY (event 2) carries the MAC.
++ */
++
++#define WMI_TLV_INIT            0x1u
++
++static void
++tlv_hdr(uint8_t *p, uint16_t tag, uint16_t len)
++{
++	p[0] = (uint8_t)len;
++	p[1] = (uint8_t)(len >> 8);
++	p[2] = (uint8_t)tag;
++	p[3] = (uint8_t)(tag >> 8);
++}
++
++static bool
++step_init(void)
++{
++	volatile uint32_t *ce = wlan_ce_map();
++	static const uint32_t resource[44] = {
++		4, 33, 0, 0, 2, 66, 16, 7, 7, 100, 100, 100, 40, 1, 4, 4, 4, 8, 0, 0, 0, 0x400, 2, 0, 0, 0, 0, 2, 1056, 2, 1,
++		0x20, 2, 5, 22, 6, 0, 1, 1, 0, 0, 0, 0, 0x200,
++	};
++	struct {
++		uint32_t req_id, size;
++		uint64_t pa;
++	} chunk[8];
++	unsigned chunks = 0, from = 0;
++	uint8_t *m, in[512];
++	uint32_t at, n;
++	bool ready = false;
++
++	if (ce == NULL || wlan_svc_rdy_len < HTC_HDR + 4 || wlan_wmi_eid == 0) {
++		printf("SWEET MPSS: %u: no SERVICE READY to answer\n", step);
++		return false;
++	}
++	announce("give the Wi-Fi firmware the memory it asked for and send WMI INIT (ath10k's resource configuration for a "
++	    "wcn3990); wait for READY and the radio's MAC address");
++	/* SERVICE READY: top-level TLVs after the 4-byte WMI header; the memory requests in an array of structs */
++	for (at = HTC_HDR + 4; at + 4 <= wlan_svc_rdy_len;) {
++		uint16_t len = (uint16_t)(wlan_svc_rdy[at] | wlan_svc_rdy[at + 1] << 8);
++		uint16_t tag = (uint16_t)(wlan_svc_rdy[at + 2] | wlan_svc_rdy[at + 3] << 8);
++		uint32_t end = at + 4 + len;
++
++		if (end > wlan_svc_rdy_len) {
++			break;
++		}
++		if (tag == 0x12) {                              /* WMI_TLV_TAG_ARRAY_STRUCT */
++			for (uint32_t in_at = at + 4; in_at + 4 <= end;) {
++				uint16_t l2 = (uint16_t)(wlan_svc_rdy[in_at] | wlan_svc_rdy[in_at + 1] << 8);
++				uint16_t t2 = (uint16_t)(wlan_svc_rdy[in_at + 2] | wlan_svc_rdy[in_at + 3] << 8);
++				const uint8_t *r = wlan_svc_rdy + in_at + 4;
++
++				if (t2 == 0x22 && l2 >= 16 && chunks < 8) {     /* WLAN_HOST_MEM_REQ */
++					uint32_t id = le32(r), unit = le32(r + 4), info = le32(r + 8), units = le32(r + 12);
++
++					if (info & 6) {                             /* num_units: peers (ath10k: max peers + 1) */
++						units = 33 + 1;
++					} else if (info & 1) {                      /* vdevs */
++						units = 4 + 1;
++					}
++					printf("SWEET MPSS: %u: the firmware asks for memory: request %u, %u units of %u bytes (info %#x)\n",
++					    step, id, units, unit, info);
++					chunk[chunks].req_id = id;
++					chunk[chunks].size = unit * units;
++					chunks++;
++				}
++				in_at += 4 + l2;
++			}
++		}
++		at = end;
++	}
++	for (unsigned i = 0; i < chunks; i++) {
++		vm_offset_t va = 0;
++		vm_size_t size = round_page(chunk[i].size);
++
++		if (chunk[i].size == 0 || chunk[i].size > (8u << 20) ||
++		    kmem_alloc_contig(kernel_map, &va, size, 0, (ppnum_t)((0x100000000ull >> PAGE_SHIFT) - 1), 0,
++		    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			printf("SWEET MPSS: %u: no %u bytes below 4 GiB for request %u\n", step, chunk[i].size, chunk[i].req_id);
++			return false;
++		}
++		wlan_flush(va, size);
++		chunk[i].pa = kvtophys(va);
++		printf("SWEET MPSS: %u:   request %u: %u bytes at %#llx\n", step, chunk[i].req_id, chunk[i].size, chunk[i].pa);
++	}
++	m = kalloc_data(1024, Z_WAITOK | Z_ZERO);
++	if (m == NULL) {
++		return false;
++	}
++	at = 0;
++	put32(m + at, WMI_TLV_INIT);                    /* the WMI header: the command id */
++	at += 4;
++	tlv_hdr(m + at, 0x4a, 28);                      /* INIT_CMD: ABI version, number of chunks */
++	put32(m + at + 4, 0x01000000);
++	put32(m + at + 8, 53);
++	put32(m + at + 12, 0x5f414351);
++	put32(m + at + 16, 0x00004c4d);
++	put32(m + at + 20, 0);
++	put32(m + at + 24, 0);
++	put32(m + at + 28, chunks);
++	at += 4 + 28;
++	tlv_hdr(m + at, 0x4b, sizeof(resource));        /* RESOURCE_CONFIG */
++	for (unsigned i = 0; i < 44; i++) {
++		put32(m + at + 4 + 4 * i, resource[i]);
++	}
++	at += 4 + sizeof(resource);
++	tlv_hdr(m + at, 0x12, (uint16_t)(chunks * 20));     /* ARRAY_STRUCT of WLAN_HOST_MEMORY_CHUNK */
++	at += 4;
++	for (unsigned i = 0; i < chunks; i++, at += 20) {
++		tlv_hdr(m + at, 0x4c, 16);
++		put32(m + at + 4, chunk[i].req_id);
++		put32(m + at + 8, (uint32_t)chunk[i].pa);
++		put32(m + at + 12, chunk[i].size);
++		put32(m + at + 16, (uint32_t)(chunk[i].pa >> 32));
++	}
++	if (!wlan_htc_send(ce, 3, 32, wlan_wmi_eid, m, (uint16_t)at)) {
++		kfree_data(m, 1024);
++		printf("SWEET MPSS: %u: WMI INIT could not be sent (CE3)\n", step);
++		return false;
++	}
++	kfree_data(m, 1024);
++	printf("SWEET MPSS: %u: WMI INIT sent (%u bytes, %u memory chunks)\n", step, at, chunks);
++	for (unsigned waited = 0; waited < 10 && !ready; waited++) {
++		n = wlan_htc_wait(ce, in, sizeof(in), 1000, &from);
++		if (n < HTC_HDR + 4) {
++			continue;
++		}
++		uint32_t id = le32(in + HTC_HDR) & 0xffffff;
++
++		printf("SWEET MPSS: %u: WMI event %#x (%u bytes) on endpoint %u\n", step, id, n - HTC_HDR, in[0]);
++		if (in[0] != wlan_wmi_eid || id != 2) {
++			wlan_htc_show(from, in, n);
++			continue;
++		}
++		for (at = HTC_HDR + 4; at + 4 <= n;) {
++			uint16_t len = (uint16_t)(in[at] | in[at + 1] << 8), tag = (uint16_t)(in[at + 2] | in[at + 3] << 8);
++
++			if (tag == 0x23 && len >= 36 && at + 4 + 36 <= n) {         /* READY_EVENT: abi, mac (8), status */
++				const uint8_t *mac = in + at + 4 + 24;
++
++				printf("SWEET MPSS: %u: THE WI-FI FIRMWARE IS READY: MAC %02x:%02x:%02x:%02x:%02x:%02x, status %u\n",
++				    step, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], le32(in + at + 4 + 32));
++				ready = true;
++			}
++			at += 4 + len;
++		}
++	}
++	if (!ready) {
++		printf("SWEET MPSS: %u: no READY within 10 s\n", step);
++	}
++	return ready;
 +}
 +
 +/* ---- step 1: survey -------------------------------------------------------------------------------- */
@@ -4802,10 +4973,10 @@
 +
 +/* ---- the steps, and bring-up ----------------------------------------------------------------------- */
 +
-+#define STEPS                   13
++#define STEPS                   14
 +static bool (*const steps[STEPS])(void) = {
 +	step_survey, step_firmware, step_header, step_image, step_our_item, step_start, step_link, step_qrtr, step_wlfw,
-+	step_smmu, step_wlan, step_htc, step_wmi,
++	step_smmu, step_wlan, step_htc, step_wmi, step_init,
 +};
 +
 +static bool keep;
