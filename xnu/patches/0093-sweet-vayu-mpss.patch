@@ -164,15 +164,78 @@
  }
 --- a/bsd/dev/sweet_rpmh.c
 +++ b/bsd/dev/sweet_rpmh.c
-@@ -30,6 +30,7 @@
+@@ -28,8 +28,10 @@
+ extern struct processor *cpu_to_processor(int cpu);
+ extern struct processor *thread_bind(struct processor *processor);
  int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++int sweet_rpmh_wifi_ldo(const char *res, unsigned mv, bool on);
  int sweet_rpmh_bcm_max(const char *const *names, unsigned count);
  int sweet_rpmh_cmd_db(const char *res, unsigned type, uint32_t *address, uint16_t *levels, unsigned max, unsigned *count);
 +int sweet_rpmh_arc_vote(const char *const *names, unsigned count, unsigned level);
  void sweet_bw_init(void);
  
  /* Live downstream DT has two positional reg entries, no reg-names. */
-@@ -457,6 +458,51 @@
+@@ -397,6 +399,59 @@
+ 	return error;
+ }
+ 
++/*
++ * The Wi-Fi radio's (WCN3998) four supplies, as vayu's DT gives them to qcom,icnss@18800000 (vdd-cx-mx, vdd-1.8-xo,
++ * vdd-1.3-rfa, vdd-3.3-ch0): PMIC5 LDOs, each switched with one active-only request of three commands - voltage,
++ * HPM (raw 7), enable last - or of one (enable 0). Only these resources and these voltages are accepted.
++ */
++int
++sweet_rpmh_wifi_ldo(const char *res, unsigned mv, bool on)
++{
++	static const struct {
++		const char *res;
++		unsigned min_mv, max_mv;
++	} allowed[] = {
++		{ "ldoa1", 752, 752 },          /* vdd-cx-mx, pm8150 L1 */
++		{ "ldoa7", 1800, 1800 },        /* vdd-1.8-xo, pm8150 L7 */
++		{ "ldoc2", 1304, 1304 },        /* vdd-1.3-rfa, pm8150l L2 */
++		{ "ldoc11", 3104, 3312 },       /* vdd-3.3-ch0, pm8150l L11 (the touch panel's too) */
++	};
++	unsigned i;
++	uint32_t address = 0;
++	int error;
++
++	for (i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) {
++		if (res != NULL && strcmp(res, allowed[i].res) == 0) {
++			break;
++		}
++	}
++	if (i == sizeof(allowed) / sizeof(allowed[0]) || (on && (mv < allowed[i].min_mv || mv > allowed[i].max_mv))) {
++		printf("SWEET RPMH: %s at %u mV is not a Wi-Fi supply this switches\n", res ? res : "(none)", mv);
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	error = rh_poisoned ? EIO : rh_map();
++	if (!error) {
++		error = rh_lookup(res, RH_VRM, &address);
++	}
++	if (!error && on) {
++		const uint32_t addresses[3] = {address, address + 8, address + 4};
++		const uint32_t values[3] = {mv, 7, 1};
++		error = rh_send(addresses, values, 3, res);
++	} else if (!error) {
++		const uint32_t addresses[1] = {address + 4};
++		const uint32_t values[1] = {0};
++		error = rh_send(addresses, values, 1, res);
++	}
++	if (error) {
++		printf("SWEET RPMH: %s %s failed errno=%d\n", res, on ? "on" : "off", error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
+ /* Highest level of each named bus clock manager (BCM), one active-only request, commit on each. */
+ int
+ sweet_rpmh_bcm_max(const char *const *names, unsigned count)
+@@ -457,6 +512,51 @@
  	}
  	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
  	return error;
@@ -226,7 +289,7 @@
  /* MB/s of a 16 MB memcpy, best of 4 (cached kernel memory, the CPU renderer's kind of work). */
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,3770 @@
+@@ -0,0 +1,3800 @@
 +/*
 + * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 1 - the modem is loaded, authenticated and let
 + * out of reset, the link to it taken up, and the application processor's file services started, so that
@@ -273,7 +336,8 @@
 + *    9  wlfw      the Wi-Fi firmware's service (QMI 0x45), as ath10k: indications, host capabilities, MSA (given by
 + *                 TrustZone to the modem and the WLAN), capabilities, board data, calibration report, "fw ready"
 + *
-+ * One request goes to RPMh (the two rails, through sweet_rpmh.c). Nothing writes a clock or a pin; the
++ * RPMh is asked for the modem's two rails (step 6) and the Wi-Fi radio's four supplies (step 9), through
++ * sweet_rpmh.c. Nothing writes a clock or a pin; the
 + * SIM is not touched, no call is made, no data session opened.
 + *
 + * Linux: drivers/soc/qcom/{smem,smp2p}.c, drivers/rpmsg/qcom_glink_*.c, net/qrtr/, qcom_scm; the vendor
@@ -306,6 +370,7 @@
 +extern kern_return_t thread_terminate(thread_t);
 +extern int sweet_ufs_read_partition(const char *name, unsigned lun_hint, uint64_t offset, void *out, uint64_t len, uint64_t *size);
 +extern int sweet_rpmh_arc_vote(const char *const *names, unsigned count, unsigned level);
++extern int sweet_rpmh_wifi_ldo(const char *res, unsigned mv, bool on);
 +void sweet_mpss_init(void);
 +
 +/* ---- logging, waits, options --------------------------------------------------------------------- */
@@ -3356,9 +3421,12 @@
 +		}
 +		printf("SWEET MPSS: servreg: the modem asks where \"%s\" is: %u domain%s\n", wanted, found, found == 1 ? "" : "s");
 +	} else if (message == SERVREG_PFR) {
++		uint16_t why_size = 0;
++		const uint8_t *why = qmi_tlv(m, length, 2, &why_size);  /* the reason, as the modem words it */
++
 +		value = qmi_tlv(m, length, 1, &size);
-+		printf("SWEET MPSS: servreg: the modem reports a failure of \"%.*s\"\n", value ? (int)(size < 63 ? size : 63) : 0,
-+		    value ? (const char *)value : "");
++		printf("SWEET MPSS: servreg: the modem reports a failure of \"%.*s\": \"%.*s\"\n", value ? (int)(size < 63 ? size : 63) : 0,
++		    value ? (const char *)value : "", why ? (int)(why_size < 200 ? why_size : 200) : 0, why ? (const char *)why : "");
 +	} else {
 +		printf("SWEET MPSS: servreg: a request this does not know (%#x)\n", message);
 +		answer[10] = QMI_RESULT_FAILURE;
@@ -3495,7 +3563,7 @@
 + * WLAN (no qcom,msa-fixed-perm), says MSA ready, asks the capabilities (chip, board, SoC, firmware version),
 + * then, on the MSA-ready indication, downloads the board data (bdwlan.bNN by board id, else bdwlan.bin, from
 + * /fw/image) and sends the calibration report; the firmware answers with "fw ready". The radio's mode (wlan-cfg,
-+ * wlan-mode) and its copy engines are for the steps after this one: nothing here switches the radio on.
++ * wlan-mode) and its copy engines are for the steps after this one. Its four supplies are switched on first.
 + */
 +
 +#define WLFW_IND_REGISTER       0x0020
@@ -3767,6 +3835,31 @@
 +		return false;
 +	}
 +	printf("SWEET MPSS: %u: WLFW at node %u port %u\n", step, wlfw_node, wlfw_peer);
++
++	/*
++	 * The radio's supplies on first, as the vendor's icnss does when the service arrives (without them the WLAN
++	 * PD failed right after the calibration report): vdd-cx-mx, vdd-1.8-xo, vdd-1.3-rfa, vdd-3.3-ch0 in that
++	 * order. sweetwlfwpower=0 leaves them as the boot chain left them.
++	 */
++	{
++		static const struct {
++			const char *res;
++			unsigned mv;
++		} supplies[] = { { "ldoa1", 752 }, { "ldoa7", 1800 }, { "ldoc2", 1304 }, { "ldoc11", 3300 } };
++		uint32_t power = 1;
++
++		PE_parse_boot_argn("sweetwlfwpower", &power, sizeof(power));
++		for (unsigned i = 0; power && i < sizeof(supplies) / sizeof(supplies[0]); i++) {
++			int pe = sweet_rpmh_wifi_ldo(supplies[i].res, supplies[i].mv, true);
++
++			printf("SWEET MPSS: %u: the radio's supply %s at %u mV: %s (%d)\n", step, supplies[i].res, supplies[i].mv,
++			    pe == 0 ? "on" : "FAILED", pe);
++			if (pe != 0) {
++				return false;
++			}
++			sleep_ms(1);
++		}
++	}
 +
 +	at = 7;
 +	tlv_u8(m, &at, 0x10, 1);                                /* fw ready */
