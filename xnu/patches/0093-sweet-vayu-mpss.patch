@@ -295,7 +295,7 @@
  /* MB/s of a 16 MB memcpy, best of 4 (cached kernel memory, the CPU renderer's kind of work). */
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,4765 @@
+@@ -0,0 +1,5041 @@
 +/*
 + * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 1 - the modem is loaded, authenticated and let
 + * out of reset, the link to it taken up, and the application processor's file services started, so that
@@ -349,6 +349,7 @@
 + *                 firmware's first HTC messages (READY) polled for
 + *   13  wmi       HTC services WMI control and HTT data connected, SETUP COMPLETE, the first WMI events
 + *   14  init      the memory the firmware asked for, WMI INIT (ath10k's resource configuration), READY and the MAC
++ *   15  scan      channel list, a station vdev, a passive scan; the networks heard (beacons) logged
 + *
 + * RPMh is asked for the modem's two rails (step 6) and the Wi-Fi radio's four supplies (step 9), through
 + * sweet_rpmh.c. Nothing writes a clock or a pin; the
@@ -4593,6 +4594,7 @@
 +static uint8_t wlan_wmi_eid;
 +static uint32_t wlan_tx_write[4], wlan_tx_slot;
 +static uint8_t wlan_htc_seq[8];
++static uint32_t wlan_credits[8];                /* HTC send credits per endpoint (only WMI's are counted) */
 +
 +static volatile uint32_t *
 +wlan_shadow_map(void)
@@ -4670,9 +4672,31 @@
 +		vm_offset_t va;
 +
 +		if (wlan_rx_buffer(c - 1, n, &va) == pa) {
++			const uint8_t *h = (const uint8_t *)va;
++
 +			got = nbytes < size ? nbytes : size;
 +			wlan_flush(va, CE_RX_BUF);
 +			memcpy(out, (const void *)va, got);
++			/*
++			 * The credits the target gives back ride in the HTC trailer (flag 0x2, trailer_len at byte 4, the
++			 * last bytes of the payload): records of u8 id, u8 length; id 1 - credit report: (endpoint, credits)
++			 * pairs (ath10k_htc_process_trailer / ath10k_htc_process_credit_report).
++			 */
++			uint32_t plen = (uint32_t)(h[2] | h[3] << 8), tlen = h[4];
++
++			if ((h[1] & 0x2) && tlen != 0 && tlen <= plen && HTC_HDR + plen <= CE_RX_BUF) {
++				for (uint32_t t = HTC_HDR + plen - tlen; t + 2 <= HTC_HDR + plen;) {
++					uint8_t rid = h[t], rlen = h[t + 1];
++
++					if (t + 2 + rlen > HTC_HDR + plen) {
++						break;
++					}
++					for (uint32_t r = 0; rid == 1 && r + 2 <= rlen; r += 2) {
++						wlan_credits[h[t + 2 + r] & 7] += h[t + 3 + r];
++					}
++					t += 2 + rlen;
++				}
++			}
 +			bzero((void *)va, CE_RX_BUF);
 +			wlan_flush(va, CE_RX_BUF);
 +			break;
@@ -4763,6 +4787,7 @@
 +		return false;
 +	}
 +	wlan_wmi_eid = wmi_eid;
++	wlan_credits[wmi_eid & 7] = 2;                 /* ath10k: all the target's credits (READY: 2) to WMI */
 +	printf("SWEET MPSS: %u: SETUP COMPLETE sent; WMI is endpoint %u, HTT %u\n", step, wmi_eid, htt_eid);
 +	for (unsigned waited = 0; waited < 10 && events < 6; waited++) {
 +		uint32_t n = wlan_htc_wait(ce, in, sizeof(in), 1000, &from);
@@ -4917,6 +4942,7 @@
 +		return false;
 +	}
 +	kfree_data(m, 1024);
++	wlan_credits[wlan_wmi_eid & 7] -= wlan_credits[wlan_wmi_eid & 7] != 0;
 +	printf("SWEET MPSS: %u: WMI INIT sent (%u bytes, %u memory chunks)\n", step, at, chunks);
 +	for (unsigned waited = 0; waited < 10 && !ready; waited++) {
 +		n = wlan_htc_wait(ce, in, sizeof(in), 1000, &from);
@@ -4949,6 +4975,256 @@
 +	return ready;
 +}
 +
++/*
++ * ---- step 15: a passive scan, and the beacons the radio hears -----------------------------------------
++ *
++ * The three commands ath10k always relies on before a scan (mac.c: ath10k_regd_update, add_interface,
++ * ath10k_hw_scan; byte layouts from wmi-tlv.c): SCAN CHAN LIST (0x3003: TLV 0x4f count, ARRAY_STRUCT of TLV 0x50
++ * wmi_channel - mhz, center, 0, mode | flags, powers in 0.5 dBm), VDEV CREATE (0x5001: TLV 0x56 vdev 0, STA 2,
++ * subtype 0, MAC), START SCAN (0x3001: TLV 0x4d of 100 bytes with ath10k's defaults, passive (0x31), then the
++ * channels (ARRAY_UINT32 of MHz), no SSIDs, the broadcast BSSID, no IEs). Then SCAN events (0x3001: type, reason,
++ * MHz) and MGMT RX (0x7001: TLV 0x2c channel, snr, rate, phy mode, length, status, rssi[4]; ARRAY_BYTE the frame):
++ * beacons (0x80) and probe responses (0x50), their BSSID and SSID logged once each. The radio only listens.
++ * Each WMI command takes a credit; the target returns them in HTC trailers.
++ */
++
++#define WMI_SCAN_CHAN_LIST      0x3003u
++#define WMI_VDEV_CREATE         0x5001u
++#define WMI_START_SCAN          0x3001u
++#define WMI_EV_SCAN             0x3001u
++#define WMI_EV_MGMT_RX          0x7001u
++
++static const uint16_t wlan_scan_mhz[] = {
++	2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
++	5180, 5200, 5220, 5240, 5745, 5765, 5785, 5805, 5825,
++};
++static uint8_t wlan_seen[48][6];
++static unsigned wlan_seen_count, wlan_beacons;
++static bool wlan_scan_done;
++
++/* One message from the target: scan events and beacons shown, the rest named. */
++static void
++wlan_wmi_event(const uint8_t *in, uint32_t n)
++{
++	uint32_t id, at;
++	const uint8_t *hdr = NULL, *frame = NULL;
++	uint32_t frame_len = 0;
++
++	if (n < HTC_HDR + 4 || in[0] != wlan_wmi_eid) {
++		return;
++	}
++	id = le32(in + HTC_HDR) & 0xffffff;
++	if (id == 0x4002) {
++		return;                                 /* CHAN INFO, one per channel visited: not shown */
++	}
++	if (id != WMI_EV_SCAN && id != WMI_EV_MGMT_RX) {
++		printf("SWEET MPSS: %u: WMI event %#x (%u bytes)\n", step, id, n - HTC_HDR);
++		return;
++	}
++	for (at = HTC_HDR + 4; at + 4 <= n;) {
++		uint16_t len = (uint16_t)(in[at] | in[at + 1] << 8), tag = (uint16_t)(in[at + 2] | in[at + 3] << 8);
++
++		if (at + 4 + len > n) {
++			break;
++		}
++		if ((tag == 0x24 && len >= 24) || (tag == 0x2c && len >= 0x18)) {
++			hdr = in + at + 4;
++		} else if (tag == 0x11) {
++			frame = in + at + 4;
++			frame_len = len;
++		}
++		at += 4 + len;
++	}
++	if (hdr == NULL) {
++		return;
++	}
++	if (id == WMI_EV_SCAN) {
++		uint32_t type = le32(hdr), reason = le32(hdr + 4);
++
++		printf("SWEET MPSS: %u: scan event %s (%#x), reason %u, %u MHz\n", step, type == 1 ? "STARTED" : type == 2 ?
++		    "COMPLETED" : type == 4 ? "BSS CHANNEL" : type == 8 ? "FOREIGN CHANNEL" : type == 0x40 ? "START FAILED" :
++		    type == 0x100 ? "FOREIGN CHANNEL EXIT" : "other", type, reason, le32(hdr + 8));
++		wlan_scan_done |= type == 2 || type == 0x40;
++		return;
++	}
++	uint32_t channel = le32(hdr), snr = le32(hdr + 4), buf_len = le32(hdr + 0x10);
++
++	if (frame == NULL || buf_len > frame_len) {
++		return;
++	}
++	wlan_beacons++;
++	if (buf_len < 36 || (frame[0] != 0x80 && frame[0] != 0x50)) {
++		return;
++	}
++	const uint8_t *bssid = frame + 16;
++
++	for (unsigned i = 0; i < wlan_seen_count; i++) {
++		if (memcmp(wlan_seen[i], bssid, 6) == 0) {
++			return;
++		}
++	}
++	if (wlan_seen_count < sizeof(wlan_seen) / sizeof(wlan_seen[0])) {
++		memcpy(wlan_seen[wlan_seen_count++], bssid, 6);
++	}
++	char ssid[33] = "";
++	for (uint32_t ie = 36; ie + 2 <= buf_len;) {
++		uint8_t eid = frame[ie], elen = frame[ie + 1];
++
++		if (ie + 2 + elen > buf_len) {
++			break;
++		}
++		if (eid == 0) {
++			uint32_t l = elen < 32 ? elen : 32;
++
++			for (uint32_t k = 0; k < l; k++) {
++				ssid[k] = frame[ie + 2 + k] >= 0x20 && frame[ie + 2 + k] < 0x7f ? (char)frame[ie + 2 + k] : '?';
++			}
++			ssid[l] = 0;
++			break;
++		}
++		ie += 2 + elen;
++	}
++	printf("SWEET MPSS: %u: A NETWORK: \"%s\" bssid %02x:%02x:%02x:%02x:%02x:%02x, channel %u, signal %d dBm (%s)\n", step,
++	    ssid[0] ? ssid : "(hidden)", bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], channel, (int)snr - 95,
++	    frame[0] == 0x80 ? "beacon" : "probe response");
++}
++
++/* A WMI command: waits (handling what comes) for a credit, then sends it on the WMI endpoint through CE3. */
++static bool
++wlan_wmi_send(volatile uint32_t *ce, uint32_t cmd, uint8_t *m, uint32_t length)
++{
++	static uint8_t in[2048];                        /* (not on the kernel stack) */
++	unsigned from = 0;
++
++	put32(m, cmd);
++	for (unsigned waited = 0; wlan_credits[wlan_wmi_eid & 7] == 0 && waited < 3000; waited++) {
++		uint32_t n = wlan_htc_wait(ce, in, sizeof(in), 1, &from);
++
++		if (n != 0) {
++			wlan_wmi_event(in, n);
++		}
++	}
++	if (wlan_credits[wlan_wmi_eid & 7] == 0) {
++		printf("SWEET MPSS: %u: no WMI credit for command %#x within 3 s\n", step, cmd);
++		return false;
++	}
++	if (!wlan_htc_send(ce, 3, 32, wlan_wmi_eid, m, (uint16_t)length)) {
++		printf("SWEET MPSS: %u: command %#x could not be sent (CE3)\n", step, cmd);
++		return false;
++	}
++	wlan_credits[wlan_wmi_eid & 7]--;
++	return true;
++}
++
++static bool
++step_scan(void)
++{
++	volatile uint32_t *ce = wlan_ce_map();
++	const unsigned channels = sizeof(wlan_scan_mhz) / sizeof(wlan_scan_mhz[0]);
++	static uint8_t in[2048];
++	uint8_t *m;
++	uint32_t at;
++	unsigned from = 0;
++
++	if (ce == NULL || wlan_wmi_eid == 0) {
++		return false;
++	}
++	announce("a passive scan: the channel list, a station interface (vdev 0), START SCAN; 20 s of what the radio hears");
++	m = kalloc_data(2048, Z_WAITOK | Z_ZERO);
++	if (m == NULL) {
++		return false;
++	}
++	/* SCAN CHAN LIST */
++	at = 4;
++	tlv_hdr(m + at, 0x4f, 4);
++	put32(m + at + 4, channels);
++	at += 8;
++	tlv_hdr(m + at, 0x12, (uint16_t)(channels * (4 + 0x18)));
++	at += 4;
++	for (unsigned i = 0; i < channels; i++, at += 4 + 0x18) {
++		uint8_t *c = m + at + 4;
++
++		tlv_hdr(m + at, 0x50, 0x18);
++		bzero(c, 0x18);
++		put32(c + 0x00, wlan_scan_mhz[i]);
++		put32(c + 0x04, wlan_scan_mhz[i]);
++		put32(c + 0x0c, wlan_scan_mhz[i] < 5000 ? 0x1941 : 0x1940);     /* 11G / 11A, HT, VHT, HT40+, ad hoc */
++		c[0x11] = c[0x12] = c[0x15] = 0x28;                             /* 20 dBm, in 0.5 dBm */
++	}
++	if (!wlan_wmi_send(ce, WMI_SCAN_CHAN_LIST, m, at)) {
++		kfree_data(m, 2048);
++		return false;
++	}
++	printf("SWEET MPSS: %u: SCAN CHAN LIST sent (%u channels)\n", step, channels);
++	/* VDEV CREATE: a station, with a locally administered address (READY gave none) */
++	bzero(m, 2048);
++	at = 4;
++	tlv_hdr(m + at, 0x56, 0x14);
++	put32(m + at + 4, 0);
++	put32(m + at + 8, 2);
++	put32(m + at + 12, 0);
++	static const uint8_t mac[6] = { 0x02, 0x50, 0x43, 0x4f, 0x01, 0x01 };
++	memcpy(m + at + 16, mac, 6);
++	at += 4 + 0x14;
++	if (!wlan_wmi_send(ce, WMI_VDEV_CREATE, m, at)) {
++		kfree_data(m, 2048);
++		return false;
++	}
++	printf("SWEET MPSS: %u: VDEV CREATE sent (vdev 0, station, 02:50:43:4f:01:01)\n", step);
++	/* START SCAN, passive, on all those channels */
++	bzero(m, 2048);
++	at = 4;
++	tlv_hdr(m + at, 0x4d, 0x64);
++	{
++		uint8_t *s = m + at + 4;
++
++		put32(s + 0x00, 0xa000);                        /* scan id */
++		put32(s + 0x04, 0xa001);                        /* requestor */
++		put32(s + 0x08, 0);                             /* vdev */
++		put32(s + 0x0c, 1);                             /* priority low */
++		put32(s + 0x10, 0x11f);                         /* events: started .. foreign channel exit */
++		put32(s + 0x14, 50);                            /* dwell active */
++		put32(s + 0x18, 150);                           /* dwell passive */
++		put32(s + 0x1c, 50);                            /* min rest */
++		put32(s + 0x20, 500);                           /* max rest */
++		put32(s + 0x30, 20000);                         /* max scan time */
++		put32(s + 0x34, 5);                             /* probe delay */
++		put32(s + 0x38, 0x31);                          /* passive, channel stats, probe requests (TLV inverts) */
++		put32(s + 0x40, channels);
++		put32(s + 0x44, 1);                             /* one BSSID: broadcast */
++		put32(s + 0x50, 3);                             /* probes */
++	}
++	at += 4 + 0x64;
++	tlv_hdr(m + at, 0x10, (uint16_t)(channels * 4));
++	at += 4;
++	for (unsigned i = 0; i < channels; i++, at += 4) {
++		put32(m + at, wlan_scan_mhz[i]);
++	}
++	tlv_hdr(m + at, 0x13, 0);                               /* SSIDs: none */
++	at += 4;
++	tlv_hdr(m + at, 0x13, 8);                               /* BSSIDs: ff:ff:ff:ff:ff:ff */
++	memset(m + at + 4, 0xff, 6);
++	at += 4 + 8;
++	tlv_hdr(m + at, 0x11, 0);                               /* IEs: none */
++	at += 4;
++	if (!wlan_wmi_send(ce, WMI_START_SCAN, m, at)) {
++		kfree_data(m, 2048);
++		return false;
++	}
++	kfree_data(m, 2048);
++	printf("SWEET MPSS: %u: START SCAN sent (passive, %u channels); listening 20 s\n", step, channels);
++	for (uint64_t end = now_us() + 20000000ull; now_us() < end && !wlan_scan_done;) {
++		uint32_t n = wlan_htc_wait(ce, in, sizeof(in), 1, &from);
++
++		if (n != 0) {
++			wlan_wmi_event(in, n);
++		}
++	}
++	printf("SWEET MPSS: %u: %u management frames, %u networks%s\n", step, wlan_beacons, wlan_seen_count,
++	    wlan_scan_done ? "; the scan is over" : "");
++	return wlan_seen_count != 0;
++}
++
 +/* ---- step 1: survey -------------------------------------------------------------------------------- */
 +
 +static bool
@@ -4973,10 +5249,10 @@
 +
 +/* ---- the steps, and bring-up ----------------------------------------------------------------------- */
 +
-+#define STEPS                   14
++#define STEPS                   15
 +static bool (*const steps[STEPS])(void) = {
 +	step_survey, step_firmware, step_header, step_image, step_our_item, step_start, step_link, step_qrtr, step_wlfw,
-+	step_smmu, step_wlan, step_htc, step_wmi, step_init,
++	step_smmu, step_wlan, step_htc, step_wmi, step_init, step_scan,
 +};
 +
 +static bool keep;
