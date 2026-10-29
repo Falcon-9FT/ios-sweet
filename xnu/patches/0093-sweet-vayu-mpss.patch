@@ -226,7 +226,7 @@
  /* MB/s of a 16 MB memcpy, best of 4 (cached kernel memory, the CPU renderer's kind of work). */
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,3284 @@
+@@ -0,0 +1,3364 @@
 +/*
 + * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 1 - the modem is loaded, authenticated and let
 + * out of reset, the link to it taken up, and the application processor's file services started, so that
@@ -2789,6 +2789,7 @@
 +#define TFTP_OACK               6
 +#define TFTP_ENOENT             1
 +#define TFTP_EBADOP             4
++#define TFTP_MAX_BLOCK          (QRTR_MAX - 4)  /* a DATA packet in one QRTR datagram */
 +
 +static struct qrtr_port *tftp_port;
 +
@@ -2824,7 +2825,9 @@
 +	uint32_t node, peer;
 +	uint8_t *data;                          /* a read: the file, whole, in memory of ours */
 +	uint64_t size, sent;
-+	uint32_t block, blksize, wsize;
++	uint64_t start, limit;                  /* a read: the bytes sent are data[start .. start + limit) */
++	uint32_t block, blksize, wsize;         /* block: the last one acknowledged */
++	uint32_t highest, last;                 /* the highest block sent; the last block of the read (once done) */
 +	bool done;
 +	bool write;                             /* a write: blocks are acknowledged and dropped */
 +	uint64_t received;
@@ -2857,11 +2860,17 @@
 +	bzero(t, sizeof(*t));
 +}
 +
++/*
++ * Block number (1-based, 32 bits of ours; the wire has the low 16) of a read: from start (the "seek" option), at most
++ * limit bytes (the "rsize" option, else the rest of the file). A block shorter than blksize - empty if the bytes end
++ * on a block boundary - is the last.
++ */
 +static void
-+tftp_send_block(struct tftp_transfer *t)
++tftp_send_block(struct tftp_transfer *t, uint32_t number)
 +{
 +	uint8_t *packet;
-+	uint32_t at = t->block * t->blksize, length = (uint32_t)(t->size - at < t->blksize ? t->size - at : t->blksize);
++	uint64_t at = (uint64_t)(number - 1) * t->blksize;
++	uint32_t length = (uint32_t)(at >= t->limit ? 0 : (t->limit - at < t->blksize ? t->limit - at : t->blksize));
 +
 +	packet = kalloc_data(4 + length, Z_WAITOK);
 +	if (packet == NULL) {
@@ -2869,14 +2878,32 @@
 +	}
 +	packet[0] = 0;
 +	packet[1] = TFTP_DATA;
-+	packet[2] = (uint8_t)((t->block + 1) >> 8);
-+	packet[3] = (uint8_t)(t->block + 1);
-+	memcpy(packet + 4, t->data + at, length);
++	packet[2] = (uint8_t)(number >> 8);
++	packet[3] = (uint8_t)number;
++	memcpy(packet + 4, t->data + t->start + at, length);
 +	qrtr_send(t->port, t->node, t->peer, packet, 4 + length);
 +	kfree_data(packet, 4 + length);
-+	t->sent = at + length;
++	if (number > t->highest) {
++		t->highest = number;
++		t->sent = at + length;
++	}
 +	if (length < t->blksize) {
 +		t->done = true;
++		t->last = number;
++	}
++}
++
++/*
++ * The window (the "wsize" option, else one block) after the last block acknowledged: from the first block not yet
++ * sent, or - again - from the first after the ack when it repeats (a block lost).
++ */
++static void
++tftp_send_window(struct tftp_transfer *t, bool again)
++{
++	uint32_t first = again || t->highest < t->block + 1 ? t->block + 1 : t->highest + 1;
++
++	for (uint32_t n = first; n <= t->block + t->wsize && !(t->done && n > t->last); n++) {
++		tftp_send_block(t, n);
 +	}
 +}
 +
@@ -2928,16 +2955,19 @@
 +		tftp_transfer_end(t);
 +		return;
 +	}
-+	if (block != t->block + 1 && block != 0) {
-+		return;                         /* a duplicate or out-of-sequence ack: ignored */
++	/* the ack names the last block taken (0: the OACK); its 16 bits are matched against what is in flight */
++	uint32_t ahead = (uint16_t)(block - (uint16_t)t->block);
++
++	if (ahead > t->highest - t->block) {
++		return;                         /* stale or out of sequence: ignored */
 +	}
-+	if (t->done) {
++	t->block += ahead;
++	if (t->done && t->block >= t->last) {
 +		tftp_served++;
 +		tftp_transfer_end(t);
 +		return;
 +	}
-+	t->block = block == 0 ? t->block : block;
-+	tftp_send_block(t);
++	tftp_send_window(t, ahead == 0);        /* the same ack again: what was sent after it goes again */
 +}
 +
 +/* A write request: taken on a port of its own if under /readwrite/; its blocks are acknowledged and dropped. */
@@ -2958,7 +2988,8 @@
 +		tftp_refused++;
 +		return;
 +	}
-+	for (options = name + strlen(name) + 1; options < (const char *)m + length;) {
++	/* after the name its mode, then option and value pairs */
++	for (options = name + strlen(name) + 1 + strlen(name + strlen(name) + 1) + 1; options < (const char *)m + length;) {
 +		const char *key = options + strlen(options) + 1;
 +
 +		if (key >= (const char *)m + length) {
@@ -2967,7 +2998,7 @@
 +		if (strcmp(options, "blksize") == 0) {
 +			uint32_t b = (uint32_t)strtoul(key, NULL, 10);
 +
-+			blksize = b >= 8 && b <= 4096 ? b : blksize;
++			blksize = b >= 8 && b <= TFTP_MAX_BLOCK ? b : TFTP_MAX_BLOCK;
 +			asked = true;
 +		}
 +		options = key + strlen(key) + 1;
@@ -3017,6 +3048,8 @@
 +	uint64_t size = 0;
 +	uint8_t *contents;
 +	uint32_t blksize = 512, wsize = 1, at = 2;
++	uint64_t rsize = 0, seek = 0;
++	bool want_blksize = false, want_tsize = false, want_wsize = false, want_rsize = false, want_seek = false;
 +	unsigned left;
 +
 +	if (length < 4) {
@@ -3053,19 +3086,43 @@
 +		tftp_refused++;
 +		return;
 +	}
-+	/* the options after the name and its mode (both NUL-terminated): blksize is the one that matters */
-+	for (options = name + strlen(name) + 1; options < (const char *)m + length;) {
++	/*
++	 * The options after the name and its mode (both NUL-terminated), as tqftpserv takes them: blksize, tsize, wsize
++	 * (blocks per ack), rsize (bytes to read) and seek (where to start) - the modem reads big files piece by piece.
++	 */
++	char seen[96] = "";
++	for (options = name + strlen(name) + 1 + strlen(name + strlen(name) + 1) + 1; options < (const char *)m + length;) {
 +		const char *key = options + strlen(options) + 1;
++		uint64_t v;
 +
 +		if (key >= (const char *)m + length) {
 +			break;
 +		}
++		v = strtouq(key, NULL, 10);
 +		if (strcmp(options, "blksize") == 0) {
-+			uint32_t b = (uint32_t)strtoul(key, NULL, 10);
-+
-+			blksize = b >= 8 && b <= 4096 ? b : blksize;
++			blksize = v >= 8 && v <= TFTP_MAX_BLOCK ? (uint32_t)v : TFTP_MAX_BLOCK;
++			want_blksize = true;
++		} else if (strcmp(options, "tsize") == 0) {
++			want_tsize = true;
++		} else if (strcmp(options, "wsize") == 0) {
++			wsize = v >= 1 && v <= 64 ? (uint32_t)v : (v > 64 ? 64 : 1);
++			want_wsize = true;
++		} else if (strcmp(options, "rsize") == 0) {
++			rsize = v;
++			want_rsize = true;
++		} else if (strcmp(options, "seek") == 0) {
++			seek = v;
++			want_seek = true;
 +		}
++		snprintf(seen + strlen(seen), sizeof(seen) - strlen(seen), " %s=%s", options, key);
 +		options = key + strlen(key) + 1;
++	}
++	if (seek > size) {
++		printf("SWEET MPSS: tftp: the modem reads \"%s\" from %llu: past its end (%llu bytes)\n", name, seek, size);
++		kfree_data(contents, size);
++		tftp_error(tftp_port, node, port, TFTP_ENOENT, "seek past end");
++		tftp_refused++;
++		return;
 +	}
 +	for (unsigned i = 0; i < sizeof(tftp_transfers) / sizeof(tftp_transfers[0]) && t == NULL; i++) {
 +		if (tftp_transfers[i].port == NULL) {
@@ -3090,19 +3147,42 @@
 +	t->peer = port;
 +	t->data = contents;
 +	t->size = size;
++	t->start = seek;
++	t->limit = want_rsize && rsize < size - seek ? rsize : size - seek;
 +	t->blksize = blksize;
 +	t->wsize = wsize;
 +	t->block = 0;
-+	if (tftp_requests <= 40) {
-+		printf("SWEET MPSS: tftp: the modem reads \"%s\" (/fw/image/%s): %llu bytes, blocks of %u\n", name, file, size, blksize);
++	if (tftp_requests <= 60) {
++		printf("SWEET MPSS: tftp: the modem reads \"%s\" (/fw/image/%s, %llu bytes):%s -> %llu bytes from %llu, blocks of %u, window %u\n",
++		    name, file, size, seen, t->limit, t->start, blksize, wsize);
 +	}
-+	/* OACK: the one option we care about echoed, then block 1 follows on its ack */
++	if (!want_blksize && !want_tsize && !want_wsize && !want_rsize && !want_seek) {
++		tftp_send_window(t, false);     /* no options: block 1 is the answer */
++		return;
++	}
++	/* OACK: the options asked for, echoed as taken; the data follows on its ack (block 0) */
 +	oack[0] = 0;
 +	oack[1] = TFTP_OACK;
-+	at += (unsigned)snprintf((char *)oack + at, sizeof(oack) - at, "blksize") + 1;
-+	at += (unsigned)snprintf((char *)oack + at, sizeof(oack) - at, "%u", blksize) + 1;
-+	at += (unsigned)snprintf((char *)oack + at, sizeof(oack) - at, "tsize") + 1;
-+	at += (unsigned)snprintf((char *)oack + at, sizeof(oack) - at, "%llu", size) + 1;
++#define OACK_PUT(key, format, value) do { \
++	at += (unsigned)snprintf((char *)oack + at, sizeof(oack) - at, "%s", key) + 1; \
++	at += (unsigned)snprintf((char *)oack + at, sizeof(oack) - at, format, value) + 1; \
++} while (0)
++	if (want_blksize) {
++		OACK_PUT("blksize", "%u", blksize);
++	}
++	if (want_tsize) {
++		OACK_PUT("tsize", "%llu", size);
++	}
++	if (want_wsize) {
++		OACK_PUT("wsize", "%u", wsize);
++	}
++	if (want_rsize) {
++		OACK_PUT("rsize", "%llu", t->limit);
++	}
++	if (want_seek) {
++		OACK_PUT("seek", "%llu", seek);
++	}
++#undef OACK_PUT
 +	qrtr_send(t->port, node, port, oack, at);
 +}
 +
