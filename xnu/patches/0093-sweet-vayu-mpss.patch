@@ -295,7 +295,7 @@
  /* MB/s of a 16 MB memcpy, best of 4 (cached kernel memory, the CPU renderer's kind of work). */
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,3966 @@
+@@ -0,0 +1,4045 @@
 +/*
 + * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 1 - the modem is loaded, authenticated and let
 + * out of reset, the link to it taken up, and the application processor's file services started, so that
@@ -343,6 +343,7 @@
 + *                 TrustZone to the modem and the WLAN), capabilities, board data, calibration report, "fw ready"
 + *   10  wlan      the copy engines told (pipes, services, shadow registers, as ath10k snoc.c) and the mode MISSION;
 + *                 a few of the radio's copy-engine registers read
++ *   11  smmu      how the boot chain left apps-smmu for the radio's stream 0x640 (read only)
 + *
 + * RPMh is asked for the modem's two rails (step 6) and the Wi-Fi radio's four supplies (step 9), through
 + * sweet_rpmh.c. Nothing writes a clock or a pin; the
@@ -4136,17 +4137,95 @@
 +		}
 +		return false;
 +	}
++	/*
++	 * ios-mpss15: ctrl1 of all twelve read at once and CE1's again 3 s later (the block does not go to sleep);
++	 * CE1's source-ring base stalled the core for good. A copy engine's ring registers are there only for the
++	 * directions it has (ath10k touches only those): source registers for CE0, 3, 4, 7, destination registers
++	 * for CE1, 2, 5, 7, 8, 9, 10, 11 (host_ce_config_wlan); ctrl1, host IE and misc IE for all.
++	 */
 +	if (ce != NULL) {
-+		printf("SWEET MPSS: %u: in 3 s CE1's ctrl1 (%#x) again, the host idle meanwhile\n", step, WLAN_MEMBASE + WLAN_CE0 + 0x1018);
-+		sleep_ms(3000);
-+		printf("SWEET MPSS: %u:   CE1 ctrl1 3 s later: %#x\n", step, ce[(0x1000 + 0x18) / 4]);
-+		printf("SWEET MPSS: %u: in 3 s CE1's source-ring base (%#x; CE1 has no source ring)\n", step,
-+		    WLAN_MEMBASE + WLAN_CE0 + 0x1000);
-+		sleep_ms(3000);
-+		printf("SWEET MPSS: %u:   CE1 source-ring base: %#x\n", step, ce[0x1000 / 4]);
++		static const uint16_t has_src = 0x099, has_dst = 0xfa6;     /* bit n: CE n */
++
++		for (unsigned c = 0; c < 12; c++) {
++			volatile uint32_t *r = ce + c * 0x1000 / 4;
++			char line[160];
++			int at2 = snprintf(line, sizeof(line), "ctrl1 %#x ie %#x misc %#x", r[0x18 / 4], r[0x2c / 4], r[0x34 / 4]);
++
++			if (has_src & (1u << c)) {
++				at2 += snprintf(line + at2, sizeof(line) - (size_t)at2, ", source ring %#x size %u write %u read %u",
++				    r[0x00 / 4], r[0x08 / 4], r[0x3c / 4], r[0x44 / 4]);
++			}
++			if (has_dst & (1u << c)) {
++				snprintf(line + at2, sizeof(line) - (size_t)at2, ", destination ring %#x size %u write %u read %u",
++				    r[0x0c / 4], r[0x14 / 4], r[0x40 / 4], r[0x48 / 4]);
++			}
++			printf("SWEET MPSS: %u:   CE%u: %s\n", step, c, line);
++		}
 +		ml_io_unmap((vm_offset_t)ce, WLAN_CE_WRAPPER - WLAN_CE0 + 0x1000);
 +	}
 +	printf("SWEET MPSS: %u: THE RADIO IS IN MISSION MODE\n", step);
++	return true;
++}
++
++/*
++ * ---- step 11: how the boot chain left the SMMU for the radio (read only) ---------------------------------
++ *
++ * The copy engines' rings are in host memory, which the radio reaches through apps-smmu@0x15000000 (dt: qcom,
++ * qsmmu-v500, qcom,skip-init) as stream 0x640 (mask 0x1, dt iommus of qcom,icnss). Before anything is given to
++ * it: the global configuration (sCR0: client port disable, unmatched stream fault), the stream match registers
++ * that take 0x640 or 0x641, what they route to (translate / bypass / fault, context bank) and that bank's state.
++ * Only reads; with no matching entry, unmatched streams go by sCR0.
++ */
++
++#define APPS_SMMU               0x15000000u
++#define APPS_SMMU_SIZE          0x100000u
++#define WLAN_STREAM             0x640u
++#define WLAN_STREAM_MASK        0x1u
++
++static bool
++step_smmu(void)
++{
++	volatile uint32_t *s;
++	uint32_t cr0, idr0, idr1, groups, banks, page, half, found = 0;
++
++	announce("read how the boot chain left the SMMU for the radio's stream 0x640 (apps-smmu@0x15000000; nothing written)");
++	s = (volatile uint32_t *)ml_io_map(APPS_SMMU, APPS_SMMU_SIZE);
++	if (s == NULL) {
++		return false;
++	}
++	cr0 = s[0x000 / 4];
++	idr0 = s[0x020 / 4];
++	idr1 = s[0x024 / 4];
++	groups = idr0 & 0xff;
++	banks = idr1 & 0xff;
++	page = (idr1 & (1u << 31)) ? 0x10000 : 0x1000;
++	half = page << (((idr1 >> 28) & 7) + 1);                /* NUMPAGENDXB: the global half, then the banks */
++	printf("SWEET MPSS: %u: sCR0 %#x (client port %s, unmatched streams %s), IDR0 %#x (%u stream match groups), IDR1 %#x "
++	    "(%u context banks, pages of %u KiB, banks from %#x)\n", step, cr0, (cr0 & 1) ? "DISABLED" : "on",
++	    (cr0 & (1u << 10)) ? "FAULT" : "bypass", idr0, groups, idr1, banks, page >> 10, half);
++	for (uint32_t g = 0; g < groups && g < 256; g++) {
++		uint32_t smr = s[(0x800 + 4 * g) / 4], id = smr & 0xffff, mask = (smr >> 16) & 0x7fff, s2cr, type, cb;
++
++		if (!(smr & (1u << 31)) || ((id ^ WLAN_STREAM) & ~(mask | WLAN_STREAM_MASK) & 0x7fff) != 0) {
++			continue;
++		}
++		found++;
++		s2cr = s[(0xc00 + 4 * g) / 4];
++		type = (s2cr >> 16) & 3;
++		cb = s2cr & 0xff;
++		printf("SWEET MPSS: %u:   SMR%u %#x (stream %#x mask %#x) -> S2CR %#x: %s", step, g, smr, id, mask, s2cr,
++		    type == 0 ? "TRANSLATE" : type == 1 ? "BYPASS" : "FAULT");
++		if (type == 0 && cb < banks && half + (cb + 1) * page <= APPS_SMMU_SIZE) {
++			volatile uint32_t *b = s + (half + cb * page) / 4;
++
++			printf(", bank %u: CBAR %#x, SCTLR %#x, TCR %#x, TTBR0 %#x%08x, FSR %#x\n", cb, s[(page + 4 * cb) / 4],
++			    b[0x00 / 4], b[0x30 / 4], b[0x24 / 4], b[0x20 / 4], b[0x58 / 4]);
++		} else {
++			printf("\n");
++		}
++	}
++	printf("SWEET MPSS: %u: %u stream match entr%s take the radio's stream\n", step, found, found == 1 ? "y" : "ies");
++	ml_io_unmap((vm_offset_t)s, APPS_SMMU_SIZE);
 +	return true;
 +}
 +
@@ -4174,10 +4253,10 @@
 +
 +/* ---- the steps, and bring-up ----------------------------------------------------------------------- */
 +
-+#define STEPS                   10
++#define STEPS                   11
 +static bool (*const steps[STEPS])(void) = {
 +	step_survey, step_firmware, step_header, step_image, step_our_item, step_start, step_link, step_qrtr, step_wlfw,
-+	step_wlan,
++	step_wlan, step_smmu,
 +};
 +
 +static bool keep;
