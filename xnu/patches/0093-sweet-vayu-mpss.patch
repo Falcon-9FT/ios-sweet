@@ -18,7 +18,143 @@
  extern void sweet_usb_probe(void);
  
  #define REG_CAP         0x00
-@@ -667,6 +668,7 @@
+@@ -357,6 +358,135 @@
+ 	return ENOENT;
+ }
+ 
++/*
++ * Read-only access for kernel clients to a GPT partition on any LUN (sweet_mpss.c: the modem's file systems
++ * modemst1, modemst2, fsg and fsc, which Android's rmtfs serves it; on vayu they are not on LUN 0). The LUNs
++ * are searched in order, lun_hint first; offset (a multiple of 4 KiB) and len pick what of the partition is
++ * read into out. With out NULL only *size, the partition's size in bytes, is filled in. The device lock is
++ * taken one bounce buffer at a time and the root's LUN is put back before it is let go, so the root's I/O
++ * never goes to another LUN. Only READ(10) is issued: nothing is ever written.
++ */
++int sweet_ufs_read_partition(const char *name, unsigned lun_hint, uint64_t offset, void *out, uint64_t len,
++    uint64_t *size);
++
++#define UFS_MAX_LUN     8u
++
++/* With the lock held and su.lun set: the partition's first device block and count, or an errno. */
++static int
++ufs_gpt_lookup(const char *want, uint64_t *first, uint64_t *count)
++{
++	static const uint8_t tur[6] = { 0x00 };
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	int error = EIO;
++	/* The first command to a LUN may report a unit attention. */
++	for (int i = 0; i < 3 && error; i++) {
++		error = ufs_scsi(tur, sizeof(tur), 0, false);
++	}
++	if (!error) {
++		error = ufs_read_blocks(1, 1);
++	}
++	if (error) {
++		return error;
++	}
++	if (memcmp(b, "EFI PART", 8) != 0) {
++		return ENXIO;
++	}
++	uint64_t entry_lba;
++	uint32_t nent, esz;
++	memcpy(&entry_lba, b + 72, 8);
++	memcpy(&nent, b + 80, 4);
++	memcpy(&esz, b + 84, 4);
++	if (esz != 128 || nent == 0 || nent > BOUNCE_SIZE / esz) {
++		return ENXIO;
++	}
++	error = ufs_read_blocks(entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
++	if (error) {
++		return error;
++	}
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = b + i * esz;
++		char name[37];
++		unsigned c;
++		for (c = 0; c < 36; c++) {
++			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++			if (ch == 0 || ch > 0x7f) {
++				break;
++			}
++			name[c] = (char)ch;
++		}
++		name[c] = 0;
++		if (strcmp(name, want) != 0) {
++			continue;
++		}
++		uint64_t lo, hi;
++		memcpy(&lo, e + 32, 8);
++		memcpy(&hi, e + 40, 8);
++		if (hi < lo) {
++			return ENXIO;
++		}
++		*first = lo;
++		*count = hi - lo + 1;
++		return 0;
++	}
++	return ENOENT;
++}
++
++int
++sweet_ufs_read_partition(const char *name, unsigned lun_hint, uint64_t offset, void *out, uint64_t len,
++    uint64_t *size)
++{
++	uint64_t first = 0, count = 0;
++	unsigned lun = 0, hint = lun_hint % UFS_MAX_LUN;
++	uint8_t root_lun;
++	int error = ENOENT;
++
++	if (!su.ready || name == NULL || (offset % UFS_BLOCK) != 0) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	root_lun = su.lun;
++	/* hint, then 0 .. hint - 1, then hint + 1 .. 7 */
++	for (unsigned i = 0; i < UFS_MAX_LUN && error; i++) {
++		lun = i == 0 ? hint : (i <= hint ? i - 1 : i);
++		su.lun = (uint8_t)lun;
++		error = ufs_gpt_lookup(name, &first, &count);
++	}
++	su.lun = root_lun;
++	lck_mtx_unlock(&sweet_ufs_lock);
++	if (error) {
++		printf("SWEET UFS: no GPT partition named \"%s\" on LUNs 0-%u\n", name, UFS_MAX_LUN - 1);
++		return error;
++	}
++	uint64_t bytes = count * UFS_BLOCK;
++	if (size != NULL) {
++		*size = bytes;
++	}
++	if (out == NULL || len == 0) {
++		return 0;
++	}
++	if (offset > bytes || len > bytes - offset) {
++		return EINVAL;
++	}
++	/* bytes is whole device blocks, so rounding the last piece up stays inside the partition */
++	for (uint64_t done = 0; done < len && !error;) {
++		uint32_t want = (uint32_t)MIN(len - done, (uint64_t)BOUNCE_SIZE);
++		uint32_t blocks = (want + UFS_BLOCK - 1) / UFS_BLOCK;
++		lck_mtx_lock(&sweet_ufs_lock);
++		su.lun = (uint8_t)lun;
++		error = ufs_read_blocks(first + (offset + done) / UFS_BLOCK, blocks);
++		if (!error) {
++			memcpy((uint8_t *)out + done, (const void *)(su.dma + DMA_BOUNCE), want);
++		}
++		su.lun = root_lun;
++		lck_mtx_unlock(&sweet_ufs_lock);
++		done += want;
++	}
++	if (!error) {
++		printf("SWEET UFS: \"%s\" on LUN %u: %llu of %llu KiB read (read-only)\n", name, lun, len >> 10, bytes >> 10);
++	}
++	return error;
++}
++
+ static int
+ ufs_take_over_host(void)
+ {
+@@ -667,6 +797,7 @@
  	sweet_cpufreq_init();    /* vayu OSM clocks, boot-arg sweetcpufreq */
  	sweet_adreno_init();     /* vayu Adreno 640 bring-up, boot-arg sweetgpu */
  	sweet_bw_init();         /* vayu DDR/LLCC bus votes, boot-arg sweetbw */
@@ -26,96 +162,290 @@
  	sweet_usb_probe();
  	return 0;
  }
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -30,6 +30,7 @@
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ int sweet_rpmh_bcm_max(const char *const *names, unsigned count);
+ int sweet_rpmh_cmd_db(const char *res, unsigned type, uint32_t *address, uint16_t *levels, unsigned max, unsigned *count);
++int sweet_rpmh_arc_vote(const char *const *names, unsigned count, unsigned level);
+ void sweet_bw_init(void);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+@@ -457,6 +458,51 @@
+ 	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
++}
++
++/*
++ * Rails (ARC, type 3) at a voltage level or above, one active-only request (sweet_mpss.c: the modem's cx.lvl and
++ * mss.lvl at 385 while it starts - qcom,mss@4080000 in vayu's DT, 384 is HakiOS's SD778G - as the vendor PIL proxy vote;
++ * 0 gives them back). An ARC vote is the index into the rail's level table (cmd-db aux data) of the first level at
++ * least as high as wanted, as the vendor rpmh-regulator picks it.
++ */
++int
++sweet_rpmh_arc_vote(const char *const *names, unsigned count, unsigned level)
++{
++	uint32_t addresses[RH_MAX_CMDS], values[RH_MAX_CMDS];
++	if (count == 0 || count > RH_MAX_CMDS) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = rh_poisoned ? EIO : rh_map();
++	for (unsigned i = 0; !error && i < count; ++i) {
++		uint32_t off = 0, len = 0, n = 0, found = ~0u;
++		error = rh_lookup_aux(names[i], 3, &addresses[i], &off, &len);
++		for (; !error && n < len / 2u && found == ~0u; n++) {
++			uint16_t v = rh_db16(off + 2u * n);
++			if (n > 0 && v == 0) {
++				break;                  /* zero padding: the table has ended */
++			}
++			if (v >= level) {
++				found = n;
++			}
++		}
++		if (!error && found == ~0u) {
++			printf("SWEET RPMH: %s has no level %u\n", names[i], level);
++			error = ERANGE;
++		}
++		values[i] = found;
++	}
++	if (!error) {
++		error = rh_send(addresses, values, count, "ARC");
++	}
++	if (error) {
++		printf("SWEET RPMH: ARC vote failed errno=%d\n", error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
+ }
+ 
+ /* MB/s of a 16 MB memcpy, best of 4 (cached kernel memory, the CPU renderer's kind of work). */
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,315 @@
+@@ -0,0 +1,3171 @@
 +/*
-+ * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 0 - read-only probe of what the modem's start
-+ * would need. After HakiOS hakios.mpss.c (oosexgang/hackios-xnu-kernel, APSL 2.0), with the numbers of
-+ * this SoC (vayu dt: qcom,mss pil-tz-generic pas-id 4, ipa pas-id 15; smem 0x86000000 + 0x200000;
-+ * smp2p items 435/428, host 0 / modem 1). Nothing is started, written or voted:
-+ *   1 TrustZone: is "PAS is-supported" available; is-supported for the modem (4), the IPA's GSI
-+ *     firmware (15) and, for comparison, the GPU's zap shader (13, answered 0 on this phone)
-+ *   2 SMEM: header (versions, initialized), the partition table at its last 4K ($TOC), the
-+ *     partition shared by the apps (host 0) and the modem (host 1) and the items in it
-+ *   3 TrustZone PAS init image with the modem's and the zap shader's .mdt (signature check only),
-+ *     each undone at once by PAS shutdown
-+ * Boot-arg sweetmpss=1 (default 0: off); sweetmpssdelay=S start delay (30 s, so iOS is up first).
-+ * Linux: drivers/soc/qcom/smem.c (layout), qcom_scm (calls), vendor subsys-pil-tz.c (pas_supported).
++ * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 1 - the modem is loaded, authenticated and let
++ * out of reset, the link to it taken up, and the application processor's file services started, so that
++ * the modem can register its services (WLFW among them: the Wi-Fi firmware service this is all for).
++ * After HakiOS hakios.mpss.c (oosexgang/hackios-xnu-kernel, APSL 2.0), with the numbers of this SoC and
++ * its one architectural difference: vayu has no IPCC. Where HakiOS rings a doorbell through IPCC and
++ * reads IPCC for the modem's rings, here outgoing doorbells are single-bit writes to the APCS register
++ * 0x17c0000c (AOP bit 0, GLINK bit 12, SMP2P bit 14) and there is no incoming-doorbell register at all:
++ * the modem's SPI interrupts (GLINK 449, SMP2P 451) are not taken, the shared memory and the GLINK
++ * queues are polled instead (a thread of ours, every millisecond).
++ *
++ *   vayu DT, from iOS/modem.md:
++ *   - qcom,mss@4080000: pil-tz-generic, pas-id 4, no MBA; modem_region 0x8e000000 + 0x9600000
++ *   - reserved-memory smem 0x86000000 + 0x200000; hwlock@1f40000, lock 3 at 0x1f43000, apps value 1
++ *   - qcom,smp2p-modem: qcom,smem <435 428> (435 the modem's, 428 ours), hosts apps 0 / modem 1
++ *   - qcom,glink/modem: IPCRTR, SMEM items 478 (descriptor) 479 (our queue) 480 (the modem's)
++ *   - crash reason item 421; AOP mailbox qcom,qmp-aop@c300000
++ *   - rails cx.lvl and mss.lvl at level 385 while it boots (sweet_rpmh.c: sweet_rpmh_arc_vote)
++ *   - rmtfs 3 MB, TrustZone HLOS (3) + MSS_MSA (15) only (no NAV); its buffer put at a free no-map
++ *     region (cdsp_regions 0x99100000; HakiOS's 0x9c700000 is this phone's splash screen)
++ *
++ * The IPA (mobile data) and going online (DMS/NAS) are left for later: milestone 1 is the modem up,
++ * linked and serving its files, which is all the Wi-Fi needs (modem.md). So no "ipa" SMP2P entry, no
++ * IPA firmware, no DMS/NAS.
++ *
++ * Boot-arg sweetmpss=1 brings the modem up on a thread of its own and leaves it up; sweetmpssstep=N
++ * runs the steps up to N and stops (sweetmpss need not be set then). sweetmpssdelay=S delays the start
++ * (default 20 s, so iOS is up first). modem_keep=1 keeps it up after a limited run. The firmware (77 MB)
++ * is read from /fw/image on the root (iOS/scripts/add-modem-fw.sh puts it there), so the steps wait for
++ * the root to be mounted.
++ *
++ *    1  survey    the shared memory: our partition with the modem, its items, whether it has run
++ *    2  firmware  find and check modem.mdt and its segments on the root; read the modem's file systems
++ *                 (rmtfs) and the service registry's tables (the *.jsn beside the firmware)
++ *    3  header    a modem a kernel before this one left running is stopped; TrustZone takes the image's
++ *                 header (PAS_INIT_IMAGE) and is told where the image will be (PAS_MEM_SETUP)
++ *    4  image     the segments written into the modem's memory, and read back
++ *    5  our item  our SMP2P item (428) made in the partition and filled in; GLINK's marks reset
++ *    6  start     RPMh asked for the rails, the always-on processor told "modem: on", TrustZone asked to
++ *                 authenticate and start the modem (PAS_AUTH_AND_RESET); its first words watched for
++ *    7  link      GLINK taken up (our version, the channel IPCRTR); a thread of ours listens from here;
++ *                 the file services (rmtfs, tftp, the service registry) started
++ *    8  qrtr      the modem's hello answered and the services it tells of listened for (WLFW wanted)
++ *
++ * One request goes to RPMh (the two rails, through sweet_rpmh.c). Nothing writes a clock or a pin; the
++ * SIM is not touched, no call is made, no data session opened.
++ *
++ * Linux: drivers/soc/qcom/{smem,smp2p}.c, drivers/rpmsg/qcom_glink_*.c, net/qrtr/, qcom_scm; the vendor
++ * subsys-pil-tz.c; github.com/linux-msm/rmtfs and the pd-mapper for the services.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
 +#include <sys/systm.h>
++#include <sys/errno.h>
 +#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/locks.h>
 +#include <kern/thread.h>
 +#include <kern/sched_prim.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
 +#include <vm/vm_kern.h>
++#include <vm/memory_types.h>
++#include <sys/uio.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <stdarg.h>
 +#include <string.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
++extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
++extern uint64_t kvtophys(vm_offset_t va);
 +extern kern_return_t thread_terminate(thread_t);
++extern int sweet_ufs_read_partition(const char *name, unsigned lun_hint, uint64_t offset, void *out, uint64_t len, uint64_t *size);
++extern int sweet_rpmh_arc_vote(const char *const *names, unsigned count, unsigned level);
 +void sweet_mpss_init(void);
 +
-+/* qcom_scm-smc.c, as sweet_adreno.c */
-+#define SCM_FAST                (1ull << 31)
-+#define SCM_64                  (1ull << 30)
-+#define SCM_SIP                 (2ull << 24)
-+#define SCM_CALL(s, c)          ((uint64_t)(s) << 8 | (c))
-+#define SCM_IS_CALL_AVAILABLE   SCM_CALL(6, 1)
-+#define SCM_PAS_IS_SUPPORTED    SCM_CALL(2, 7)
-+#define SCM_ONE_VALUE           1
-+#define SCM_INTERRUPTED         1
-+#define PAS_MPSS                4
-+#define PAS_IPA                 15
-+#define PAS_GPU                 13
++/* ---- logging, waits, options --------------------------------------------------------------------- */
 +
-+#define SMEM_PA                 0x86000000u     /* dt reserved-memory smem */
-+#define SMEM_SIZE               0x00200000u
-+#define SMEM_VERSION(i)         (64u + 4u * (i))        /* after proc_comm[4] */
-+#define SMEM_INITIALIZED        (64u + 128u)
-+#define SMEM_SBL_VERSION        7
-+#define SMEM_TOC                (SMEM_SIZE - 0x1000u)
-+#define SMEM_TOC_MAGIC          0x434f5424u     /* "$TOC" */
-+#define SMEM_PRT_MAGIC          0x54525024u     /* "$PRT" */
-+#define SMEM_TOC_ENTRY          48u
-+#define SMEM_PRIVATE_CANARY     0xa5a5u
-+#define SMEM_APPS               0u
-+#define SMEM_MODEM              1u
++static uint32_t step;                   /* the step being performed (for the log) */
 +
-+static int sweet_mpss_chan;
++static int say(const char *format, ...) __printflike(1, 2);
++static int
++say(const char *format, ...)
++{
++	char line[400];
++	va_list list;
++	int length;
++
++	va_start(list, format);
++	length = vsnprintf(line, sizeof(line), format, list);
++	va_end(list);
++	printf("%s", line);
++	return length;
++}
++#define printf say
++
++static int mpss_chan;
 +
 +static void
-+sleep_ms(unsigned ms)
++sleep_ms(uint32_t ms)
 +{
 +	uint64_t deadline;
++
 +	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
-+	(void)assert_wait_deadline(&sweet_mpss_chan, THREAD_UNINT, deadline);
++	(void)assert_wait_deadline(&mpss_chan, THREAD_UNINT, deadline);
 +	thread_block(THREAD_CONTINUE_NULL);
 +}
 +
-+static uint32_t
-+rd(vm_offset_t base, uint32_t off)
++/* Sub-millisecond: a short busy wait (as sweet_rpmh.c uses delay()); longer rounds up to a yielding sleep. */
++static void
++sleep_us(uint32_t us)
 +{
-+	uint32_t v = *(volatile uint32_t *)(base + off);
-+	__asm__ volatile("dmb oshld" ::: "memory");
++	if (us < 1000) {
++		delay(us);
++	} else {
++		sleep_ms(us / 1000);
++	}
++}
++
++static uint64_t
++now_us(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000;
++}
++
++static void
++settle(void)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static bool
++option(const char *name)
++{
++	uint32_t value = 0;
++
++	return PE_parse_boot_argn(name, &value, sizeof(value)) && value != 0;
++}
++
++static void
++announce(const char *what)
++{
++	printf("SWEET MPSS: step %u: %s\n", step, what);
++}
++
++/* ---- register access ----------------------------------------------------------------------------- */
++
++static uint32_t
++r32(vm_offset_t a)
++{
++	uint32_t v;
++
++	__asm__ volatile ("ldr %w0, [%1]" : "=r" (v) : "r" (a) : "memory");
++	__asm__ volatile ("dmb oshld" ::: "memory");
 +	return v;
 +}
 +
++static void
++w32(vm_offset_t a, uint32_t v)
++{
++	__asm__ volatile ("str %w0, [%1]" : : "r" (v), "r" (a) : "memory");
++}
++
++struct block {
++	const char *name;
++	uint32_t phys, size;
++	vm_offset_t base;
++};
++
++static bool
++need(struct block *b)
++{
++	if (b->base == 0) {
++		b->base = ml_io_map(b->phys, b->size);
++	}
++	return b->base != 0;
++}
++
++/* ---- TrustZone (PAS), as the probe's scm, generalized to four register arguments ------------------ */
++
++#define SCM_64                  (1ull << 30)
++#define SCM_SIP                 (2ull << 24)
++#define SCM_CALL(s, c)          ((uint64_t)(s) << 8 | (c))
++#define SCM_PAS_INIT_IMAGE      SCM_CALL(2, 1)
++#define SCM_PAS_MEM_SETUP       SCM_CALL(2, 2)
++#define SCM_PAS_AUTH_AND_RESET  SCM_CALL(2, 5)
++#define SCM_PAS_SHUTDOWN        SCM_CALL(2, 6)
++#define SCM_MP_ASSIGN           SCM_CALL(0xc, 0x16)
++#define SCM_ONE_VALUE           1
++#define SCM_THREE_VALUES        3
++#define SCM_VAL_RW              (2u | 2u << 6)  /* SCM_ARGS(2, SCM_VAL, SCM_RW) = 0x82 */
++#define SCM_ASSIGN_ARGUMENTS    0x1117
++#define SCM_INTERRUPTED         1
++#define PAS_MPSS                4               /* dt: qcom,pas-id of qcom,mss */
++
++static uint32_t pas_mpss = PAS_MPSS;
++
 +static int32_t
-+scm2(uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t *answer)
++scm(uint64_t function, uint64_t arguments, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t *answer)
 +{
 +	uint64_t session = 0;
++
++	function |= SCM_64 | SCM_SIP;
 +	for (int i = 0; i < 100; i++) {
 +		register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
 +		register uint64_t x1 __asm__("x1") = arguments;
-+		register uint64_t x2 __asm__("x2") = first;
-+		register uint64_t x3 __asm__("x3") = second;
-+		register uint64_t x4 __asm__("x4") = 0;
-+		register uint64_t x5 __asm__("x5") = 0;
++		register uint64_t x2 __asm__("x2") = a1;
++		register uint64_t x3 __asm__("x3") = a2;
++		register uint64_t x4 __asm__("x4") = a3;
++		register uint64_t x5 __asm__("x5") = a4;
 +		register uint64_t x6 __asm__("x6") = session;
 +		register uint64_t x7 __asm__("x7") = 0;
++
 +		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4), "+r" (x5), "+r" (x6),
 +		    "+r" (x7) : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
 +		session = x6;
@@ -127,200 +457,2916 @@
 +	return -1;
 +}
 +
-+static int32_t
-+scm(uint64_t function, uint64_t arguments, uint64_t first, uint64_t *answer)
-+{
-+	return scm2(function, arguments, first, 0, answer);
-+}
-+
-+static void
-+probe_trustzone(void)
-+{
-+	static const struct { unsigned pas; const char *what; } images[] = {
-+		{ PAS_MPSS, "modem" }, { PAS_IPA, "IPA GSI firmware" }, { PAS_GPU, "GPU zap shader" },
-+	};
-+	/*
-+	 * ios-mpss1: as fast calls (bit 31) every image answered 0, the modem too - which Android starts through
-+	 * TrustZone on this very phone. Linux (vendor scm_call2, upstream qcom_scm_call) and HakiOS make these
-+	 * as standard (yielding) calls; fast is only for the atomic ones. Both kinds are asked here.
-+	 */
-+	for (int kind = 0; kind < 2; kind++) {
-+		uint64_t how = (kind ? SCM_FAST : 0) | SCM_64 | SCM_SIP, ans = ~0ull;
-+		const char *k = kind ? "fast" : "standard";
-+		int32_t r = scm(how | SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE, how | SCM_PAS_IS_SUPPORTED, &ans);
-+		printf("SWEET MPSS: TrustZone (%s calls) is-call-available(pas-is-supported): ret %d answer %#llx\n", k, r, ans);
-+		for (unsigned i = 0; i < sizeof(images) / sizeof(images[0]); i++) {
-+			ans = ~0ull;
-+			r = scm(how | SCM_PAS_IS_SUPPORTED, SCM_ONE_VALUE, images[i].pas, &ans);
-+			printf("SWEET MPSS: TrustZone (%s calls) pas-is-supported(%u, %s): ret %d answer %#llx%s\n", k,
-+			    images[i].pas, images[i].what, r, ans, r == 0 && ans == 1 ? " - SUPPORTED" : "");
-+		}
-+	}
-+}
-+
-+/* The apps/modem partition: its header and the items in its uncached list (smem.c qcom_smem_get_private). */
-+static void
-+probe_partition(vm_offset_t smem, uint32_t offset, uint32_t size)
-+{
-+	if (offset == 0 || size < 32 || offset > SMEM_SIZE || size > SMEM_SIZE - offset) {
-+		printf("SWEET MPSS: partition at %#x size %#x is outside SMEM\n", offset, size);
-+		return;
-+	}
-+	vm_offset_t p = smem + offset;
-+	uint32_t magic = rd(p, 0), hosts = rd(p, 4), psize = rd(p, 8), free_uncached = rd(p, 12), free_cached = rd(p, 16);
-+	printf("SWEET MPSS: partition at %#x: magic %#x hosts %u/%u size %#x free uncached %#x cached %#x\n", offset, magic,
-+	    hosts & 0xffffu, hosts >> 16, psize, free_uncached, free_cached);
-+	if (magic != SMEM_PRT_MAGIC || free_uncached > size) {
-+		return;
-+	}
-+	unsigned items = 0;
-+	for (uint32_t e = 32u; e + 16u <= free_uncached && items < 64; items++) {
-+		uint32_t w0 = rd(p, e), w1 = rd(p, e + 4), w2 = rd(p, e + 8);
-+		uint32_t canary = w0 & 0xffffu, item = w0 >> 16, isize = w1, pad_hdr = w2 >> 16;
-+		if (canary != SMEM_PRIVATE_CANARY) {
-+			printf("SWEET MPSS: bad canary %#x at %#x\n", canary, e);
-+			break;
-+		}
-+		printf("SWEET MPSS:   item %u (%#x) size %#x at %#x%s\n", item, item, isize, e,
-+		    item == 428 ? " - modem's SMP2P out" : item == 435 ? " - apps' SMP2P out" : item == 421 ? " - crash reason" :
-+		    (item >= 478 && item <= 480) ? " - GLINK" : "");
-+		e += 16u + pad_hdr + isize;
-+	}
-+	printf("SWEET MPSS: %u items in the apps/modem partition\n", items);
-+}
-+
-+static void
-+probe_smem(void)
-+{
-+	vm_offset_t smem = ml_io_map(SMEM_PA, SMEM_SIZE);
-+	if (smem == 0) {
-+		printf("SWEET MPSS: SMEM mapping failed\n");
-+		return;
-+	}
-+	uint32_t sbl = rd(smem, SMEM_VERSION(SMEM_SBL_VERSION));
-+	printf("SWEET MPSS: SMEM at %#x: initialized %#x, SBL version %#x (global heap %u, partitions %u)\n", SMEM_PA,
-+	    rd(smem, SMEM_INITIALIZED), sbl, (sbl >> 16) == 0xb, (sbl >> 16) == 0xc);
-+	vm_offset_t toc = smem + SMEM_TOC;
-+	uint32_t magic = rd(toc, 0), version = rd(toc, 4), n = rd(toc, 8);
-+	printf("SWEET MPSS: partition table: magic %#x version %u entries %u\n", magic, version, n);
-+	if (magic != SMEM_TOC_MAGIC || n > 64) {
-+		return;
-+	}
-+	bool found = false;
-+	for (uint32_t i = 0; i < n; i++) {
-+		uint32_t e = 32u + SMEM_TOC_ENTRY * i;
-+		uint32_t offset = rd(toc, e), size = rd(toc, e + 4), flags = rd(toc, e + 8), hosts = rd(toc, e + 12);
-+		uint32_t h0 = hosts & 0xffffu, h1 = hosts >> 16;
-+		printf("SWEET MPSS: partition %u: hosts %u/%u offset %#x size %#x flags %#x cacheline %u\n", i, h0, h1, offset,
-+		    size, flags, rd(toc, e + 16));
-+		if ((h0 == SMEM_APPS && h1 == SMEM_MODEM) || (h0 == SMEM_MODEM && h1 == SMEM_APPS)) {
-+			found = true;
-+			probe_partition(smem, offset, size);
-+		}
-+	}
-+	printf("SWEET MPSS: apps/modem partition %s\n", found ? "PRESENT" : "MISSING");
-+}
++/* ---- the doorbells: vayu's APCS register (no IPCC) ------------------------------------------------- */
 +
 +/*
-+ * Step 3: the real question. The vendor kernel never asks pas-is-supported (subsys-pil-tz.c has no such
-+ * call; this TrustZone answers 0 for every image, ios-mpss1/2): it hands the image's header (.mdt: ELF
-+ * headers + hash segment with the signature) to PAS_INIT_IMAGE in one physically contiguous buffer -
-+ * args pas id (value) and its address (read-write buffer), SCM_ARGS(2, VAL, RW) - and TrustZone checks
-+ * the signature. Done here for the modem (4) and the GPU zap shader (13), each followed at once by
-+ * PAS_SHUTDOWN (pil_deinit_image_trusted), so nothing stays set up; no memory is given, nothing runs.
-+ * The headers come in the payload after the CP microcode (build-payload.sh EXTRAFW=SWEETMDM=modem.mdt
-+ * SWEETZAP=a640_zap.mdt), found by walking the blocks after the touch firmware (sweet_adreno.c).
++ * One register, 0x17c0000c; a bit written there raises the modem's interrupt of that number (dt:
++ * mboxes of qcom,smp2p-modem bit 14, qcom,glink/modem bit 12, qcom,qmp-aop bit 0). There is no
++ * matching register for the modem's rings back: those are SPI interrupts, which this does not take,
++ * so everything the modem writes is found by polling the shared memory and the GLINK queues.
 + */
-+#define SCM_PAS_INIT_IMAGE      SCM_CALL(2, 1)
-+#define SCM_PAS_SHUTDOWN        SCM_CALL(2, 6)
-+#define SCM_VAL_RW              (2u | 2u << 6)  /* SCM_ARGS(2, SCM_VAL, SCM_RW) */
-+#define BLOB_MAP                0x40000u
-+extern uint64_t kvtophys(vm_offset_t va);
++static struct block apcs = { "apcs", 0x17c00000, 0x1000, 0 };
++#define APCS_IPC_SEND           0x0c
++#define RING_AOP                0u
++#define RING_GLINK              12u
++#define RING_SMP2P              14u
 +
-+/* A tagged block of the payload copied into one kernel page (so physically contiguous); 0 if absent. */
-+static vm_offset_t
-+payload_blob(const char *tag, uint32_t *size)
++static void
++ring(unsigned bit)
 +{
-+	uint64_t nvt_pa = 0;
-+	uint32_t nvt_size = 0;
-+	(void)PE_parse_boot_argn("sweetnvtfw", &nvt_pa, sizeof(nvt_pa));
-+	(void)PE_parse_boot_argn("sweetnvtfwsz", &nvt_size, sizeof(nvt_size));
-+	if (nvt_pa == 0) {
++	if (need(&apcs)) {
++		w32(apcs.base + APCS_IPC_SEND, 1u << bit);
++	}
++}
++
++/* ---- the shared memory ---------------------------------------------------------------------------- */
++
++#define SMEM_PA                 0x86000000u     /* dt: reserved-memory smem */
++#define SMEM_SIZE               0x00200000u
++#define SMEM_US                 0
++#define SMEM_MPSS               1               /* dt: qcom,remote-pid of qcom,smp2p-modem and qcom,glink/modem */
++#define SMEM_CANARY             0xa5a5
++
++#define ITEM_SMP2P_OURS         428
++#define ITEM_SMP2P_THEIRS       435
++#define ITEM_CRASH_REASON       421
++#define ITEM_GLINK_DESCRIPTOR   478
++#define ITEM_GLINK_OUR_QUEUE    479
++#define ITEM_GLINK_THEIR_QUEUE  480
++#define GLINK_OUR_QUEUE_SIZE    0x4000u         /* 16 KB (dt: qcom,glink/modem) */
++
++struct smem_table {
++	uint8_t magic[4];
++	uint32_t version, count, reserved[5];
++};
++struct smem_table_entry {
++	uint32_t offset, size, flags;
++	uint16_t host0, host1;
++	uint32_t cacheline, reserved[7];
++};
++struct smem_partition {
++	uint8_t magic[4];
++	uint16_t host0, host1;
++	uint32_t size, free_uncached, free_cached, reserved[3];
++};
++#define SMEM_PARTITION_FREE_UNCACHED    12      /* offsetof(struct smem_partition, free_uncached) */
++struct smem_entry {
++	uint16_t canary, item;
++	uint32_t size;
++	uint16_t padding_data, padding_header;
++	uint32_t reserved;
++};
++struct smem_item {
++	uint32_t item, offset, size;
++};
++
++static const volatile uint8_t *smem;
++
++static bool
++smem_peek(uint64_t offset, void *to, uint32_t size)
++{
++	if (smem == NULL) {
++		smem = (const volatile uint8_t *)ml_io_map(SMEM_PA, SMEM_SIZE);
++	}
++	if (smem == NULL || offset + size > SMEM_SIZE) {
++		return false;
++	}
++	for (uint32_t i = 0; i < size; i++) {
++		((uint8_t *)to)[i] = smem[offset + i];
++	}
++	return true;
++}
++
++static void
++smem_poke(uint32_t offset, uint32_t value)
++{
++	w32((vm_offset_t)smem + offset, value);
++}
++
++static uint32_t
++smem_word(uint32_t offset)
++{
++	return r32((vm_offset_t)smem + offset);
++}
++
++static uint32_t
++smem_partition(uint16_t one, uint16_t other, uint32_t *cacheline, uint32_t *size)
++{
++	struct smem_table table;
++	struct smem_table_entry entry;
++	struct smem_partition header;
++
++	if (!smem_peek(SMEM_SIZE - 0x1000, &table, sizeof(table)) || memcmp(table.magic, "$TOC", 4) != 0 || table.version != 1 ||
++	    table.count > 64) {
 +		return 0;
 +	}
-+	uint64_t pa = nvt_pa + ((nvt_size + 15u) & ~15u), base = pa & ~0x3fffull;
-+	vm_offset_t io = ml_io_map((vm_offset_t)base, BLOB_MAP);
-+	uint32_t want[2];
-+	memcpy(want, tag, 8);
-+	for (uint32_t at = (uint32_t)(pa - base); io != 0 && at + 16u <= BLOB_MAP;) {
-+		volatile const uint32_t *w = (volatile const uint32_t *)(io + at);
-+		uint32_t len = w[2];
-+		if ((w[0] & 0xffffffu) != 0x455753u /* "SWE" */ || len > BLOB_MAP) {
++	for (uint32_t i = 0; i < table.count; i++) {
++		if (!smem_peek(SMEM_SIZE - 0x1000 + sizeof(table) + i * sizeof(entry), &entry, sizeof(entry)) || entry.offset == 0 ||
++		    entry.size == 0) {
++			continue;
++		}
++		if (!((entry.host0 == one && entry.host1 == other) || (entry.host0 == other && entry.host1 == one))) {
++			continue;
++		}
++		if ((uint64_t)entry.offset + entry.size > SMEM_SIZE - 0x1000 || !smem_peek(entry.offset, &header, sizeof(header)) ||
++		    memcmp(header.magic, "$PRT", 4) != 0 || header.size != entry.size) {
++			return 0;
++		}
++		*cacheline = entry.cacheline;
++		*size = entry.size;
++		return entry.offset;
++	}
++	return 0;
++}
++
++static unsigned
++smem_items(uint32_t partition, uint32_t cacheline, struct smem_item *found, unsigned max)
++{
++	struct smem_partition header;
++	struct smem_entry entry;
++	uint32_t at, step_back;
++	unsigned count = 0;
++
++	if (partition == 0 || !smem_peek(partition, &header, sizeof(header)) || header.free_uncached > header.size ||
++	    header.free_cached > header.size) {
++		return 0;
++	}
++	for (at = sizeof(header); at + sizeof(entry) <= header.free_uncached;) {
++		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.size > header.size) {
 +			break;
 +		}
-+		if (w[0] == want[0] && w[1] == want[1]) {
-+			vm_offset_t copy = 0;
-+			if (len == 0 || len > PAGE_SIZE || (len & 3) || at + 16u + len > BLOB_MAP ||
-+			    kmem_alloc(kernel_map, &copy, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
-+			    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
-+				printf("SWEET MPSS: %.8s: %u bytes, not usable\n", tag, len);
-+				return 0;
-+			}
-+			for (uint32_t i = 0; i < len / 4u; i++) {
-+				((uint32_t *)copy)[i] = w[4 + i];
-+			}
-+			*size = len;
-+			return copy;
++		if (count < max) {
++			found[count].item = entry.item;
++			found[count].offset = partition + at + sizeof(entry) + entry.padding_header;
++			found[count].size = entry.size - entry.padding_data;
 +		}
-+		at += 16u + ((len + 15u) & ~15u);
++		count++;
++		at += sizeof(entry) + entry.padding_header + entry.size;
 +	}
-+	printf("SWEET MPSS: no %.8s block in the payload\n", tag);
++	if (cacheline == 0 || (cacheline & (cacheline - 1))) {
++		return count;
++	}
++	step_back = ((uint32_t)sizeof(entry) + cacheline - 1) & ~(cacheline - 1);
++	for (at = header.size - step_back; at > header.free_cached && at < header.size;) {
++		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.size > at) {
++			break;
++		}
++		if (count < max) {
++			found[count].item = entry.item;
++			found[count].offset = partition + at - entry.size;
++			found[count].size = entry.size - entry.padding_data;
++		}
++		count++;
++		if (entry.size + step_back > at) {
++			break;
++		}
++		at -= entry.size + step_back;
++	}
++	return count;
++}
++
++static uint32_t
++smem_item(uint32_t item, uint32_t *size)
++{
++	static struct smem_item found[256];
++	static const uint16_t hosts[2][2] = { { SMEM_US, SMEM_MPSS }, { 0xfffe, 0xfffe } };
++
++	for (unsigned h = 0; h < 2; h++) {
++		uint32_t cacheline = 0, partition_size = 0;
++		uint32_t partition = smem_partition(hosts[h][0], hosts[h][1], &cacheline, &partition_size);
++		unsigned count = smem_items(partition, cacheline, found, 256);
++
++		for (unsigned i = 0; i < count && i < 256; i++) {
++			if (found[i].item == item) {
++				*size = found[i].size;
++				return found[i].offset;
++			}
++		}
++	}
 +	return 0;
 +}
 +
 +static void
-+probe_signature(unsigned pas, const char *what, const char *tag)
++show_partition(void)
 +{
-+	uint32_t size = 0;
-+	vm_offset_t mdt = payload_blob(tag, &size);
-+	if (mdt == 0) {
++	static struct smem_item found[256];
++	struct smem_partition header;
++	uint32_t cacheline = 0, size = 0, partition = smem_partition(SMEM_US, SMEM_MPSS, &cacheline, &size);
++	unsigned count;
++	char line[320];
++
++	if (partition == 0 || !smem_peek(partition, &header, sizeof(header))) {
++		printf("SWEET MPSS: %u: there is no partition for us and the modem (0 and 1)\n", step);
 +		return;
 +	}
-+	for (vm_offset_t line = mdt; line < mdt + size; line += 64) {
-+		__asm__ volatile("dc civac, %0" : : "r"(line) : "memory");
++	count = smem_items(partition, cacheline, found, 256);
++	printf("SWEET MPSS: %u: the partition for us and the modem: at %#lx, %#x bytes, %#x free; %u items\n", step,
++	    (unsigned long)(SMEM_PA + partition), size, header.free_cached - header.free_uncached, count);
++	for (unsigned i = 0; i < count && i < 256;) {
++		int at = 0;
++
++		for (unsigned n = 0; n < 12 && i < count && i < 256; n++, i++) {
++			at += snprintf(line + at, sizeof(line) - (size_t)at, " %u(%u)", found[i].item, found[i].size);
++		}
++		printf("SWEET MPSS: %u:   items:%s\n", step, line);
 +	}
-+	__asm__ volatile("dsb sy" ::: "memory");
-+	uint64_t how = SCM_64 | SCM_SIP, ans = ~0ull, phys = kvtophys(mdt);
-+	printf("SWEET MPSS: %s header: %u bytes at pa %#llx, ELF %#x\n", what, size, phys, *(uint32_t *)mdt);
-+	int32_t r = scm2(how | SCM_PAS_INIT_IMAGE, SCM_VAL_RW, pas, phys, &ans);
-+	printf("SWEET MPSS: TrustZone pas-init-image(%u, %s): ret %d answer %#llx%s\n", pas, what, r, ans,
-+	    r == 0 && ans == 0 ? " - SIGNATURE ACCEPTED" : " - refused");
-+	ans = ~0ull;
-+	r = scm(how | SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, pas, &ans);
-+	printf("SWEET MPSS: TrustZone pas-shutdown(%u): ret %d answer %#llx\n", pas, r, ans);
++}
++
++/* ---- SMP2P ---------------------------------------------------------------------------------------- */
++
++struct smp2p {
++	uint32_t magic;
++	uint32_t version;
++	uint16_t local, remote, total, valid;
++	uint32_t flags;
++	struct {
++		char name[16];
++		uint32_t value;
++	} entry[16];
++};
++#define SMP2P_MAGIC             0x504d5324      /* "$SMP" */
++#define SMP2P_VERSION           1
++#define SMP2P_RESTART_ACKS      1u
++#define SMP2P_RESTART_DONE      (1u << 0)
++#define SMP2P_RESTART_ACK       (1u << 1)
++#define SMP2P_AT_VERSION        4
++#define SMP2P_AT_PROCESSORS     8
++#define SMP2P_AT_COUNTS         12
++#define SMP2P_AT_FLAGS          16
++#define SMP2P_AT_NAME(i)        (20 + 20 * (i))
++#define SMP2P_AT_VALUE(i)       (36 + 20 * (i))
++
++/* The modem's entry "slave-kernel" (dt: the interrupts of qcom,smp2p-modem, as modem.md names them). */
++#define DSP_FATAL               (1u << 0)
++#define DSP_READY               (1u << 1)
++#define DSP_HANDOVER            (1u << 2)       /* proxy-unvote: it has asked for its own power */
++#define DSP_STOP_ACK            (1u << 3)
++#define DSP_SHUTDOWN_ACK        (1u << 7)
++#define OUR_ENTRY_STOP          "master-kernel"
++#define DSP_STOP                (1u << 0)
++
++static uint32_t our_item;               /* our SMP2P item (428); 0: not made */
++static bool smp2p_agreed, smp2p_restart_acks, smp2p_restart_acked;
++
++static bool
++dsp_words(struct smp2p *words)
++{
++	static uint32_t at;
++	uint32_t size = 0;
++
++	if (at == 0) {
++		at = smem_item(ITEM_SMP2P_THEIRS, &size);
++		if (at == 0 || size < sizeof(*words)) {
++			at = 0;
++			return false;
++		}
++	}
++	return smem_peek(at, words, sizeof(*words)) && words->magic == SMP2P_MAGIC;
++}
++
++static int
++smp2p_entry(const struct smp2p *words, const char *name)
++{
++	for (unsigned i = 0; i < words->valid && i < 16; i++) {
++		if (strncmp(words->entry[i].name, name, sizeof(words->entry[i].name)) == 0) {
++			return (int)i;
++		}
++	}
++	return -1;
++}
++
++static uint32_t
++dsp_state(const struct smp2p *words)
++{
++	int entry = smp2p_entry(words, "slave-kernel");
++
++	return entry < 0 ? 0 : words->entry[entry].value;
 +}
 +
 +static void
-+mpss_thread(void *arg, wait_result_t result)
++show_words(const char *prefix, const struct smp2p *words)
 +{
-+	unsigned delay_s = 30;
-+	(void)arg;
-+	(void)result;
-+	(void)PE_parse_boot_argn("sweetmpssdelay", &delay_s, sizeof(delay_s));
-+	printf("SWEET MPSS: modem probe in %u s (read-only)\n", delay_s);
++	char line[320];
++	int at = 0;
++
++	line[0] = 0;
++	for (unsigned i = 0; i < words->valid && i < 16 && at < (int)sizeof(line) - 40; i++) {
++		at += snprintf(line + at, sizeof(line) - (size_t)at, " %.16s=%#x;", words->entry[i].name, words->entry[i].value);
++	}
++	printf("SWEET MPSS: %u: %s: SMP2P version %u, features %#x, %u->%u, flags %#x, %u/%u entries:%s\n", step, prefix,
++	    words->version & 0xff, words->version >> 8, words->local, words->remote, words->flags, words->valid, words->total, line);
++}
++
++static void
++show_crash_reason(void)
++{
++	char text[257];
++	uint32_t size = 0, at = smem_item(ITEM_CRASH_REASON, &size);
++
++	if (at == 0 || size == 0) {
++		printf("SWEET MPSS: %u: item %u, the modem's last words: not there\n", step, ITEM_CRASH_REASON);
++		return;
++	}
++	bzero(text, sizeof(text));
++	smem_peek(at, text, size < sizeof(text) - 1 ? size : sizeof(text) - 1);
++	if (text[0] == 0) {
++		printf("SWEET MPSS: %u: item %u, the modem's last words (%u bytes): none\n", step, ITEM_CRASH_REASON, size);
++	} else {
++		printf("SWEET MPSS: %u: THE MODEM'S LAST WORDS (item %u, %u bytes): \"%s\"\n", step, ITEM_CRASH_REASON, size, text);
++	}
++}
++
++/* What Linux does when the modem rings for SMP2P: agree on the features once, and answer a restart. */
++static void
++dsp_listen(const struct smp2p *theirs)
++{
++	struct smp2p ours;
++
++	if (our_item == 0 || !smem_peek(our_item, &ours, sizeof(ours)) || ours.magic != SMP2P_MAGIC) {
++		return;
++	}
++	if (!smp2p_agreed) {
++		uint32_t features = (ours.version >> 8) & (theirs->version >> 8);
++
++		if ((theirs->version & 0xff) != (ours.version & 0xff)) {
++			return;
++		}
++		if (features != ours.version >> 8) {
++			smem_poke(our_item + SMP2P_AT_VERSION, features << 8 | (ours.version & 0xff));
++		}
++		smp2p_restart_acks = features & SMP2P_RESTART_ACKS;
++		smp2p_agreed = true;
++		printf("SWEET MPSS: %u: SMP2P agreed: version %u, features %#x\n", step, ours.version & 0xff, features);
++	}
++	if (smp2p_restart_acks && ((theirs->flags & SMP2P_RESTART_DONE) != 0) != smp2p_restart_acked) {
++		smp2p_restart_acked = !smp2p_restart_acked;
++		smem_poke(our_item + SMP2P_AT_FLAGS, (ours.flags & ~SMP2P_RESTART_ACK) | (smp2p_restart_acked ? SMP2P_RESTART_ACK : 0));
++		settle();
++		ring(RING_SMP2P);
++	}
++}
++
++static uint32_t
++our_item_find(void)
++{
++	uint32_t size = 0, at = smem_item(ITEM_SMP2P_OURS, &size);
++
++	return at != 0 && size >= sizeof(struct smp2p) ? at : 0;
++}
++
++/* Linux's qcom_q6v5_request_stop(): our "stop" bit, the modem's "stop ack" waited for, our bit taken back. */
++static bool
++dsp_ask_to_stop(uint32_t bound_ms)
++{
++	struct smp2p ours, theirs;
++	uint32_t at = our_item_find(), state, value_at;
++	uint64_t asked, now;
++	int entry;
++
++	if (at == 0 || !smem_peek(at, &ours, sizeof(ours)) || ours.magic != SMP2P_MAGIC || (ours.version & 0xff) != SMP2P_VERSION ||
++	    (entry = smp2p_entry(&ours, OUR_ENTRY_STOP)) < 0) {
++		printf("SWEET MPSS: %u: the modem is not asked to stop first: no SMP2P item of ours\n", step);
++		return false;
++	}
++	if (!dsp_words(&theirs) || smp2p_entry(&theirs, "slave-kernel") < 0) {
++		printf("SWEET MPSS: %u: the modem is not asked to stop first: its item has no entry to answer in\n", step);
++		return false;
++	}
++	state = dsp_state(&theirs);
++	if (state & DSP_STOP_ACK) {
++		printf("SWEET MPSS: %u: the modem already says it has stopped (%#x)\n", step, state);
++		return true;
++	}
++	if (!(state & DSP_READY) || (state & DSP_FATAL)) {
++		printf("SWEET MPSS: %u: the modem is not asked to stop first: its entry says %#x, not up\n", step, state);
++		return false;
++	}
++	value_at = at + SMP2P_AT_VALUE((uint32_t)entry);
++	smem_poke(value_at, ours.entry[entry].value | DSP_STOP);
++	settle();
++	ring(RING_SMP2P);
++	asked = now = now_us();
++	while (now - asked < bound_ms * 1000ull) {
++		if (dsp_words(&theirs) && (dsp_state(&theirs) & (DSP_STOP_ACK | DSP_FATAL))) {
++			break;
++		}
++		sleep_us(200);
++		now = now_us();
++	}
++	state = dsp_words(&theirs) ? dsp_state(&theirs) : 0;
++	printf("SWEET MPSS: %u: %s after %llu.%03llu ms; its entry says %#x\n", step, state & DSP_STOP_ACK ?
++	    "THE MODEM ACKNOWLEDGES THE STOP" : "THE MODEM DOES NOT ACKNOWLEDGE THE STOP", (now - asked) / 1000,
++	    (now - asked) % 1000, state);
++	smem_poke(value_at, ours.entry[entry].value & ~DSP_STOP);
++	settle();
++	ring(RING_SMP2P);
++	return (state & DSP_STOP_ACK) != 0;
++}
++
++/* ---- the always-on processor's mailbox (Linux's qmp; its memory is at 0x0c300000, the doorbell APCS bit 0) ---- */
++
++#define QMP_MAGIC               0x00
++#define QMP_MAGIC_VALUE         0x4d41494c      /* "MAIL" */
++#define QMP_VERSION             0x04
++#define QMP_THEIR_LINK          0x0c
++#define QMP_THEIR_LINK_ACK      0x10
++#define QMP_THEIR_CHANNEL       0x14
++#define QMP_THEIR_CHANNEL_ACK   0x18
++#define QMP_OUR_LINK            0x24
++#define QMP_OUR_LINK_ACK        0x28
++#define QMP_OUR_CHANNEL         0x2c
++#define QMP_OUR_CHANNEL_ACK     0x30
++#define QMP_OUR_BOX_SIZE        0x34
++#define QMP_OUR_BOX             0x38
++#define QMP_UP                  0x0000ffffu
++#define QMP_DOWN                0xffff0000u
++#define QMP_MESSAGE             64
++
++static struct block aoss = { "aop-mailbox", 0x0c300000, 0x400, 0 };
++static uint32_t our_box;                /* where our mailbox is in the message memory; 0: not open */
++
++static bool
++mailbox_wait(uint32_t offset, uint32_t value, uint32_t ms)
++{
++	for (uint32_t i = 0; i < ms * 10; i++) {
++		if (r32(aoss.base + offset) == value) {
++			return true;
++		}
++		sleep_us(100);
++	}
++	return r32(aoss.base + offset) == value;
++}
++
++/* Linux's qmp_open(), as HakiOS does it; what is done already is found done. */
++static bool
++mailbox_open(void)
++{
++	uint32_t box, size;
++
++	if (!need(&aoss)) {
++		return false;
++	}
++	if (r32(aoss.base + QMP_MAGIC) != QMP_MAGIC_VALUE || r32(aoss.base + QMP_VERSION) != 1) {
++		printf("SWEET MPSS: %u: not a mailbox this knows (magic %#x)\n", step, r32(aoss.base + QMP_MAGIC));
++		return false;
++	}
++	box = r32(aoss.base + QMP_OUR_BOX);
++	size = r32(aoss.base + QMP_OUR_BOX_SIZE);
++	if (size < QMP_MESSAGE + 4 || box < 0x3c || box + size > aoss.size || (box & 3)) {
++		printf("SWEET MPSS: %u: our mailbox is not where a message fits (box %#x size %#x)\n", step, box, size);
++		return false;
++	}
++	if (r32(aoss.base + QMP_OUR_LINK) == QMP_UP && r32(aoss.base + QMP_OUR_LINK_ACK) == QMP_UP &&
++	    r32(aoss.base + QMP_OUR_CHANNEL) == QMP_UP && r32(aoss.base + QMP_THEIR_CHANNEL) == QMP_UP &&
++	    r32(aoss.base + QMP_OUR_CHANNEL_ACK) == QMP_UP) {
++		printf("SWEET MPSS: %u: the mailbox is open already\n", step);
++		our_box = box;
++		return true;
++	}
++	w32(aoss.base + QMP_THEIR_LINK_ACK, r32(aoss.base + QMP_THEIR_LINK));
++	w32(aoss.base + QMP_OUR_LINK, QMP_UP);
++	ring(RING_AOP);
++	if (!mailbox_wait(QMP_OUR_LINK_ACK, QMP_UP, 1000)) {
++		printf("SWEET MPSS: %u: THE ALWAYS-ON PROCESSOR DOES NOT ACKNOWLEDGE OUR LINK; taken down again\n", step);
++		w32(aoss.base + QMP_OUR_LINK, QMP_DOWN);
++		ring(RING_AOP);
++		return false;
++	}
++	w32(aoss.base + QMP_OUR_CHANNEL, QMP_UP);
++	ring(RING_AOP);
++	if (!mailbox_wait(QMP_THEIR_CHANNEL, QMP_UP, 1000)) {
++		printf("SWEET MPSS: %u: THE ALWAYS-ON PROCESSOR DOES NOT OPEN ITS CHANNEL; ours taken down again\n", step);
++		w32(aoss.base + QMP_OUR_CHANNEL, QMP_DOWN);
++		w32(aoss.base + QMP_OUR_LINK, QMP_DOWN);
++		ring(RING_AOP);
++		return false;
++	}
++	w32(aoss.base + QMP_THEIR_CHANNEL_ACK, QMP_UP);
++	ring(RING_AOP);
++	if (!mailbox_wait(QMP_OUR_CHANNEL_ACK, QMP_UP, 1000)) {
++		printf("SWEET MPSS: %u: THE ALWAYS-ON PROCESSOR DOES NOT ACKNOWLEDGE OUR CHANNEL; taken down again\n", step);
++		w32(aoss.base + QMP_OUR_CHANNEL, QMP_DOWN);
++		w32(aoss.base + QMP_OUR_LINK, QMP_DOWN);
++		ring(RING_AOP);
++		return false;
++	}
++	printf("SWEET MPSS: %u: THE MAILBOX TO THE ALWAYS-ON PROCESSOR IS OPEN\n", step);
++	our_box = box;
++	return true;
++}
++
++static bool
++mailbox_send(const char *text)
++{
++	uint32_t words[QMP_MESSAGE / 4] = { 0 };
++
++	if (our_box == 0 && !mailbox_open()) {
++		return false;
++	}
++	strlcpy((char *)words, text, sizeof(words));
++	if (r32(aoss.base + our_box) != 0) {
++		printf("SWEET MPSS: %u: our mailbox still holds %u bytes: not sent\n", step, r32(aoss.base + our_box));
++		return false;
++	}
++	for (unsigned i = 0; i < QMP_MESSAGE / 4; i++) {
++		w32(aoss.base + our_box + 4 + 4 * i, words[i]);
++	}
++	w32(aoss.base + our_box, QMP_MESSAGE);
++	(void)r32(aoss.base + our_box);
++	ring(RING_AOP);
++	if (!mailbox_wait(our_box, 0, 1000)) {
++		printf("SWEET MPSS: %u: THE ALWAYS-ON PROCESSOR DOES NOT TAKE \"%s\"; taken back\n", step, text);
++		w32(aoss.base + our_box, 0);
++		return false;
++	}
++	printf("SWEET MPSS: %u: the always-on processor has taken \"%s\"\n", step, text);
++	return true;
++}
++
++/* ---- the rails: cx.lvl and mss.lvl at 385 while the modem boots (sweet_rpmh.c) --------------------- */
++
++static bool rails_asked;
++
++static bool
++rails(uint32_t level)
++{
++	static const char *const names[2] = { "cx.lvl", "mss.lvl" };
++	int error = sweet_rpmh_arc_vote(names, 2, level);
++
++	printf("SWEET MPSS: %u: RPMh asked for cx.lvl and mss.lvl at level %u: %s (%d)\n", step, level,
++	    error == 0 ? "done" : "FAILED", error);
++	return error == 0;
++}
++
++/* ---- the firmware, from /fw/image on the root ------------------------------------------------------ */
++
++#define MPSS_MEMORY             0x8e000000u     /* dt: modem_region, memory-region of qcom,mss@4080000 */
++#define MPSS_MEMORY_SIZE        0x09600000u
++#define MDT_HASH(flags)         (((flags) >> 24 & 7) == 2)
++#define MAX_SEGMENTS            48
++
++struct elf_segment {
++	uint32_t type, offset, vaddr, paddr, file_size, memory_size, flags, align;
++};
++
++static struct {
++	uint8_t *header;
++	uint64_t header_size;
++	struct {
++		uint32_t at, file_size, memory_size;
++		uint8_t *file;
++	} segment[MAX_SEGMENTS];
++	unsigned segments;
++	uint32_t size;
++} image;
++
++/* A file of /fw/image on the root, read whole into memory of ours. */
++static uint8_t *
++root_file(const char *name, uint64_t *size)
++{
++	char path[256];
++	vfs_context_t context = vfs_context_kernel();
++	vnode_t vnode = NULLVP;
++	struct vnode_attr attributes;
++	uint8_t *data;
++	int left = 0, error;
++
++	if (rootvnode == NULLVP) {
++		return NULL;
++	}
++	snprintf(path, sizeof(path), "/fw/image/%s", name);
++	if (vnode_lookup(path, 0, &vnode, context) != 0) {
++		return NULL;
++	}
++	VATTR_INIT(&attributes);
++	VATTR_WANTED(&attributes, va_data_size);
++	if (vnode_getattr(vnode, &attributes, context) != 0 || attributes.va_data_size == 0 ||
++	    attributes.va_data_size > MPSS_MEMORY_SIZE) {
++		vnode_put(vnode);
++		return NULL;
++	}
++	data = kalloc_data(attributes.va_data_size, Z_WAITOK);
++	if (data == NULL) {
++		vnode_put(vnode);
++		return NULL;
++	}
++	error = vn_rdwr(UIO_READ, vnode, (caddr_t)data, (int)attributes.va_data_size, 0, UIO_SYSSPACE, 0,
++	    vfs_context_ucred(context), &left, vfs_context_proc(context));
++	vnode_put(vnode);
++	if (error != 0 || left != 0) {
++		printf("SWEET MPSS: %u: %s: read error %d, %d left\n", step, path, error, left);
++		kfree_data(data, attributes.va_data_size);
++		return NULL;
++	}
++	*size = attributes.va_data_size;
++	return data;
++}
++
++static void
++image_forget(void)
++{
++	if (image.header != NULL) {
++		kfree_data(image.header, image.header_size);
++	}
++	for (unsigned s = 0; s < image.segments; s++) {
++		if (image.segment[s].file != NULL) {
++			kfree_data(image.segment[s].file, image.segment[s].file_size);
++		}
++	}
++	bzero(&image, sizeof(image));
++}
++
++static unsigned rmtfs_load(void);
++static void servreg_load(void);
++
++static bool
++step_firmware(void)
++{
++	struct elf_segment segment;
++	uint8_t *header;
++	uint64_t size = 0, files = 0;
++	uint32_t count, hashes = 0, lowest = ~0u, highest = 0;
++
++	announce("find modem.mdt and its segments in /fw/image on the root, and check the image against its own header");
++	image_forget();
++	header = root_file("modem.mdt", &size);
++	if (header == NULL) {
++		printf("SWEET MPSS: %u: no /fw/image/modem.mdt on the root (run iOS/scripts/add-modem-fw.sh)\n", step);
++		return false;
++	}
++	image.header = header;
++	image.header_size = size;
++	count = size >= 52 + 2 * 32 ? header[44] | header[45] << 8 : 0;
++	if (memcmp(header, "\177ELF\1", 5) != 0 || count < 3 || count > MAX_SEGMENTS || 52 + 32 * count > size || size > PAGE_SIZE) {
++		printf("SWEET MPSS: %u: modem.mdt is not such a header (%u segments, %llu bytes)\n", step, count, size);
++		goto fail;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		char name[16];
++
++		memcpy(&segment, header + 52 + 32 * i, sizeof(segment));
++		if (MDT_HASH(segment.flags)) {
++			hashes = segment.file_size;
++		}
++		if (segment.type != 1 || MDT_HASH(segment.flags) || segment.memory_size == 0) {
++			continue;
++		}
++		if (segment.paddr < MPSS_MEMORY || segment.file_size > segment.memory_size ||
++		    (uint64_t)segment.paddr + segment.memory_size > (uint64_t)MPSS_MEMORY + MPSS_MEMORY_SIZE) {
++			printf("SWEET MPSS: %u: segment %u (%#x, %#x bytes) is not within the modem's memory\n", step, i, segment.paddr,
++			    segment.memory_size);
++			goto fail;
++		}
++		image.segment[image.segments].at = segment.paddr - MPSS_MEMORY;
++		image.segment[image.segments].file_size = segment.file_size;
++		image.segment[image.segments].memory_size = segment.memory_size;
++		image.segment[image.segments].file = NULL;
++		if (segment.file_size != 0) {
++			uint64_t file_size = 0;
++
++			snprintf(name, sizeof(name), "modem.b%02u", i);
++			image.segment[image.segments].file = root_file(name, &file_size);
++			if (image.segment[image.segments].file == NULL) {
++				printf("SWEET MPSS: %u: no /fw/image/%s on the root\n", step, name);
++				goto fail;
++			}
++			if (file_size != segment.file_size) {
++				printf("SWEET MPSS: %u: /fw/image/%s has %llu bytes, the header says %u\n", step, name, file_size,
++				    segment.file_size);
++				image.segments++;               /* (for its file to be given back) */
++				goto fail;
++			}
++			files += file_size;
++		}
++		lowest = segment.paddr < lowest ? segment.paddr : lowest;
++		highest = segment.paddr + segment.memory_size > highest ? segment.paddr + segment.memory_size : highest;
++		image.segments++;
++	}
++	if (image.segments == 0 || lowest != MPSS_MEMORY || 52 + 32 * count + (uint64_t)hashes != size) {
++		printf("SWEET MPSS: %u: not what TrustZone takes: %u segments, lowest %#x; header %llu, headers %u, hashes %u\n", step,
++		    image.segments, lowest, size, 52 + 32 * count, hashes);
++		goto fail;
++	}
++	image.size = ((highest + 0xfff) & ~0xfffu) - MPSS_MEMORY;
++	printf("SWEET MPSS: %u: the image is whole: header %llu bytes (%u of hashes), %u segments, %llu bytes of files, %#x bytes of "
++	    "the modem's %#x from %#x\n", step, size, hashes, image.segments, files, image.size, MPSS_MEMORY_SIZE, MPSS_MEMORY);
++	announce("read the modem's file systems from the phone's storage into memory of ours");
++	{
++		unsigned loaded = rmtfs_load();
++
++		printf("SWEET MPSS: %u: %u of the modem's 4 file systems are here%s\n", step, loaded, loaded == 4 ? "" :
++		    ": WITHOUT THEM ALL THE MODEM OFFERS LITTLE");
++		servreg_load();
++	}
++	return true;
++fail:
++	image_forget();
++	return false;
++}
++
++/* ---- TrustZone takes the header; stopping a modem a kernel before this one left running ------------ */
++
++static bool dsp_started;
++static bool stopped_by_its_word;
++static void link_stop(void);
++static bool rmtfs_share(bool in);
++
++static bool
++dsp_shutdown(const char *why)
++{
++	uint64_t answer = ~0ull;
++	int32_t result;
++
++	printf("SWEET MPSS: %u: %s: the modem is asked to stop, then TrustZone to shut it down\n", step, why);
++	link_stop();
++	stopped_by_its_word = dsp_ask_to_stop(5000);
++	result = scm(SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, pas_mpss, 0, 0, 0, &answer);
++	if (result != 0 || answer != 0) {
++		printf("SWEET MPSS: %u: TRUSTZONE DOES NOT SHUT THE MODEM DOWN (ret %d, answer %#llx)\n", step, result, answer);
++		return false;
++	}
++	printf("SWEET MPSS: %u: THE MODEM IS SHUT DOWN\n", step);
++	rmtfs_share(false);
++	dsp_started = false;
++	mailbox_send("{class: image, res: load_state, name: modem, val: off}");
++	if (rails_asked) {
++		rails(0);
++		rails_asked = false;
++	}
++	return true;
++}
++
++static bool
++step_header(void)
++{
++	struct smp2p words;
++	vm_offset_t page = 0;
++	uint64_t answer = ~0ull;
++	int32_t result;
++
++	if (image.segments == 0) {
++		return false;
++	}
++	if (dsp_words(&words)) {
++		show_words("the modem has left words in the shared memory", &words);
++		announce("shut down a modem a kernel before this one may have left running");
++		if (!dsp_shutdown("it may be running")) {
++			return false;
++		}
++		if (!stopped_by_its_word && !option("modem_again")) {
++			printf("SWEET MPSS: %u: NOT STARTED AGAIN: shut down without acknowledging a stop (modem_again=1 to try)\n", step);
++			return false;
++		}
++	} else {
++		printf("SWEET MPSS: %u: the modem has not run since the phone was started\n", step);
++	}
++	announce("hand the image's header to TrustZone to check its signature (PAS_INIT_IMAGE), in a page of ours");
++	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET MPSS: %u: no memory\n", step);
++		return false;
++	}
++	memcpy((void *)page, image.header, image.header_size);
++	for (vm_offset_t line = page; line < page + PAGE_SIZE; line += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (line) : "memory");
++	}
++	settle();
++	result = scm(SCM_PAS_INIT_IMAGE, SCM_VAL_RW, pas_mpss, kvtophys(page), 0, 0, &answer);
++	kmem_free(kernel_map, page, PAGE_SIZE);
++	if (result != 0 || answer != 0) {
++		printf("SWEET MPSS: %u: TRUSTZONE DOES NOT TAKE THE HEADER (ret %d, answer %#llx)\n", step, result, answer);
++		return false;
++	}
++	printf("SWEET MPSS: %u: TRUSTZONE ACCEPTS THE MODEM'S SIGNATURE\n", step);
++	announce("tell TrustZone where the image will be: the whole of the modem's memory (PAS_MEM_SETUP)");
++	result = scm(SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, pas_mpss, MPSS_MEMORY, MPSS_MEMORY_SIZE, 0, &answer);
++	if (result != 0 || answer != 0) {
++		printf("SWEET MPSS: %u: TRUSTZONE DOES NOT TAKE THE PLACE (ret %d, answer %#llx)\n", step, result, answer);
++		return false;
++	}
++	printf("SWEET MPSS: %u: TrustZone takes the place: %#x bytes at %#x\n", step, MPSS_MEMORY_SIZE, MPSS_MEMORY);
++	return true;
++}
++
++/* ---- the image, written into the modem's memory ---------------------------------------------------- */
++
++static bool image_written;
++
++static uint64_t
++segment_word(unsigned s, uint32_t at)
++{
++	uint64_t word = 0;
++
++	for (unsigned b = 0; b < 8 && at + b < image.segment[s].file_size; b++) {
++		word |= (uint64_t)image.segment[s].file[at + b] << (8 * b);
++	}
++	return word;
++}
++
++static void
++segment_put(volatile uint8_t *mem, unsigned s)
++{
++	uint32_t at = image.segment[s].at, size = image.segment[s].memory_size, i = 0;
++
++	if ((at & 7) == 0) {
++		volatile uint64_t *to = (volatile uint64_t *)(mem + at);
++
++		for (; i + 8 <= size; i += 8) {
++			to[i / 8] = segment_word(s, i);
++		}
++	}
++	for (; i < size; i++) {
++		mem[at + i] = i < image.segment[s].file_size ? image.segment[s].file[i] : 0;
++	}
++}
++
++static uint64_t
++segment_check(volatile uint8_t *mem, unsigned s)
++{
++	uint32_t at = image.segment[s].at, size = image.segment[s].memory_size, i = 0;
++	uint64_t wrong = 0;
++
++	if ((at & 7) == 0) {
++		volatile uint64_t *from = (volatile uint64_t *)(mem + at);
++
++		for (; i + 8 <= size; i += 8) {
++			wrong += from[i / 8] != segment_word(s, i);
++		}
++	}
++	for (; i < size; i++) {
++		wrong += mem[at + i] != (i < image.segment[s].file_size ? image.segment[s].file[i] : 0);
++	}
++	return wrong;
++}
++
++static bool
++step_image(void)
++{
++	volatile uint8_t *mem;
++	uint64_t written = 0, cleared = 0, wrong = 0, began;
++
++	if (image.segments == 0) {
++		return false;
++	}
++	announce("put the image's segments into the modem's memory (150 MB, nobody's until TrustZone starts the modem), and read back");
++	mem = (volatile uint8_t *)ml_io_map_unmappable(MPSS_MEMORY, image.size, VM_WIMG_WCOMB);
++	if (mem == NULL) {
++		printf("SWEET MPSS: %u: the modem's memory cannot be mapped (%#x bytes)\n", step, image.size);
++		return false;
++	}
++	began = now_us();
++	for (unsigned s = 0; s < image.segments; s++) {
++		segment_put(mem, s);
++		written += image.segment[s].file_size;
++		cleared += image.segment[s].memory_size - image.segment[s].file_size;
++	}
++	settle();
++	for (unsigned s = 0; s < image.segments; s++) {
++		wrong += segment_check(mem, s);
++	}
++	printf("SWEET MPSS: %u: %u segments, %llu bytes written and %llu cleared in %llu ms; read back, %llu differ\n", step,
++	    image.segments, written, cleared, (now_us() - began) / 1000, wrong);
++	settle();
++	ml_io_unmap((vm_offset_t)mem, image.size);
++	image_written = wrong == 0;
++	image_forget();                         /* (it is in the modem's memory now) */
++	return image_written;
++}
++
++/* ---- our SMP2P item (428) --------------------------------------------------------------------------- */
++
++static struct block smem_lock = { "smem-lock", 0x01f43000, 0x1000, 0 };   /* hwlock@1f40000, lock 3 */
++#define LOCK_OWNER              0x000
++#define LOCK_US                 1u
++
++static bool
++our_item_make(uint32_t partition, uint32_t item, uint32_t bytes)
++{
++	struct smem_partition header;
++	struct smem_entry entry;
++	const uint32_t item_size = (bytes + 7) & ~7u, need_bytes = sizeof(entry) + item_size;
++	uint32_t owner = ~0u, at;
++	bool made = false;
++
++	if (!need(&smem_lock)) {
++		return false;
++	}
++	for (uint32_t ms = 0; ms <= 1000; ms++) {
++		w32(smem_lock.base + LOCK_OWNER, LOCK_US);
++		owner = r32(smem_lock.base + LOCK_OWNER);
++		if (owner == LOCK_US) {
++			break;
++		}
++		sleep_ms(1);
++	}
++	if (owner != LOCK_US) {
++		printf("SWEET MPSS: %u: the shared memory's lock is held by %u for a second: nothing written\n", step, owner);
++		return false;
++	}
++	if (!smem_peek(partition, &header, sizeof(header)) || header.free_uncached > header.free_cached ||
++	    header.free_cached > header.size) {
++		printf("SWEET MPSS: %u: the partition's marks make no sense: nothing written\n", step);
++		goto out;
++	}
++	for (at = sizeof(header); at < header.free_uncached;) {
++		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.item == item ||
++		    entry.size > header.size) {
++			break;
++		}
++		at += sizeof(entry) + entry.padding_header + entry.size;
++	}
++	if (at != header.free_uncached) {
++		printf("SWEET MPSS: %u: the entries do not end at the mark, or the item has appeared: nothing written\n", step);
++		goto out;
++	}
++	if (at + need_bytes > header.free_cached) {
++		printf("SWEET MPSS: %u: no room: %u wanted, %u free\n", step, need_bytes, header.free_cached - at);
++		goto out;
++	}
++	smem_poke(partition + at, SMEM_CANARY | item << 16);
++	smem_poke(partition + at + 4, item_size);
++	smem_poke(partition + at + 8, item_size - bytes);
++	for (uint32_t z = 0; z < item_size; z += 4) {
++		smem_poke(partition + at + (uint32_t)sizeof(entry) + z, 0);
++	}
++	smem_poke(partition + at + 12, 0);
++	settle();
++	smem_poke(partition + SMEM_PARTITION_FREE_UNCACHED, at + need_bytes);
++	settle();
++	made = true;
++out:
++	w32(smem_lock.base + LOCK_OWNER, 0);
++	return made;
++}
++
++static void glink_reset(void);
++
++static bool
++step_our_item(void)
++{
++	struct smem_partition header;
++	struct smp2p ours;
++	uint32_t cacheline = 0, size = 0, partition, name[4] = { 0 };
++
++	announce("look for our SMP2P item (428) in the partition, make it if there is none, and fill it in");
++	partition = smem_partition(SMEM_US, SMEM_MPSS, &cacheline, &size);
++	if (partition == 0 || !smem_peek(partition, &header, sizeof(header))) {
++		printf("SWEET MPSS: %u: there is no such partition\n", step);
++		return false;
++	}
++	our_item = our_item_find();
++	if (our_item != 0) {
++		printf("SWEET MPSS: %u: item %u is there, at %#lx (a kernel before this one made it)\n", step, ITEM_SMP2P_OURS,
++		    (unsigned long)(SMEM_PA + our_item));
++	} else {
++		if (!our_item_make(partition, ITEM_SMP2P_OURS, sizeof(struct smp2p))) {
++			return false;
++		}
++		our_item = our_item_find();
++		if (our_item == 0) {
++			printf("SWEET MPSS: %u: THE ITEM IS NOT FOUND where it was just made\n", step);
++			return false;
++		}
++		printf("SWEET MPSS: %u: item %u made, at %#lx\n", step, ITEM_SMP2P_OURS, (unsigned long)(SMEM_PA + our_item));
++	}
++	/*
++	 * zeroes; from processor 0 to 1, one entry "master-kernel" (the force-stop), feature bit 0; the version
++	 * last. No "ipa" entry: there is no IPA driver here, and milestone 1 (the Wi-Fi) does not need the IPA.
++	 */
++	for (uint32_t at = 0; at < sizeof(ours); at += 4) {
++		smem_poke(our_item + at, 0);
++	}
++	settle();
++	smem_poke(our_item, SMP2P_MAGIC);
++	smem_poke(our_item + SMP2P_AT_PROCESSORS, SMEM_US | SMEM_MPSS << 16);
++	strlcpy((char *)name, OUR_ENTRY_STOP, sizeof(name));
++	for (uint32_t word = 0; word < 4; word++) {
++		smem_poke(our_item + SMP2P_AT_NAME(0) + 4 * word, name[word]);
++	}
++	smem_poke(our_item + SMP2P_AT_COUNTS, 16 | 1u << 16);
++	smem_poke(our_item + SMP2P_AT_VERSION, SMP2P_RESTART_ACKS << 8);
++	settle();
++	smem_poke(our_item + SMP2P_AT_VERSION, SMP2P_RESTART_ACKS << 8 | SMP2P_VERSION);
++	settle();
++	smp2p_agreed = smp2p_restart_acks = smp2p_restart_acked = false;
++	ring(RING_SMP2P);
++	if (!smem_peek(our_item, &ours, sizeof(ours)) || ours.magic != SMP2P_MAGIC || smp2p_entry(&ours, OUR_ENTRY_STOP) < 0) {
++		printf("SWEET MPSS: %u: OUR ITEM DOES NOT READ BACK AS WRITTEN\n", step);
++		return false;
++	}
++	show_words("our item reads back", &ours);
++	/*
++	 * GLINK's shared memory, which the application processor allocates (modem.md; Linux's
++	 * qcom_glink_smem_register): item 478, the 32-byte descriptor holding the four read/write marks,
++	 * and item 479, our 16 KB transmit queue (the modem's receive). Item 480, the modem's own queue,
++	 * the modem makes. Made here if a kernel before this one has not; left as they are if it has (the
++	 * marks are reset in glink_reset below). Without them the modem's GLINK finds no transport.
++	 */
++	{
++		uint32_t size = 0;
++
++		if (smem_item(ITEM_GLINK_DESCRIPTOR, &size) == 0 && !our_item_make(partition, ITEM_GLINK_DESCRIPTOR, 32)) {
++			printf("SWEET MPSS: %u: GLINK's descriptor (item %u) could not be made\n", step, ITEM_GLINK_DESCRIPTOR);
++			return false;
++		}
++		if (smem_item(ITEM_GLINK_OUR_QUEUE, &size) == 0 && !our_item_make(partition, ITEM_GLINK_OUR_QUEUE, GLINK_OUR_QUEUE_SIZE)) {
++			printf("SWEET MPSS: %u: GLINK's queue (item %u) could not be made\n", step, ITEM_GLINK_OUR_QUEUE);
++			return false;
++		}
++		printf("SWEET MPSS: %u: GLINK's descriptor (478) and our queue (479, %u bytes) are in place\n", step,
++		    GLINK_OUR_QUEUE_SIZE);
++	}
++	glink_reset();
++	return true;
++}
++
++/* ---- start the modem (PAS_AUTH_AND_RESET), and watch for its first words ---------------------------- */
++
++static bool
++step_start(void)
++{
++	struct smp2p words, last;
++	uint64_t answer = ~0ull, started, now, ready_at = 0, limit;
++	uint32_t state = 0, changes = 0, wait_seconds = 10;
++	int32_t result;
++	bool have, spoke = false, handed_over = false;
++
++	if (!image_written) {
++		printf("SWEET MPSS: %u: the image is not in place\n", step);
++		return false;
++	}
++	PE_parse_boot_argn("modem_wait", &wait_seconds, sizeof(wait_seconds));
++	bzero(&last, sizeof(last));
++	have = dsp_words(&last);
++	announce("ask RPMh for the modem's rails, tell the always-on processor its image is loaded, and ask TrustZone to "
++	    "authenticate the image and let the modem out of reset (PAS_AUTH_AND_RESET)");
++	if (option("modem_share_off")) {
++		printf("SWEET MPSS: %u: the buffer is not shared with the modem (modem_share_off)\n", step);
++	} else if (!rmtfs_share(true)) {
++		printf("SWEET MPSS: %u: THE MODEM GETS NO BUFFER FOR ITS FILES: started all the same\n", step);
++	}
++	if (!rails(385)) {
++		return false;
++	}
++	rails_asked = true;
++	if (!mailbox_send("{class: image, res: load_state, name: modem, val: on}")) {
++		rails(0);
++		rails_asked = false;
++		return false;
++	}
++	result = scm(SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, pas_mpss, 0, 0, 0, &answer);
++	started = now_us();
++	image_written = false;
++	if (result != 0 || answer != 0) {
++		printf("SWEET MPSS: %u: TRUSTZONE DOES NOT START THE MODEM (ret %d, answer %#llx)\n", step, result, answer);
++		mailbox_send("{class: image, res: load_state, name: modem, val: off}");
++		rails(0);
++		rails_asked = false;
++		return false;
++	}
++	dsp_started = true;
++	printf("SWEET MPSS: %u: TRUSTZONE HAS STARTED THE MODEM; watching for %u s\n", step, wait_seconds);
++	limit = started + wait_seconds * 1000000ull;
++	for (;;) {
++		now = now_us();
++		if (now >= limit || !dsp_started) {
++			break;
++		}
++		if (dsp_words(&words) && (!have || memcmp(&words, &last, sizeof(words)) != 0)) {
++			char when[64];
++
++			snprintf(when, sizeof(when), "+%llu.%03llu ms: the modem's item %s", (now - started) / 1000,
++			    (now - started) % 1000, have ? "changes" : "APPEARS");
++			if (changes++ < 40) {
++				show_words(when, &words);
++			}
++			last = words;
++			have = spoke = true;
++			dsp_listen(&words);
++			state = dsp_state(&words);
++			if ((state & DSP_READY) && ready_at == 0) {
++				ready_at = now;
++				limit = now + 3000000ull;
++				printf("SWEET MPSS: %u: THE MODEM SAYS IT IS UP (%#x), %llu.%03llu ms after the start\n", step, state,
++				    (now - started) / 1000, (now - started) % 1000);
++			}
++			if ((state & DSP_HANDOVER) && !handed_over) {
++				handed_over = true;
++				printf("SWEET MPSS: %u: the modem has asked for its own power (bit 2): ours is given back\n", step);
++				if (rails_asked) {
++					rails(0);
++					rails_asked = false;
++				}
++			}
++			if (state & DSP_FATAL) {
++				printf("SWEET MPSS: %u: THE MODEM SAYS IT HAS GIVEN UP\n", step);
++				show_crash_reason();
++				break;
++			}
++		}
++		sleep_us(200);
++	}
++	printf("SWEET MPSS: %u: the watch is over after %llu ms\n", step, (now_us() - started) / 1000);
++	show_partition();
++	if (state & DSP_FATAL) {
++		return false;
++	}
++	if (ready_at == 0) {
++		printf("SWEET MPSS: %u: %s\n", step, spoke ? "THE MODEM RUNS BUT HAS NOT SAID UP" : "NOT A WORD FROM THE MODEM");
++		show_crash_reason();
++	}
++	return ready_at != 0;
++}
++
++/* ---- GLINK (items 478 to 480 of our partition with the modem) -------------------------------------- */
++
++#define GLINK_OUR_TAIL          0
++#define GLINK_OUR_HEAD          4
++#define GLINK_THEIR_TAIL        8
++#define GLINK_THEIR_HEAD        12
++#define GLINK_RESERVE           16
++
++enum {
++	GLINK_VERSION = 0, GLINK_VERSION_ACK = 1, GLINK_OPEN = 2, GLINK_CLOSE = 3, GLINK_OPEN_ACK = 4, GLINK_INTENT = 5,
++	GLINK_DONE = 6, GLINK_INTENT_REQUEST = 7, GLINK_INTENT_REQUEST_ACK = 8, GLINK_DATA = 9, GLINK_CLOSE_ACK = 11,
++	GLINK_DATA_MORE = 12, GLINK_READ_NOTIFY = 13, GLINK_DONE_REUSE = 14, GLINK_SIGNALS = 15,
++};
++#define GLINK_VERSION_1         1
++#define GLINK_INTENT_REUSE      1u
++
++struct glink_message {
++	uint16_t command, param1;
++	uint32_t param2;
++};
++struct glink_packet {
++	struct glink_packet *next;
++	uint32_t length;
++	uint8_t data[];
++};
++
++/* The one channel we answer when the modem opens it: IPCRTR, which carries QRTR. */
++enum { CHANNEL_QRTR, CHANNELS };
++
++struct glink_channel {
++	const char *name;
++	uint32_t ours;
++	struct {
++		uint32_t size, count;
++	} intents[3];
++	uint32_t theirs;                        /* the modem's number for it; 0: not opened */
++	bool asked, acknowledged, open;
++	bool request_answered, request_granted;
++	struct {
++		uint32_t id, size;
++		bool there, in_use;
++	} their_intents[64];
++	struct {
++		uint32_t size, fill;
++		uint8_t *data;
++	} our_intents[24];
++	uint32_t our_intent_count;
++	struct glink_packet *first, *last;
++};
++
++static LCK_GRP_DECLARE(mpss_grp, "sweet-mpss");
++static LCK_MTX_DECLARE(glink_lock, &mpss_grp);
++static struct {
++	uint32_t descriptor, ours, ours_size, theirs, theirs_size;
++	bool up, broken;
++	uint32_t features;
++	bool agreed;
++	struct glink_channel channel[CHANNELS];
++	uint32_t said, heard, trace;
++	char others[4][33];
++} glink = {
++	.channel = {
++		[CHANNEL_QRTR] = { .name = "IPCRTR", .ours = 1, .intents = { { 0x800, 5 }, { 0x2000, 3 }, { 0x4400, 2 } } },
++	},
++};
++
++static struct glink_channel *
++glink_theirs(uint32_t theirs)
++{
++	for (unsigned c = 0; c < CHANNELS; c++) {
++		if (glink.channel[c].theirs != 0 && glink.channel[c].theirs == theirs) {
++			return &glink.channel[c];
++		}
++	}
++	return NULL;
++}
++
++static bool
++glink_find(void)
++{
++	uint32_t size = 0;
++
++	glink.descriptor = smem_item(ITEM_GLINK_DESCRIPTOR, &size);
++	if (glink.descriptor == 0 || size != 32) {
++		return false;
++	}
++	glink.ours = smem_item(ITEM_GLINK_OUR_QUEUE, &glink.ours_size);
++	glink.theirs = smem_item(ITEM_GLINK_THEIR_QUEUE, &glink.theirs_size);
++	return glink.ours != 0 && glink.theirs != 0 && glink.ours_size >= 1024 && glink.theirs_size >= 1024 &&
++	       !(glink.ours_size & 7) && !(glink.theirs_size & 7);
++}
++
++static void
++glink_reset(void)
++{
++	uint32_t size = 0, descriptor = smem_item(ITEM_GLINK_DESCRIPTOR, &size);
++
++	if (descriptor == 0 || size != 32) {
++		printf("SWEET MPSS: %u: GLINK's descriptor (item %u) is not there yet\n", step, ITEM_GLINK_DESCRIPTOR);
++		return;
++	}
++	printf("SWEET MPSS: %u: GLINK's descriptor at %#lx: our queue %#x/%#x, the modem's %#x/%#x\n", step,
++	    (unsigned long)(SMEM_PA + descriptor), smem_word(descriptor + GLINK_OUR_TAIL), smem_word(descriptor + GLINK_OUR_HEAD),
++	    smem_word(descriptor + GLINK_THEIR_TAIL), smem_word(descriptor + GLINK_THEIR_HEAD));
++	if (smem_word(descriptor + GLINK_OUR_HEAD) != 0 || smem_word(descriptor + GLINK_THEIR_TAIL) != 0) {
++		smem_poke(descriptor + GLINK_OUR_HEAD, 0);
++		smem_poke(descriptor + GLINK_THEIR_TAIL, 0);
++		settle();
++	}
++}
++
++static uint32_t
++glink_waiting(void)
++{
++	uint32_t head = smem_word(glink.descriptor + GLINK_THEIR_HEAD), tail = smem_word(glink.descriptor + GLINK_THEIR_TAIL);
++
++	if (head >= glink.theirs_size || tail >= glink.theirs_size) {
++		return 0;
++	}
++	return head >= tail ? head - tail : glink.theirs_size - tail + head;
++}
++
++static void
++glink_peek(void *to, uint32_t offset, uint32_t count)
++{
++	uint32_t at = (smem_word(glink.descriptor + GLINK_THEIR_TAIL) + offset) % glink.theirs_size;
++
++	for (uint32_t i = 0; i < count; i++) {
++		((uint8_t *)to)[i] = smem[glink.theirs + (at + i) % glink.theirs_size];
++	}
++}
++
++static void
++glink_advance(uint32_t count)
++{
++	smem_poke(glink.descriptor + GLINK_THEIR_TAIL, (smem_word(glink.descriptor + GLINK_THEIR_TAIL) + count) % glink.theirs_size);
++}
++
++static uint32_t
++glink_room(void)
++{
++	uint32_t head = smem_word(glink.descriptor + GLINK_OUR_HEAD), tail = smem_word(glink.descriptor + GLINK_OUR_TAIL), room;
++
++	if (head >= glink.ours_size || tail >= glink.ours_size) {
++		return 0;
++	}
++	room = tail <= head ? glink.ours_size - head + tail : tail - head;
++	return room < GLINK_RESERVE ? 0 : room - GLINK_RESERVE;
++}
++
++static bool
++glink_put(const void *first, uint32_t first_length, const void *second, uint32_t second_length)
++{
++	volatile uint8_t *queue = (volatile uint8_t *)(uintptr_t)smem + glink.ours;
++	uint32_t head = smem_word(glink.descriptor + GLINK_OUR_HEAD), length = first_length + second_length;
++	uint32_t padded = (length + 7) & ~7u;
++
++	if (!glink.up || glink_room() < padded) {
++		return false;
++	}
++	for (uint32_t i = 0; i < padded; i++) {
++		queue[(head + i) % glink.ours_size] = i < first_length ? ((const uint8_t *)first)[i] :
++		    i < length ? ((const uint8_t *)second)[i - first_length] : 0;
++	}
++	settle();
++	smem_poke(glink.descriptor + GLINK_OUR_HEAD, (head + padded) % glink.ours_size);
++	settle();
++	ring(RING_GLINK);
++	glink.said++;
++	return true;
++}
++
++static const char *
++glink_name(unsigned command)
++{
++	static const char *const names[] = {
++		"version", "version-ack", "open", "close", "open-ack", "intent", "done", "intent-request", "intent-request-ack",
++		"data", "10", "close-ack", "data-more", "read-notify", "done-reuse", "signals"
++	};
++
++	return command < sizeof(names) / sizeof(names[0]) ? names[command] : "?";
++}
++
++static void
++glink_say(unsigned command, uint32_t param1, uint32_t param2, const void *more, uint32_t more_length)
++{
++	struct glink_message message = { .command = (uint16_t)command, .param1 = (uint16_t)param1, .param2 = param2 };
++	bool sent = glink_put(&message, sizeof(message), more, more_length);
++
++	if (glink.trace > 0 || !sent) {
++		glink.trace -= glink.trace > 0;
++		printf("SWEET MPSS: glink: > %s %u %#x%s\n", glink_name(command), param1, param2, sent ? "" : ": NO ROOM, not sent");
++	}
++}
++
++static bool
++glink_offer(struct glink_channel *channel, uint32_t size)
++{
++	uint32_t words[2] = { size, channel->our_intent_count + 1 }, i = channel->our_intent_count;
++
++	if (i >= sizeof(channel->our_intents) / sizeof(channel->our_intents[0]) || size == 0 || size > 0x10000) {
++		return false;
++	}
++	if (channel->our_intents[i].data == NULL || channel->our_intents[i].size != size) {
++		channel->our_intents[i].data = kalloc_data(size, Z_WAITOK | Z_ZERO);
++	}
++	if (channel->our_intents[i].data == NULL) {
++		return false;
++	}
++	channel->our_intents[i].size = size;
++	channel->our_intents[i].fill = 0;
++	channel->our_intent_count++;
++	glink_say(GLINK_INTENT, channel->ours, 1, words, sizeof(words));
++	return true;
++}
++
++/* Everything the modem has put into its queue, taken out and acted on (Linux's qcom_glink_native_rx()). */
++static void
++glink_pump(void)
++{
++	struct glink_message message;
++	struct glink_channel *channel;
++	uint32_t words[4];
++	char name[33];
++
++	while (glink.up && !glink.broken) {
++		uint32_t waiting = glink_waiting(), length = sizeof(message);
++
++		if (waiting < sizeof(message)) {
++			return;
++		}
++		glink_peek(&message, 0, sizeof(message));
++		if (message.command == GLINK_OPEN) {
++			length += message.param2;
++		} else if (message.command == GLINK_INTENT) {
++			length += 8 * message.param2;
++		} else if (message.command == GLINK_DATA || message.command == GLINK_DATA_MORE) {
++			if (waiting < 16) {
++				return;
++			}
++			glink_peek(words, 8, 8);
++			length = 16 + words[0];
++		}
++		length = (length + 7) & ~7u;
++		if (length > glink.theirs_size - 8) {
++			printf("SWEET MPSS: glink: A MESSAGE OF %u BYTES (%s): not believed\n", length, glink_name(message.command));
++			glink.broken = true;
++			return;
++		}
++		if (waiting < length) {
++			return;
++		}
++		glink.heard++;
++		if (glink.trace > 0 && message.command != GLINK_DATA && message.command != GLINK_DATA_MORE &&
++		    message.command != GLINK_INTENT && message.command != GLINK_DONE_REUSE) {
++			glink.trace--;
++			printf("SWEET MPSS: glink: < %s %u %#x\n", glink_name(message.command), message.param1, message.param2);
++		}
++		switch (message.command) {
++		case GLINK_VERSION:
++			if (message.param1 == GLINK_VERSION_1) {
++				glink.features &= message.param2;
++			}
++			glink_advance(length);
++			glink_say(GLINK_VERSION_ACK, GLINK_VERSION_1, glink.features, NULL, 0);
++			break;
++		case GLINK_VERSION_ACK:
++			glink_advance(length);
++			if (message.param1 == GLINK_VERSION_1 && message.param2 == glink.features) {
++				glink.agreed = true;
++			} else if (message.param1 != 0) {
++				glink.features &= message.param2;
++				glink_say(GLINK_VERSION, GLINK_VERSION_1, glink.features, NULL, 0);
++			}
++			break;
++		case GLINK_OPEN:
++			bzero(name, sizeof(name));
++			glink_peek(name, sizeof(message), message.param2 < sizeof(name) - 1 ? message.param2 : sizeof(name) - 1);
++			glink_advance(length);
++			channel = NULL;
++			for (unsigned c = 0; c < CHANNELS; c++) {
++				if (strcmp(name, glink.channel[c].name) == 0) {
++					channel = &glink.channel[c];
++				}
++			}
++			if (channel == NULL) {
++				printf("SWEET MPSS: glink: the modem opens \"%s\" (its channel %u): nobody here speaks it\n", name,
++				    message.param1);
++				for (unsigned i = 0; i < 4; i++) {
++					if (glink.others[i][0] == 0) {
++						strlcpy(glink.others[i], name, sizeof(glink.others[i]));
++						break;
++					}
++				}
++				break;
++			}
++			printf("SWEET MPSS: glink: the modem opens \"%s\" (its channel %u): acknowledged, opened from our side as %u\n",
++			    name, message.param1, channel->ours);
++			channel->theirs = message.param1;
++			glink_say(GLINK_OPEN_ACK, channel->theirs, 0, NULL, 0);
++			if (!channel->asked) {
++				uint32_t size = (uint32_t)strlen(channel->name) + 1;
++
++				bzero(name, sizeof(name));
++				strlcpy(name, channel->name, sizeof(name));
++				glink_say(GLINK_OPEN, channel->ours, size, name, (size + 7) & ~7u);
++				channel->asked = true;
++			}
++			break;
++		case GLINK_OPEN_ACK:
++			glink_advance(length);
++			for (unsigned c = 0; c < CHANNELS; c++) {
++				if (message.param1 == glink.channel[c].ours) {
++					glink.channel[c].acknowledged = true;
++				}
++			}
++			break;
++		case GLINK_INTENT:
++			channel = glink_theirs(message.param1);
++			for (uint32_t i = 0; channel != NULL && i < message.param2; i++) {
++				glink_peek(words, 8 + 8 * i, 8);
++				for (unsigned n = 0; n < sizeof(channel->their_intents) / sizeof(channel->their_intents[0]); n++) {
++					if (!channel->their_intents[n].there || channel->their_intents[n].id == words[1]) {
++						channel->their_intents[n].there = true;
++						channel->their_intents[n].in_use = false;
++						channel->their_intents[n].size = words[0];
++						channel->their_intents[n].id = words[1];
++						break;
++					}
++				}
++			}
++			glink_advance(length);
++			break;
++		case GLINK_DONE:
++		case GLINK_DONE_REUSE:
++			channel = glink_theirs(message.param1);
++			for (unsigned n = 0; channel != NULL && n < sizeof(channel->their_intents) / sizeof(channel->their_intents[0]); n++) {
++				if (channel->their_intents[n].there && channel->their_intents[n].id == message.param2) {
++					channel->their_intents[n].in_use = false;
++					channel->their_intents[n].there = message.command == GLINK_DONE_REUSE;
++				}
++			}
++			glink_advance(length);
++			break;
++		case GLINK_INTENT_REQUEST:
++			glink_advance(length);
++			if ((channel = glink_theirs(message.param1)) != NULL) {
++				bool granted = glink_offer(channel, message.param2);
++
++				glink_say(GLINK_INTENT_REQUEST_ACK, channel->ours, granted, NULL, 0);
++			}
++			break;
++		case GLINK_INTENT_REQUEST_ACK:
++			glink_advance(length);
++			for (unsigned c = 0; c < CHANNELS; c++) {
++				if (message.param1 == glink.channel[c].theirs || message.param1 == glink.channel[c].ours) {
++					glink.channel[c].request_answered = true;
++					glink.channel[c].request_granted = message.param2 != 0;
++				}
++			}
++			break;
++		case GLINK_DATA:
++		case GLINK_DATA_MORE: {
++			uint32_t intent = message.param2 - 1;
++
++			channel = glink_theirs(message.param1);
++			if (channel == NULL || intent >= channel->our_intent_count ||
++			    words[0] > channel->our_intents[intent].size - channel->our_intents[intent].fill) {
++				printf("SWEET MPSS: glink: < data of %u on channel %u intent %u: NOT OURS OR TOO MUCH\n", words[0],
++				    message.param1, message.param2);
++				glink_advance(length);
++				break;
++			}
++			glink_peek(channel->our_intents[intent].data + channel->our_intents[intent].fill, 16, words[0]);
++			channel->our_intents[intent].fill += words[0];
++			glink_advance(length);
++			if (words[1] == 0) {
++				struct glink_packet *packet = kalloc_data(sizeof(*packet) + channel->our_intents[intent].fill, Z_WAITOK);
++
++				if (packet != NULL) {
++					packet->next = NULL;
++					packet->length = channel->our_intents[intent].fill;
++					memcpy(packet->data, channel->our_intents[intent].data, packet->length);
++					if (channel->last != NULL) {
++						channel->last->next = packet;
++					} else {
++						channel->first = packet;
++					}
++					channel->last = packet;
++				}
++				channel->our_intents[intent].fill = 0;
++				glink_say(GLINK_DONE_REUSE, channel->ours, message.param2, NULL, 0);
++			}
++			break;
++		}
++		case GLINK_READ_NOTIFY:
++			glink_advance(length);
++			ring(RING_GLINK);
++			break;
++		case GLINK_CLOSE:
++			glink_advance(length);
++			glink_say(GLINK_CLOSE_ACK, message.param1, 0, NULL, 0);
++			if ((channel = glink_theirs(message.param1)) != NULL) {
++				printf("SWEET MPSS: glink: THE MODEM CLOSES \"%s\"\n", channel->name);
++				channel->open = false;
++				channel->theirs = 0;
++			}
++			break;
++		case GLINK_CLOSE_ACK:
++		case GLINK_SIGNALS:
++			glink_advance(length);
++			break;
++		default:
++			printf("SWEET MPSS: glink: A MESSAGE THIS DOES NOT KNOW (%u, %u, %#x)\n", message.command, message.param1,
++			    message.param2);
++			glink.broken = true;
++			return;
++		}
++		for (unsigned c = 0; c < CHANNELS; c++) {
++			channel = &glink.channel[c];
++			if (channel->theirs != 0 && channel->acknowledged && !channel->open) {
++				channel->open = true;
++				printf("SWEET MPSS: glink: THE CHANNEL \"%s\" IS OPEN both ways (ours %u, the modem's %u)\n", channel->name,
++				    channel->ours, channel->theirs);
++				for (unsigned i = 0; i < 3; i++) {
++					for (unsigned n = 0; n < channel->intents[i].count; n++) {
++						glink_offer(channel, channel->intents[i].size);
++					}
++				}
++			}
++		}
++	}
++}
++
++/* One whole message to the modem on a channel; waits up to five seconds for an intent of its that it fits. */
++static int
++glink_send(struct glink_channel *channel, const void *data, uint32_t length)
++{
++	struct {
++		struct glink_message message;
++		uint32_t size, left;
++	} header = { { GLINK_DATA, (uint16_t)channel->ours, 0 }, length, 0 };
++	bool asked = false, fits;
++	int found = -1;
++
++	lck_mtx_lock(&glink_lock);
++	if (glink.up && length + sizeof(header) + 8 > glink.ours_size - GLINK_RESERVE) {
++		lck_mtx_unlock(&glink_lock);
++		return EMSGSIZE;
++	}
++	for (unsigned waited = 0;; waited++) {
++		glink_pump();
++		if (!glink.up || !channel->open || glink.broken) {
++			lck_mtx_unlock(&glink_lock);
++			return ENOTCONN;
++		}
++		found = -1;
++		fits = false;
++		for (unsigned n = 0; n < sizeof(channel->their_intents) / sizeof(channel->their_intents[0]); n++) {
++			if (!channel->their_intents[n].there || channel->their_intents[n].size < length) {
++				continue;
++			}
++			fits = true;
++			if (!channel->their_intents[n].in_use &&
++			    (found < 0 || channel->their_intents[n].size < channel->their_intents[found].size)) {
++				found = (int)n;
++			}
++		}
++		if (found >= 0 && glink_room() >= ((length + sizeof(header) + 7) & ~7u)) {
++			break;
++		}
++		if (!fits && !asked) {
++			channel->request_answered = false;
++			glink_say(GLINK_INTENT_REQUEST, channel->ours, length, NULL, 0);
++			asked = true;
++		}
++		if (waited >= 5000 || (!fits && asked && channel->request_answered && !channel->request_granted)) {
++			lck_mtx_unlock(&glink_lock);
++			return found < 0 ? ENOBUFS : EAGAIN;
++		}
++		lck_mtx_unlock(&glink_lock);
++		sleep_ms(1);
++		lck_mtx_lock(&glink_lock);
++	}
++	channel->their_intents[found].in_use = true;
++	header.message.param2 = channel->their_intents[found].id;
++	glink_put(&header, sizeof(header), data, length);
++	lck_mtx_unlock(&glink_lock);
++	return 0;
++}
++
++/* ---- QRTR: the router's datagrams, and ports of ours ----------------------------------------------- */
++
++#define QRTR_MAX                8192
++#define QRTR_US                 1u
++#define QRTR_CONTROL            0xfffffffeu
++#define QRTR_FIRST_PORT         0x4000u
++enum { QRTR_DATA = 1, QRTR_HELLO = 2, QRTR_BYE = 3, QRTR_NEW_SERVER = 4, QRTR_DEL_SERVER = 5, QRTR_DEL_CLIENT = 6,
++       QRTR_RESUME_TX = 7, QRTR_NEW_LOOKUP = 10, QRTR_DEL_LOOKUP = 11 };
++
++struct qrtr_header {
++	uint32_t version, type, from_node, from_port, confirm, size, to_node, to_port;
++};
++struct qrtr_control {
++	uint32_t command;
++	uint32_t words[4];
++};
++
++typedef void (*qrtr_receive_t)(void *context, uint32_t node, uint32_t port, const void *data, uint32_t length);
++
++struct qrtr_port {
++	uint32_t number;                        /* 0: free */
++	qrtr_receive_t receive;
++	void *context;
++};
++
++static LCK_MTX_DECLARE(qrtr_lock, &mpss_grp);
++static struct qrtr_port qrtr_ports[8];
++static struct {
++	uint32_t service, instance, node, port;
++	bool there;
++} qrtr_servers[64];
++static uint32_t qrtr_peer;
++static uint32_t qrtr_next_port = QRTR_FIRST_PORT, qrtr_in, qrtr_out, qrtr_hellos, qrtr_lookups;
++static thread_t link_thread_is;
++
++/* Our servers, told of on hello and on lookup (rmtfs, tftp, the service registry). */
++static struct {
++	uint32_t service, instance, port;
++} our_servers[4];
++static uint32_t rmtfs_requests, rmtfs_reads, rmtfs_writes, rmtfs_sectors_read, rmtfs_sectors_written, rmtfs_refused;
++static uint32_t tftp_requests, tftp_served, tftp_refused, servreg_requests;
++
++static int
++qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to_port, const void *data, uint32_t length)
++{
++	uint32_t padded = (length + 3) & ~3u;
++	struct qrtr_header *packet;
++	int error;
++
++	if (length == 0 || length > QRTR_MAX) {
++		return EMSGSIZE;
++	}
++	packet = kalloc_data(sizeof(*packet) + padded, Z_WAITOK | Z_ZERO);
++	if (packet == NULL) {
++		return ENOMEM;
++	}
++	packet->version = 1;
++	packet->type = type;
++	packet->from_node = QRTR_US;
++	packet->from_port = from_port;
++	packet->size = length;
++	packet->to_node = to_node;
++	packet->to_port = to_port;
++	memcpy(packet + 1, data, length);
++	error = glink_send(&glink.channel[CHANNEL_QRTR], packet, (uint32_t)sizeof(*packet) + padded);
++	kfree_data(packet, sizeof(*packet) + padded);
++	qrtr_out += error == 0;
++	return error;
++}
++
++static struct qrtr_port *
++qrtr_open(qrtr_receive_t receive, void *context)
++{
++	struct qrtr_port *port = NULL;
++
++	lck_mtx_lock(&qrtr_lock);
++	for (unsigned p = 0; p < sizeof(qrtr_ports) / sizeof(qrtr_ports[0]) && port == NULL; p++) {
++		if (qrtr_ports[p].number == 0) {
++			port = &qrtr_ports[p];
++			bzero(port, sizeof(*port));
++			port->number = qrtr_next_port++;
++			port->receive = receive;
++			port->context = context;
++		}
++	}
++	lck_mtx_unlock(&qrtr_lock);
++	return port;
++}
++
++static int
++qrtr_send(struct qrtr_port *port, uint32_t node, uint32_t to, const void *data, uint32_t length)
++{
++	if (port == NULL || port->number == 0 || length > QRTR_MAX) {
++		return EINVAL;
++	}
++	return qrtr_out_packet(QRTR_DATA, port->number, node, to, data, length);
++}
++
++static void
++qrtr_close(struct qrtr_port *port)
++{
++	struct qrtr_control gone = { .command = QRTR_DEL_CLIENT, .words = { QRTR_US, port ? port->number : 0 } };
++
++	if (port == NULL || port->number == 0) {
++		return;
++	}
++	lck_mtx_lock(&qrtr_lock);
++	port->number = 0;
++	lck_mtx_unlock(&qrtr_lock);
++	if (qrtr_peer != 0 && glink.channel[CHANNEL_QRTR].open) {
++		qrtr_out_packet(QRTR_DEL_CLIENT, gone.words[1], qrtr_peer, QRTR_CONTROL, &gone, sizeof(gone));
++	}
++}
++
++/* Our service announced to a node: a "new server", or the empty one that ends an answer to a lookup. */
++static void
++qrtr_announce(uint32_t node, unsigned server, bool end)
++{
++	struct qrtr_control packet = { .command = QRTR_NEW_SERVER };
++
++	if (!end) {
++		packet.words[0] = our_servers[server].service;
++		packet.words[1] = our_servers[server].instance;
++		packet.words[2] = QRTR_US;
++		packet.words[3] = our_servers[server].port;
++	}
++	qrtr_out_packet(QRTR_NEW_SERVER, QRTR_CONTROL, node, QRTR_CONTROL, &packet, sizeof(packet));
++}
++
++static void
++qrtr_announce_all(uint32_t node)
++{
++	for (unsigned i = 0; i < sizeof(our_servers) / sizeof(our_servers[0]); i++) {
++		if (our_servers[i].port != 0) {
++			qrtr_announce(node, i, false);
++		}
++	}
++}
++
++static void
++qrtr_control_in(const struct qrtr_header *header, const struct qrtr_control *control)
++{
++	struct qrtr_control hello = { .command = QRTR_HELLO };
++	int found = -1, error;
++
++	switch (control->command) {
++	case QRTR_HELLO:
++		if (qrtr_hellos++ != 0) {
++			break;
++		}
++		error = qrtr_out_packet(QRTR_HELLO, QRTR_CONTROL, header->from_node, QRTR_CONTROL, &hello, sizeof(hello));
++		printf("SWEET MPSS: qrtr: HELLO FROM NODE %u; ours to it: %s\n", header->from_node, error == 0 ? "SENT" : "NOT SENT");
++		qrtr_announce_all(header->from_node);
++		break;
++	case QRTR_NEW_SERVER:
++		lck_mtx_lock(&qrtr_lock);
++		for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
++			if (qrtr_servers[i].there && qrtr_servers[i].node == control->words[2] && qrtr_servers[i].port == control->words[3]) {
++				found = (int)i;
++				break;
++			}
++			if (!qrtr_servers[i].there && found < 0) {
++				found = (int)i;
++			}
++		}
++		if (found >= 0) {
++			qrtr_servers[found].there = true;
++			qrtr_servers[found].service = control->words[0];
++			qrtr_servers[found].instance = control->words[1];
++			qrtr_servers[found].node = control->words[2];
++			qrtr_servers[found].port = control->words[3];
++		}
++		lck_mtx_unlock(&qrtr_lock);
++		printf("SWEET MPSS: qrtr: a service: %u (%#x), version %u, instance %u, node %u port %u\n", control->words[0],
++		    control->words[0], control->words[1] & 0xff, control->words[1] >> 8, control->words[2], control->words[3]);
++		break;
++	case QRTR_DEL_SERVER:
++	case QRTR_BYE:
++		for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
++			bool gone;
++
++			lck_mtx_lock(&qrtr_lock);
++			gone = qrtr_servers[i].there && (control->command == QRTR_BYE ? qrtr_servers[i].node == header->from_node :
++			    qrtr_servers[i].node == control->words[2] && qrtr_servers[i].port == control->words[3]);
++			qrtr_servers[i].there = qrtr_servers[i].there && !gone;
++			lck_mtx_unlock(&qrtr_lock);
++			if (gone) {
++				printf("SWEET MPSS: qrtr: service %u at node %u port %u has gone\n", qrtr_servers[i].service,
++				    qrtr_servers[i].node, qrtr_servers[i].port);
++			}
++		}
++		break;
++	case QRTR_NEW_LOOKUP: {
++		unsigned matches = 0;
++
++		for (unsigned i = 0; i < sizeof(our_servers) / sizeof(our_servers[0]); i++) {
++			if (our_servers[i].port != 0 && (control->words[0] == 0 || our_servers[i].service == control->words[0]) &&
++			    (control->words[1] == 0 || our_servers[i].instance == control->words[1])) {
++				qrtr_announce(header->from_node, i, false);
++				matches++;
++			}
++		}
++		qrtr_announce(header->from_node, 0, true);
++		if (qrtr_lookups++ < 16) {
++			printf("SWEET MPSS: qrtr: the modem looks for service %u (%#x) instance %u: %u of ours\n", control->words[0],
++			    control->words[0], control->words[1], matches);
++		}
++		break;
++	}
++	default:
++		break;
++	}
++}
++
++static void
++qrtr_input(const uint8_t *data, uint32_t length)
++{
++	struct qrtr_header header;
++	qrtr_receive_t receive = NULL;
++	void *context = NULL;
++	uint32_t at;
++
++	if (length >= sizeof(header) && data[0] == 1) {
++		memcpy(&header, data, sizeof(header));
++		at = sizeof(header);
++	} else if (length >= 16 && data[0] == 3) {
++		bzero(&header, sizeof(header));
++		header.type = data[1];
++		header.confirm = data[2] & 1;
++		memcpy(&header.size, data + 4, 4);
++		header.from_node = (uint32_t)(data[8] | data[9] << 8);
++		header.from_port = (uint32_t)(data[10] | data[11] << 8);
++		header.to_node = (uint32_t)(data[12] | data[13] << 8);
++		header.to_port = (uint32_t)(data[14] | data[15] << 8);
++		header.from_port = header.from_port == 0xfffe ? QRTR_CONTROL : header.from_port;
++		header.to_port = header.to_port == 0xfffe ? QRTR_CONTROL : header.to_port;
++		at = 16 + data[3];
++	} else {
++		printf("SWEET MPSS: qrtr: %u bytes that are no datagram\n", length);
++		return;
++	}
++	if (header.size == 0 || at + header.size > length) {
++		printf("SWEET MPSS: qrtr: a datagram of %u in a message of %u: dropped\n", header.size, length);
++		return;
++	}
++	qrtr_in++;
++	if (qrtr_peer == 0) {
++		qrtr_peer = header.from_node;
++	}
++	if (header.type == QRTR_RESUME_TX) {
++		return;
++	}
++	if (header.confirm) {
++		struct qrtr_control resume = { .command = QRTR_RESUME_TX, .words = { header.to_node, header.to_port } };
++
++		qrtr_out_packet(QRTR_RESUME_TX, header.to_port, header.from_node, header.from_port, &resume, sizeof(resume));
++	}
++	if (header.to_port == QRTR_CONTROL || header.type == QRTR_HELLO || header.type == QRTR_BYE ||
++	    header.type == QRTR_NEW_SERVER || header.type == QRTR_DEL_SERVER || header.type == QRTR_NEW_LOOKUP) {
++		struct qrtr_control control = { 0 };
++
++		memcpy(&control, data + at, header.size < sizeof(control) ? header.size : sizeof(control));
++		qrtr_control_in(&header, &control);
++		return;
++	}
++	lck_mtx_lock(&qrtr_lock);
++	for (unsigned p = 0; p < sizeof(qrtr_ports) / sizeof(qrtr_ports[0]); p++) {
++		if (qrtr_ports[p].number == header.to_port && header.type == QRTR_DATA) {
++			receive = qrtr_ports[p].receive;
++			context = qrtr_ports[p].context;
++		}
++	}
++	lck_mtx_unlock(&qrtr_lock);
++	if (receive != NULL) {
++		receive(context, header.from_node, header.from_port, data + at, header.size);
++	} else if (qrtr_in <= 64) {
++		printf("SWEET MPSS: qrtr: a datagram from node %u port %u to our port %u: nobody listens there\n", header.from_node,
++		    header.from_port, header.to_port);
++	}
++}
++
++/* ---- the link's thread ----------------------------------------------------------------------------- */
++
++static volatile bool link_wanted, link_runs;
++
++static void
++link_thread(__unused void *parameter, __unused wait_result_t result)
++{
++	struct smp2p words, last;
++	struct glink_packet *packet;
++	bool gave_up = false;
++
++	bzero(&last, sizeof(last));
++	dsp_words(&last);
++	while (link_wanted) {
++		sleep_ms(1);
++		if (dsp_words(&words) && memcmp(&words, &last, sizeof(words)) != 0) {
++			last = words;
++			dsp_listen(&words);
++			if ((dsp_state(&words) & DSP_FATAL) && !gave_up) {
++				gave_up = true;
++				printf("SWEET MPSS: link: THE MODEM SAYS IT HAS GIVEN UP (%#x)\n", dsp_state(&words));
++				show_crash_reason();
++			}
++		}
++		for (;;) {
++			struct glink_channel *channel = &glink.channel[CHANNEL_QRTR];
++
++			lck_mtx_lock(&glink_lock);
++			glink_pump();
++			packet = channel->first;
++			if (packet != NULL) {
++				channel->first = packet->next;
++				channel->last = channel->first == NULL ? NULL : channel->last;
++			}
++			lck_mtx_unlock(&glink_lock);
++			if (packet == NULL) {
++				break;
++			}
++			qrtr_input(packet->data, packet->length);
++			kfree_data(packet, sizeof(*packet) + packet->length);
++		}
++	}
++	link_runs = false;
++	thread_terminate(current_thread());
++}
++
++static void
++link_stop(void)
++{
++	struct glink_packet *packet;
++
++	if (link_runs) {
++		link_wanted = false;
++		for (unsigned ms = 0; ms < 2000 && link_runs; ms++) {
++			sleep_ms(1);
++		}
++		printf("SWEET MPSS: link: %s; GLINK said %u heard %u, QRTR sent %u received %u; rmtfs: %u requests, %u reads (%u "
++		    "sectors), %u writes (%u sectors), %u refused; tftp: %u requests, %u served, %u refused; registry: %u questions\n",
++		    link_runs ? "THE THREAD DOES NOT END" : "down", glink.said, glink.heard, qrtr_out, qrtr_in, rmtfs_requests,
++		    rmtfs_reads, rmtfs_sectors_read, rmtfs_writes, rmtfs_sectors_written, rmtfs_refused, tftp_requests, tftp_served,
++		    tftp_refused, servreg_requests);
++	}
++	lck_mtx_lock(&glink_lock);
++	glink.up = false;
++	for (unsigned c = 0; c < CHANNELS; c++) {
++		struct glink_channel *channel = &glink.channel[c];
++
++		channel->open = false;
++		while ((packet = channel->first) != NULL) {
++			channel->first = packet->next;
++			kfree_data(packet, sizeof(*packet) + packet->length);
++		}
++		channel->last = NULL;
++	}
++	lck_mtx_unlock(&glink_lock);
++	lck_mtx_lock(&qrtr_lock);
++	bzero(qrtr_servers, sizeof(qrtr_servers));
++	qrtr_peer = 0;
++	lck_mtx_unlock(&qrtr_lock);
++}
++
++/* ---- the modem's file systems: RMTFS, a service of ours on QRTR ------------------------------------- */
++
++#define RMTFS_SERVICE           14
++#define RMTFS_VERSION           1
++#define RMTFS_INSTANCE          0
++#define RMTFS_SECTOR            512
++#define RMTFS_BUFFER_SIZE       0x00300000u     /* dt: reg size of qcom,rmtfs_sharedmem@0 (3 MB) */
++#define RMTFS_OPEN              1
++#define RMTFS_CLOSE             2
++#define RMTFS_RW_IOVEC          3
++#define RMTFS_ALLOC_BUFF        4
++#define RMTFS_GET_DEV_ERROR     5
++#define QMI_REQUEST             0
++#define QMI_RESPONSE            2
++#define QMI_RESULT_FAILURE      1
++#define QMI_ERR_INTERNAL        1
++#define QMI_ERR_MALFORMED       2
++#define VMID_HLOS               3
++#define VMID_MSS_MSA            15
++#define VM_PERM_RW              6
++
++/*
++ * The buffer: the modem's addresses are 32 bits, so it must be below 4 GB and in one piece of 3 MB.
++ * HakiOS put it at the compute DSP's reservation 0x9c700000, but that is this phone's splash screen
++ * (cont_splash 0x9c000000-0x9e400000); here it is the compute DSP's region (cdsp_regions 0x99100000,
++ * no-map, the CDSP never started here). modem_buffer=ADDRESS chooses another.
++ */
++static uint64_t rmtfs_buffer_pa = 0x99100000ull;
++static volatile uint8_t *rmtfs_window;
++static bool rmtfs_shared;
++
++static struct {
++	const char *path, *partition;
++	uint8_t *data;
++	uint64_t size;
++	bool open;
++} rmtfs_files[4] = {
++	{ .path = "/boot/modem_fs1", .partition = "modemst1" }, { .path = "/boot/modem_fs2", .partition = "modemst2" },
++	{ .path = "/boot/modem_fsc", .partition = "fsc" },
++	{ .path = "/boot/modem_fsg", .partition = "fsg" },
++};
++static struct qrtr_port *rmtfs_port;
++
++static unsigned
++rmtfs_load(void)
++{
++	unsigned loaded = 0;
++
++	for (unsigned f = 0; f < 4; f++) {
++		uint64_t size = 0;
++		int error = sweet_ufs_read_partition(rmtfs_files[f].partition, 1, 0, NULL, 0, &size);   /* LUN hint 1: not the root's */
++
++		if (error != 0 || size == 0 || size > (64u << 20)) {
++			printf("SWEET MPSS: %u: the partition %s: not read (%d)\n", step, rmtfs_files[f].partition, error);
++			continue;
++		}
++		if (rmtfs_files[f].data == NULL || rmtfs_files[f].size != size) {
++			if (rmtfs_files[f].data != NULL) {
++				kfree_data(rmtfs_files[f].data, rmtfs_files[f].size);
++			}
++			rmtfs_files[f].data = kalloc_data(size, Z_WAITOK | Z_ZERO);
++			rmtfs_files[f].size = rmtfs_files[f].data == NULL ? 0 : size;
++		}
++		if (rmtfs_files[f].data == NULL) {
++			printf("SWEET MPSS: %u: no memory for %s (%llu bytes)\n", step, rmtfs_files[f].partition, size);
++			continue;
++		}
++		error = sweet_ufs_read_partition(rmtfs_files[f].partition, 1, 0, rmtfs_files[f].data, size, NULL);
++		if (error != 0) {
++			printf("SWEET MPSS: %u: the partition %s: read error %d\n", step, rmtfs_files[f].partition, error);
++			continue;
++		}
++		printf("SWEET MPSS: %u: %s (%s): %llu bytes read into memory of ours\n", step, rmtfs_files[f].partition,
++		    rmtfs_files[f].path, size);
++		loaded++;
++	}
++	return loaded;
++}
++
++static bool
++rmtfs_buffer_make(void)
++{
++	if (rmtfs_window != NULL) {
++		return true;
++	}
++	PE_parse_boot_argn("modem_buffer", &rmtfs_buffer_pa, sizeof(rmtfs_buffer_pa));
++	rmtfs_window = (volatile uint8_t *)ml_io_map_unmappable((vm_offset_t)rmtfs_buffer_pa, RMTFS_BUFFER_SIZE, VM_WIMG_WCOMB);
++	if (rmtfs_window == NULL) {
++		printf("SWEET MPSS: %u: the modem's buffer at %#llx cannot be mapped\n", step, rmtfs_buffer_pa);
++		return false;
++	}
++	for (uint32_t i = 0; i < RMTFS_BUFFER_SIZE; i += 8) {
++		*(volatile uint64_t *)(rmtfs_window + i) = 0;
++	}
++	settle();
++	printf("SWEET MPSS: %u: the modem's buffer: %u bytes at %#llx\n", step, RMTFS_BUFFER_SIZE, rmtfs_buffer_pa);
++	return true;
++}
++
++/*
++ * TrustZone asked to let the modem into the buffer (Linux's qcom_scm_assign_mem()), or out again.
++ * vayu's rmtfs has no qcom,vm-nav-path, so only HLOS (3) and MSS_MSA (15) are named, no NAV.
++ */
++static bool
++rmtfs_share(bool in)
++{
++	struct {
++		uint64_t address, size;
++		uint64_t pad0[6];
++		uint32_t sources[3];
++		uint32_t pad1[13];
++		struct {
++			uint32_t vmid, permission;
++			uint64_t context;
++			uint32_t context_size, unused;
++		} destinations[3];
++		uint8_t pad2[40];
++		uint64_t more[7];
++	} *page;
++	vm_offset_t memory = 0;
++	uint64_t answer = ~0ull, pa;
++	unsigned sources, destinations;
++	int32_t result;
++
++	if (in && !rmtfs_buffer_make()) {
++		return false;
++	}
++	if (rmtfs_window == NULL || rmtfs_shared == in) {
++		return rmtfs_window != NULL;
++	}
++	if (kmem_alloc(kernel_map, &memory, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return false;
++	}
++	page = (void *)memory;
++	page->address = rmtfs_buffer_pa;
++	page->size = RMTFS_BUFFER_SIZE;
++	if (in) {
++		page->sources[0] = VMID_HLOS;
++		sources = 1;
++		page->destinations[0].vmid = VMID_HLOS;
++		page->destinations[0].permission = VM_PERM_RW;
++		page->destinations[1].vmid = VMID_MSS_MSA;
++		page->destinations[1].permission = VM_PERM_RW;
++		destinations = 2;
++	} else {
++		page->sources[0] = VMID_HLOS;
++		page->sources[1] = VMID_MSS_MSA;
++		sources = 2;
++		page->destinations[0].vmid = VMID_HLOS;
++		page->destinations[0].permission = VM_PERM_RW;
++		destinations = 1;
++	}
++	pa = kvtophys(memory);
++	page->more[0] = sources * 4;
++	page->more[1] = pa + 128;
++	page->more[2] = destinations * sizeof(page->destinations[0]);
++	page->more[3] = 0;
++	for (vm_offset_t line = memory; line < memory + PAGE_SIZE; line += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (line) : "memory");
++	}
++	settle();
++	result = scm(SCM_MP_ASSIGN, SCM_ASSIGN_ARGUMENTS, pa, 16, pa + 64, pa + 240, &answer);
++	kmem_free(kernel_map, memory, PAGE_SIZE);
++	if (result != 0 || answer != 0) {
++		printf("SWEET MPSS: %u: TRUSTZONE DOES NOT %s THE BUFFER (ret %d, answer %#llx)\n", step, in ? "SHARE" : "TAKE BACK",
++		    result, answer);
++		return false;
++	}
++	rmtfs_shared = in;
++	printf("SWEET MPSS: %u: %s\n", step, in ? "THE MODEM MAY USE THE BUFFER" : "the buffer is ours alone again");
++	return true;
++}
++
++static const uint8_t *
++qmi_tlv(const uint8_t *m, size_t length, uint8_t type, uint16_t *size)
++{
++	for (size_t at = 7; at + 3 <= length;) {
++		uint16_t n = (uint16_t)(m[at + 1] | m[at + 2] << 8);
++
++		if (at + 3 + n > length) {
++			return NULL;
++		}
++		if (m[at] == type) {
++			*size = n;
++			return m + at + 3;
++		}
++		at += 3 + n;
++	}
++	return NULL;
++}
++
++static uint32_t
++le32(const uint8_t *p)
++{
++	return (uint32_t)(p[0] | p[1] << 8 | p[2] << 16 | p[3] << 24);
++}
++
++static void
++rmtfs_receive(__unused void *context, uint32_t node, uint32_t port, const void *data, uint32_t length)
++{
++	const uint8_t *m = data, *value;
++	uint8_t answer[64], *tlv;
++	uint16_t message, size = 0, result = 0, error = 0, extra = 0;
++	unsigned file = 4;
++
++	if (length < 7 || m[0] != QMI_REQUEST) {
++		return;
++	}
++	message = (uint16_t)(m[3] | m[4] << 8);
++	rmtfs_requests++;
++	bzero(answer, sizeof(answer));
++	answer[0] = QMI_RESPONSE;
++	answer[1] = m[1];
++	answer[2] = m[2];
++	answer[3] = m[3];
++	answer[4] = m[4];
++	tlv = answer + 7 + 7;
++	switch (message) {
++	case RMTFS_OPEN:
++		value = qmi_tlv(m, length, 1, &size);
++		for (unsigned f = 0; value != NULL && f < 4; f++) {
++			if (size == strlen(rmtfs_files[f].path) && memcmp(value, rmtfs_files[f].path, size) == 0) {
++				file = f;
++			}
++		}
++		if (file == 4 || rmtfs_files[file].data == NULL) {
++			result = QMI_RESULT_FAILURE;
++			error = QMI_ERR_INTERNAL;
++			rmtfs_refused++;
++			break;
++		}
++		rmtfs_files[file].open = true;
++		printf("SWEET MPSS: rmtfs: the modem opens %s (%llu bytes): caller %u\n", rmtfs_files[file].path, rmtfs_files[file].size,
++		    file + 1);
++		tlv[0] = 0x10;
++		tlv[1] = 4;
++		tlv[2] = 0;
++		tlv[3] = (uint8_t)(file + 1);
++		extra = 7;
++		break;
++	case RMTFS_CLOSE:
++		value = qmi_tlv(m, length, 1, &size);
++		file = value != NULL && size == 4 && le32(value) >= 1 && le32(value) <= 4 ? le32(value) - 1 : 4;
++		if (file < 4) {
++			rmtfs_files[file].open = false;
++		}
++		break;
++	case RMTFS_ALLOC_BUFF:
++		value = qmi_tlv(m, length, 2, &size);
++		if (value == NULL || size != 4 || le32(value) > RMTFS_BUFFER_SIZE || rmtfs_window == NULL || !rmtfs_shared) {
++			result = QMI_RESULT_FAILURE;
++			error = QMI_ERR_INTERNAL;
++			rmtfs_refused++;
++			break;
++		}
++		printf("SWEET MPSS: rmtfs: the modem asks for a buffer of %u bytes: given ours at %#llx\n", le32(value), rmtfs_buffer_pa);
++		tlv[0] = 0x10;
++		tlv[1] = 8;
++		tlv[2] = 0;
++		for (unsigned b = 0; b < 8; b++) {
++			tlv[3 + b] = (uint8_t)(rmtfs_buffer_pa >> (8 * b));
++		}
++		extra = 11;
++		break;
++	case RMTFS_RW_IOVEC: {
++		const uint8_t *direction = qmi_tlv(m, length, 2, &size), *entries;
++		uint16_t direction_size = size, entries_size = 0;
++		bool write;
++		unsigned count;
++
++		value = qmi_tlv(m, length, 1, &size);
++		entries = qmi_tlv(m, length, 3, &entries_size);
++		file = value != NULL && size == 4 && le32(value) >= 1 && le32(value) <= 4 ? le32(value) - 1 : 4;
++		if (file == 4 || !rmtfs_files[file].open || direction == NULL || direction_size != 1 || entries == NULL ||
++		    entries_size < 1 || entries_size != 1 + 12 * entries[0] || rmtfs_window == NULL) {
++			result = QMI_RESULT_FAILURE;
++			error = QMI_ERR_MALFORMED;
++			rmtfs_refused++;
++			break;
++		}
++		write = direction[0] != 0;
++		count = entries[0];
++		for (unsigned e = 0; e < count && result == 0; e++) {
++			uint64_t sector = le32(entries + 1 + 12 * e), physical = le32(entries + 5 + 12 * e);
++			uint64_t sectors = le32(entries + 9 + 12 * e), bytes = sectors * RMTFS_SECTOR;
++
++			if (physical < rmtfs_buffer_pa || physical - rmtfs_buffer_pa + bytes > RMTFS_BUFFER_SIZE ||
++			    sector * RMTFS_SECTOR + bytes > rmtfs_files[file].size) {
++				printf("SWEET MPSS: rmtfs: %s %llu sectors from %llu of %s: OUTSIDE THE FILE OR THE BUFFER\n", write ?
++				    "write" : "read", sectors, sector, rmtfs_files[file].partition);
++				result = QMI_RESULT_FAILURE;
++				error = QMI_ERR_MALFORMED;
++				rmtfs_refused++;
++				break;
++			}
++			if (write) {
++				for (uint64_t i = 0; i < bytes; i++) {
++					rmtfs_files[file].data[sector * RMTFS_SECTOR + i] = rmtfs_window[physical - rmtfs_buffer_pa + i];
++				}
++				rmtfs_sectors_written += sectors;
++			} else {
++				for (uint64_t i = 0; i < bytes; i++) {
++					rmtfs_window[physical - rmtfs_buffer_pa + i] = rmtfs_files[file].data[sector * RMTFS_SECTOR + i];
++				}
++				rmtfs_sectors_read += sectors;
++			}
++		}
++		settle();
++		rmtfs_reads += !write;
++		rmtfs_writes += write;
++		if (rmtfs_reads + rmtfs_writes <= 12) {
++			printf("SWEET MPSS: rmtfs: the modem %s %u pieces of %s%s: served\n", write ? "writes" : "reads", count,
++			    rmtfs_files[file].partition, write ? " (kept in memory, not on the storage)" : "");
++		}
++		break;
++	}
++	case RMTFS_GET_DEV_ERROR:
++		tlv[0] = 0x10;
++		tlv[1] = 1;
++		tlv[2] = 0;
++		tlv[3] = 0;
++		extra = 4;
++		break;
++	default:
++		printf("SWEET MPSS: rmtfs: a request this does not know (%#x)\n", message);
++		result = QMI_RESULT_FAILURE;
++		error = QMI_ERR_MALFORMED;
++		break;
++	}
++	answer[5] = (uint8_t)(7 + extra);
++	answer[6] = (uint8_t)((7 + extra) >> 8);
++	answer[7] = 2;
++	answer[8] = 4;
++	answer[9] = 0;
++	answer[10] = (uint8_t)result;
++	answer[11] = (uint8_t)(result >> 8);
++	answer[12] = (uint8_t)error;
++	answer[13] = (uint8_t)(error >> 8);
++	if (rmtfs_port != NULL) {
++		int sent = qrtr_send(rmtfs_port, node, port, answer, 7 + 7 + extra);
++
++		if (sent != 0) {
++			printf("SWEET MPSS: rmtfs: the answer to %#x is NOT SENT (%d)\n", message, sent);
++		}
++	}
++}
++
++/* ---- TFTP (the modem reads wlanmdsp.mbn and the rest from /fw/image over this; Linux's tqftpserv) --- */
++
++#define TFTP_SERVICE            4096
++#define TFTP_INSTANCE           1
++#define TFTP_RRQ                1
++#define TFTP_WRQ                2
++#define TFTP_DATA               3
++#define TFTP_ACK                4
++#define TFTP_ERROR              5
++#define TFTP_OACK               6
++#define TFTP_ENOENT             1
++#define TFTP_EBADOP             4
++
++static struct qrtr_port *tftp_port;
++
++/* The modem's TFTP paths (/readonly/firmware/image/NAME) map to /fw/image/NAME on the root. */
++static const char *
++tftp_file_of(const char *path)
++{
++	static const char *const prefix = "/readonly/firmware/image/";
++
++	if (strncmp(path, prefix, strlen(prefix)) != 0) {
++		return NULL;
++	}
++	return path + strlen(prefix);
++}
++
++struct tftp_transfer {
++	struct qrtr_port *port;                 /* the port of this transfer (a read); NULL: free */
++	uint32_t node, peer;
++	uint8_t *data;                          /* the file, whole, in memory of ours */
++	uint64_t size, sent;
++	uint32_t block, blksize, wsize;
++	bool done;
++};
++static struct tftp_transfer tftp_transfers[4];
++
++static void
++tftp_error(struct qrtr_port *from, uint32_t node, uint32_t port, uint16_t code, const char *text)
++{
++	uint8_t packet[64];
++	unsigned at = 4;
++
++	packet[0] = 0;
++	packet[1] = TFTP_ERROR;
++	packet[2] = (uint8_t)(code >> 8);
++	packet[3] = (uint8_t)code;
++	at += (unsigned)strlcpy((char *)packet + at, text, sizeof(packet) - at) + 1;
++	qrtr_send(from, node, port, packet, at);
++}
++
++static void
++tftp_transfer_end(struct tftp_transfer *t)
++{
++	if (t->data != NULL) {
++		kfree_data(t->data, t->size);
++	}
++	if (t->port != NULL) {
++		qrtr_close(t->port);
++	}
++	bzero(t, sizeof(*t));
++}
++
++static void
++tftp_send_block(struct tftp_transfer *t)
++{
++	uint8_t *packet;
++	uint32_t at = t->block * t->blksize, length = (uint32_t)(t->size - at < t->blksize ? t->size - at : t->blksize);
++
++	packet = kalloc_data(4 + length, Z_WAITOK);
++	if (packet == NULL) {
++		return;
++	}
++	packet[0] = 0;
++	packet[1] = TFTP_DATA;
++	packet[2] = (uint8_t)((t->block + 1) >> 8);
++	packet[3] = (uint8_t)(t->block + 1);
++	memcpy(packet + 4, t->data + at, length);
++	qrtr_send(t->port, t->node, t->peer, packet, 4 + length);
++	kfree_data(packet, 4 + length);
++	t->sent = at + length;
++	if (length < t->blksize) {
++		t->done = true;
++	}
++}
++
++static void
++tftp_transfer_receive(void *context, uint32_t node, uint32_t port, const void *data, uint32_t length)
++{
++	struct tftp_transfer *t = context;
++	const uint8_t *m = data;
++	uint16_t op, block;
++
++	if (length < 4) {
++		return;
++	}
++	op = (uint16_t)(m[0] << 8 | m[1]);
++	block = (uint16_t)(m[2] << 8 | m[3]);
++	if (op == TFTP_ERROR) {
++		tftp_transfer_end(t);
++		return;
++	}
++	if (op != TFTP_ACK) {
++		tftp_error(t->port, node, port, TFTP_EBADOP, "expected ACK");
++		tftp_transfer_end(t);
++		return;
++	}
++	if (block != t->block + 1 && block != 0) {
++		return;                         /* a duplicate or out-of-sequence ack: ignored */
++	}
++	if (t->done) {
++		tftp_served++;
++		tftp_transfer_end(t);
++		return;
++	}
++	t->block = block == 0 ? t->block : block;
++	tftp_send_block(t);
++}
++
++static void
++tftp_receive(__unused void *context, uint32_t node, uint32_t port, const void *data, uint32_t length)
++{
++	const uint8_t *m = data;
++	const char *name, *file, *options;
++	uint8_t oack[128];
++	struct tftp_transfer *t = NULL;
++	uint64_t size = 0;
++	uint8_t *contents;
++	uint32_t blksize = 512, wsize = 1, at = 2;
++	unsigned left;
++
++	if (length < 4) {
++		return;
++	}
++	tftp_requests++;
++	if ((m[0] << 8 | m[1]) != TFTP_RRQ) {
++		printf("SWEET MPSS: tftp: the modem's request %u: not a read, refused\n", m[0] << 8 | m[1]);
++		tftp_error(tftp_port, node, port, TFTP_EBADOP, "not a read");
++		tftp_refused++;
++		return;
++	}
++	name = (const char *)m + 2;
++	for (left = 2; left < length && m[left] != 0; left++) {
++		;
++	}
++	if (left >= length) {
++		tftp_refused++;
++		return;
++	}
++	file = tftp_file_of(name);
++	if (file == NULL || *file == 0) {
++		printf("SWEET MPSS: tftp: the modem reads \"%s\": NOT A PATH SERVED HERE\n", name);
++		tftp_error(tftp_port, node, port, TFTP_ENOENT, "file not found");
++		tftp_refused++;
++		return;
++	}
++	contents = root_file(file, &size);
++	if (contents == NULL) {
++		printf("SWEET MPSS: tftp: the modem reads \"%s\" (/fw/image/%s): NOT HERE\n", name, file);
++		tftp_error(tftp_port, node, port, TFTP_ENOENT, "file not found");
++		tftp_refused++;
++		return;
++	}
++	/* the options after the name and its mode (both NUL-terminated): blksize is the one that matters */
++	for (options = name + strlen(name) + 1; options < (const char *)m + length;) {
++		const char *key = options + strlen(options) + 1;
++
++		if (key >= (const char *)m + length) {
++			break;
++		}
++		if (strcmp(options, "blksize") == 0) {
++			uint32_t b = (uint32_t)strtoul(key, NULL, 10);
++
++			blksize = b >= 8 && b <= 4096 ? b : blksize;
++		}
++		options = key + strlen(key) + 1;
++	}
++	for (unsigned i = 0; i < sizeof(tftp_transfers) / sizeof(tftp_transfers[0]) && t == NULL; i++) {
++		if (tftp_transfers[i].port == NULL) {
++			t = &tftp_transfers[i];
++		}
++	}
++	if (t == NULL) {
++		kfree_data(contents, size);
++		tftp_error(tftp_port, node, port, TFTP_ENOENT, "busy");
++		tftp_refused++;
++		return;
++	}
++	bzero(t, sizeof(*t));
++	t->port = qrtr_open(tftp_transfer_receive, t);
++	if (t->port == NULL) {
++		kfree_data(contents, size);
++		tftp_error(tftp_port, node, port, TFTP_ENOENT, "no port");
++		tftp_refused++;
++		return;
++	}
++	t->node = node;
++	t->peer = port;
++	t->data = contents;
++	t->size = size;
++	t->blksize = blksize;
++	t->wsize = wsize;
++	t->block = 0;
++	if (tftp_requests <= 40) {
++		printf("SWEET MPSS: tftp: the modem reads \"%s\" (/fw/image/%s): %llu bytes, blocks of %u\n", name, file, size, blksize);
++	}
++	/* OACK: the one option we care about echoed, then block 1 follows on its ack */
++	oack[0] = 0;
++	oack[1] = TFTP_OACK;
++	at += (unsigned)snprintf((char *)oack + at, sizeof(oack) - at, "blksize") + 1;
++	at += (unsigned)snprintf((char *)oack + at, sizeof(oack) - at, "%u", blksize) + 1;
++	at += (unsigned)snprintf((char *)oack + at, sizeof(oack) - at, "tsize") + 1;
++	at += (unsigned)snprintf((char *)oack + at, sizeof(oack) - at, "%llu", size) + 1;
++	qrtr_send(t->port, node, port, oack, at);
++}
++
++/* ---- the service registry's locator (pd-mapper): the *.jsn beside the firmware --------------------- */
++
++#define SERVREG_SERVICE         64
++#define SERVREG_INSTANCE        257
++#define SERVREG_GET_DOMAIN_LIST 0x21
++#define SERVREG_PFR             0x24
++
++static struct qrtr_port *servreg_port;
++static struct {
++	char service[48];
++	char domain[48];
++	uint32_t instance;
++} servreg_map[32];
++static unsigned servreg_maps;
++
++static const char *
++jsn_string(const char *from, const char *end, const char *key, char *out, size_t out_size)
++{
++	char quoted[48];
++	const char *at;
++
++	snprintf(quoted, sizeof(quoted), "\"%s\"", key);
++	at = strnstr(from, quoted, (size_t)(end - from));
++	if (at == NULL) {
++		return NULL;
++	}
++	at += strlen(quoted);
++	while (at < end && (*at == ':' || *at == ' ' || *at == '\t' || *at == '\n' || *at == '\r')) {
++		at++;
++	}
++	if (at >= end) {
++		return NULL;
++	}
++	if (*at == '"') {
++		const char *close = at + 1;
++
++		while (close < end && *close != '"') {
++			close++;
++		}
++		if (close >= end) {
++			return NULL;
++		}
++		snprintf(out, out_size, "%.*s", (int)(close - at - 1), at + 1);
++		return close + 1;
++	}
++	{
++		const char *close = at;
++
++		while (close < end && ((*close >= '0' && *close <= '9') || *close == '-')) {
++			close++;
++		}
++		snprintf(out, out_size, "%.*s", (int)(close - at), at);
++		return close;
++	}
++}
++
++static void
++servreg_load(void)
++{
++	static const char *const files[] = { "modemr.jsn", "modemuw.jsn", "adspr.jsn", "adspua.jsn", "cdspr.jsn", "slpir.jsn" };
++
++	servreg_maps = 0;
++	for (unsigned f = 0; f < sizeof(files) / sizeof(files[0]); f++) {
++		char soc[24], domain[24], subdomain[24], instance[16], provider[24], service[24], full[48];
++		uint64_t size = 0;
++		uint8_t *data;
++		const char *text, *end, *at;
++
++		data = root_file(files[f], &size);
++		if (data == NULL) {
++			continue;
++		}
++		text = (const char *)data;
++		end = text + size;
++		if (jsn_string(text, end, "soc", soc, sizeof(soc)) == NULL || jsn_string(text, end, "domain", domain, sizeof(domain)) == NULL ||
++		    jsn_string(text, end, "subdomain", subdomain, sizeof(subdomain)) == NULL ||
++		    jsn_string(text, end, "qmi_instance_id", instance, sizeof(instance)) == NULL) {
++			printf("SWEET MPSS: servreg: fw/image/%s: not of the shape this reads\n", files[f]);
++			kfree_data(data, size);
++			continue;
++		}
++		snprintf(full, sizeof(full), "%s/%s/%s", soc, domain, subdomain);
++		at = text;
++		while (servreg_maps < sizeof(servreg_map) / sizeof(servreg_map[0]) &&
++		    (at = jsn_string(at, end, "provider", provider, sizeof(provider))) != NULL &&
++		    jsn_string(at, end, "service", service, sizeof(service)) != NULL) {
++			snprintf(servreg_map[servreg_maps].service, sizeof(servreg_map[0].service), "%s/%s", provider, service);
++			strlcpy(servreg_map[servreg_maps].domain, full, sizeof(servreg_map[0].domain));
++			servreg_map[servreg_maps].instance = (uint32_t)strtoul(instance, NULL, 10);
++			servreg_maps++;
++		}
++		kfree_data(data, size);
++	}
++	printf("SWEET MPSS: %u: the service registry: %u services of %u files\n", step, servreg_maps,
++	    (unsigned)(sizeof(files) / sizeof(files[0])));
++	for (unsigned i = 0; i < servreg_maps; i++) {
++		printf("SWEET MPSS: %u:   %s at %s, instance %u\n", step, servreg_map[i].service, servreg_map[i].domain,
++		    servreg_map[i].instance);
++	}
++}
++
++static void
++servreg_receive(__unused void *context, uint32_t node, uint32_t port, const void *data, uint32_t length)
++{
++	const uint8_t *m = data, *value;
++	uint8_t answer[512];
++	uint16_t message, size = 0;
++	unsigned at = 7 + 7, found = 0;
++	char wanted[64] = "";
++
++	if (length < 7 || m[0] != QMI_REQUEST) {
++		return;
++	}
++	message = (uint16_t)(m[3] | m[4] << 8);
++	servreg_requests++;
++	bzero(answer, sizeof(answer));
++	answer[0] = QMI_RESPONSE;
++	answer[1] = m[1];
++	answer[2] = m[2];
++	answer[3] = m[3];
++	answer[4] = m[4];
++	answer[7] = 2;
++	answer[8] = 4;
++	if (message == SERVREG_GET_DOMAIN_LIST) {
++		value = qmi_tlv(m, length, 1, &size);
++		if (value != NULL) {
++			snprintf(wanted, sizeof(wanted), "%.*s", (int)(size < 63 ? size : 63), (const char *)value);
++		}
++		for (unsigned i = 0; i < servreg_maps; i++) {
++			found += strcmp(servreg_map[i].service, wanted) == 0;
++		}
++		answer[at++] = 0x10;
++		answer[at++] = 2;
++		answer[at++] = 0;
++		answer[at++] = (uint8_t)found;
++		answer[at++] = (uint8_t)(found >> 8);
++		answer[at++] = 0x11;
++		answer[at++] = 2;
++		answer[at++] = 0;
++		answer[at++] = 1;
++		answer[at++] = 0;
++		if (found != 0) {
++			unsigned list = at;
++
++			answer[at++] = 0x12;
++			at += 2;
++			answer[at++] = (uint8_t)found;
++			for (unsigned i = 0; i < servreg_maps && at + 64 < sizeof(answer); i++) {
++				if (strcmp(servreg_map[i].service, wanted) != 0) {
++					continue;
++				}
++				answer[at++] = (uint8_t)strlen(servreg_map[i].domain);
++				memcpy(answer + at, servreg_map[i].domain, strlen(servreg_map[i].domain));
++				at += (unsigned)strlen(servreg_map[i].domain);
++				for (unsigned b = 0; b < 4; b++) {
++					answer[at++] = (uint8_t)(servreg_map[i].instance >> (8 * b));
++				}
++				answer[at++] = 0;
++				at += 4;
++			}
++			answer[list + 1] = (uint8_t)(at - list - 3);
++			answer[list + 2] = (uint8_t)((at - list - 3) >> 8);
++		}
++		printf("SWEET MPSS: servreg: the modem asks where \"%s\" is: %u domain%s\n", wanted, found, found == 1 ? "" : "s");
++	} else if (message == SERVREG_PFR) {
++		value = qmi_tlv(m, length, 1, &size);
++		printf("SWEET MPSS: servreg: the modem reports a failure of \"%.*s\"\n", value ? (int)(size < 63 ? size : 63) : 0,
++		    value ? (const char *)value : "");
++	} else {
++		printf("SWEET MPSS: servreg: a request this does not know (%#x)\n", message);
++		answer[10] = QMI_RESULT_FAILURE;
++		answer[12] = QMI_ERR_MALFORMED;
++	}
++	answer[5] = (uint8_t)(at - 7);
++	answer[6] = (uint8_t)((at - 7) >> 8);
++	qrtr_send(servreg_port, node, port, answer, at);
++}
++
++/* The ports, and the services on them. */
++static bool
++services_start(void)
++{
++	if (rmtfs_port == NULL) {
++		rmtfs_port = qrtr_open(rmtfs_receive, NULL);
++	}
++	if (rmtfs_port == NULL) {
++		return false;
++	}
++	our_servers[0].service = RMTFS_SERVICE;
++	our_servers[0].instance = RMTFS_VERSION | RMTFS_INSTANCE << 8;
++	our_servers[0].port = rmtfs_port->number;
++	if (tftp_port == NULL) {
++		tftp_port = qrtr_open(tftp_receive, NULL);
++	}
++	if (tftp_port != NULL) {
++		our_servers[1].service = TFTP_SERVICE;
++		our_servers[1].instance = TFTP_INSTANCE;
++		our_servers[1].port = tftp_port->number;
++	}
++	if (servreg_port == NULL) {
++		servreg_port = qrtr_open(servreg_receive, NULL);
++	}
++	if (servreg_port != NULL) {
++		our_servers[2].service = SERVREG_SERVICE;
++		our_servers[2].instance = SERVREG_INSTANCE;
++		our_servers[2].port = servreg_port->number;
++	}
++	return true;
++}
++
++/* ---- step 7: GLINK, and the link's thread ---------------------------------------------------------- */
++
++static bool
++step_link(void)
++{
++	thread_t thread;
++	uint64_t began;
++
++	if (!dsp_started) {
++		return false;
++	}
++	if (!glink_find()) {
++		printf("SWEET MPSS: %u: GLINK's queues (items 478-480) are not there\n", step);
++		return false;
++	}
++	announce("take up GLINK with the modem (our version, the channel IPCRTR); a thread of ours listens from here, every ms");
++	if (!services_start()) {
++		printf("SWEET MPSS: %u: no port for the modem's file services\n", step);
++	}
++	lck_mtx_lock(&glink_lock);
++	glink.features = GLINK_INTENT_REUSE;
++	glink.agreed = glink.broken = false;
++	glink.said = glink.heard = 0;
++	for (unsigned c = 0; c < CHANNELS; c++) {
++		struct glink_channel *channel = &glink.channel[c];
++
++		channel->asked = channel->acknowledged = channel->open = false;
++		channel->theirs = channel->our_intent_count = 0;
++		bzero(channel->their_intents, sizeof(channel->their_intents));
++	}
++	bzero(glink.others, sizeof(glink.others));
++	glink.trace = 60;
++	glink.up = true;
++	qrtr_hellos = qrtr_in = qrtr_out = qrtr_lookups = 0;
++	began = now_us();
++	glink_say(GLINK_VERSION, GLINK_VERSION_1, glink.features, NULL, 0);
++	lck_mtx_unlock(&glink_lock);
++	link_wanted = link_runs = true;
++	if (kernel_thread_start(link_thread, NULL, &thread) != KERN_SUCCESS) {
++		link_wanted = link_runs = false;
++		printf("SWEET MPSS: %u: no thread\n", step);
++		return false;
++	}
++	link_thread_is = thread;
++	thread_deallocate(thread);
++	for (unsigned ms = 0; ms < 5000 && !glink.channel[CHANNEL_QRTR].open && !glink.broken; ms++) {
++		sleep_ms(1);
++	}
++	sleep_ms(50);
++	printf("SWEET MPSS: %u: %llu ms after our version: versions %s (features %#x); IPCRTR is %s; the modem also opened "
++	    "\"%s\" \"%s\" \"%s\" \"%s\"\n", step, (now_us() - began) / 1000, glink.agreed ? "agreed" : "NOT AGREED", glink.features,
++	    glink.channel[CHANNEL_QRTR].open ? "OPEN" : "NOT OPEN", glink.others[0], glink.others[1], glink.others[2], glink.others[3]);
++	return glink.channel[CHANNEL_QRTR].open;
++}
++
++/* ---- step 8: QRTR ---------------------------------------------------------------------------------- */
++
++static uint32_t listen_seconds = 5;
++
++static bool
++step_qrtr(void)
++{
++	unsigned services = 0, wlfw = 0;
++
++	if (!glink.channel[CHANNEL_QRTR].open) {
++		return false;
++	}
++	PE_parse_boot_argn("modem_listen", &listen_seconds, sizeof(listen_seconds));
++	announce("listen to QRTR: the modem's hello (answered from the link's thread) and the services it tells of (WLFW wanted)");
++	for (unsigned ms = 0; ms < listen_seconds * 1000; ms++) {
++		sleep_ms(1);
++	}
++	lck_mtx_lock(&qrtr_lock);
++	for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
++		services += qrtr_servers[i].there;
++		wlfw += qrtr_servers[i].there && qrtr_servers[i].service == 0x27;       /* WLFW is QMI service 0x27 (39) */
++	}
++	lck_mtx_unlock(&qrtr_lock);
++	printf("SWEET MPSS: %u: after %u s: %s; the modem is node %u, told of %u services (WLFW %s); it looked for %u of ours; QRTR "
++	    "received %u and sent %u datagrams\n", step, listen_seconds, qrtr_hellos ? "HELLO BOTH WAYS" : "NO HELLO FROM THE MODEM",
++	    qrtr_peer, services, wlfw ? "PRESENT - the Wi-Fi firmware service is up" : "not yet", qrtr_lookups, qrtr_in, qrtr_out);
++	return qrtr_hellos != 0;
++}
++
++/* ---- step 1: survey -------------------------------------------------------------------------------- */
++
++static bool
++step_survey(void)
++{
++	struct smp2p words;
++	uint32_t size = 0;
++
++	announce("read our partition with the modem in the shared memory, and its items");
++	show_partition();
++	if (dsp_words(&words)) {
++		show_words("the modem's item (435) is there: it has run since the phone was started", &words);
++	} else {
++		printf("SWEET MPSS: %u: the modem's SMP2P item (435) is not there\n", step);
++	}
++	printf("SWEET MPSS: %u: our item (428): %s; GLINK descriptor (478): %s, our queue (479): %s, the modem's (480): %s\n", step,
++	    smem_item(ITEM_SMP2P_OURS, &size) ? "there" : "not there", smem_item(478, &size) ? "there" : "not there",
++	    smem_item(479, &size) ? "there" : "not there", smem_item(480, &size) ? "there" : "not there (the modem makes it)");
++	show_crash_reason();
++	return smem_partition(SMEM_US, SMEM_MPSS, &size, &size) != 0;
++}
++
++/* ---- the steps, and bring-up ----------------------------------------------------------------------- */
++
++#define STEPS                   8
++static bool (*const steps[STEPS])(void) = {
++	step_survey, step_firmware, step_header, step_image, step_our_item, step_start, step_link, step_qrtr,
++};
++
++static bool keep;
++static uint32_t last_step = STEPS;
++
++static void
++run_steps(void)
++{
++	uint32_t done = 0;
++
++	for (step = 1; step <= last_step; step++) {
++		if (!steps[step - 1]()) {
++			printf("SWEET MPSS: step %u: FAILED; the steps after it are not attempted\n", step);
++			break;
++		}
++		printf("SWEET MPSS: step %u: done\n", step);
++		done = step;
++	}
++	step = done;
++	if (dsp_started && !(done == last_step && (keep || last_step == STEPS))) {
++		dsp_shutdown("the steps are over");
++	} else if (dsp_started) {
++		printf("SWEET MPSS: THE MODEM STAYS ON%s\n", link_runs ? ", and the link with it" : "");
++	}
++	printf("SWEET MPSS: over after step %u\n", done);
++}
++
++static void
++mpss_thread(__unused void *arg, __unused wait_result_t result)
++{
++	uint32_t delay_s = 20;
++	unsigned services = 0;
++
++	PE_parse_boot_argn("sweetmpssdelay", &delay_s, sizeof(delay_s));
++	printf("SWEET MPSS: the modem is brought up in %u s (steps up to %u)\n", delay_s, last_step);
 +	sleep_ms(delay_s * 1000u);
-+	printf("SWEET MPSS: step 1: TrustZone PAS support\n");
-+	sleep_ms(3000);
-+	probe_trustzone();
-+	printf("SWEET MPSS: step 2: SMEM\n");
-+	sleep_ms(3000);
-+	probe_smem();
-+	printf("SWEET MPSS: step 3: TrustZone PAS init image (signature check) + shutdown: modem, GPU zap\n");
-+	sleep_ms(3000);
-+	probe_signature(PAS_MPSS, "modem", "SWEETMDM");
-+	sleep_ms(1000);
-+	probe_signature(PAS_GPU, "GPU zap shader", "SWEETZAP");
-+	printf("SWEET MPSS: probe done\n");
++	/* the firmware is on the root, which may not be mounted yet: a minute at most */
++	for (unsigned waited = 0; waited < 300 && rootvnode == NULLVP; waited++) {
++		sleep_ms(200);
++	}
++	if (rootvnode == NULLVP) {
++		printf("SWEET MPSS: no root file system within a minute: the modem is not brought up\n");
++	} else {
++		run_steps();
++	}
++	if (step == STEPS && dsp_started) {
++		lck_mtx_lock(&qrtr_lock);
++		for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
++			services += qrtr_servers[i].there;
++		}
++		lck_mtx_unlock(&qrtr_lock);
++		printf("SWEET MPSS: THE MODEM IS UP AND LINKED: node %u, %u services; it stays on\n", qrtr_peer, services);
++	}
 +	(void)thread_terminate(current_thread());
 +	thread_block(THREAD_CONTINUE_NULL);
 +}
@@ -329,15 +3375,23 @@
 +sweet_mpss_init(void)
 +{
 +	static bool started;
-+	unsigned on = 0;
++	uint32_t on = 0, want_step = 0;
 +	thread_t thread;
++
 +	if (started) {
 +		return;
 +	}
-+	started = true;
-+	(void)PE_parse_boot_argn("sweetmpss", &on, sizeof(on));
-+	if (on == 0) {
++	PE_parse_boot_argn("sweetmpssstep", &want_step, sizeof(want_step));
++	if (want_step == 0 && (!PE_parse_boot_argn("sweetmpss", &on, sizeof(on)) || on == 0)) {
 +		return;
++	}
++	started = true;
++	if (want_step != 0) {
++		last_step = want_step > STEPS ? STEPS : want_step;
++		keep = option("modem_keep");
++	} else {
++		last_step = STEPS;
++		keep = true;
 +	}
 +	if (kernel_thread_start(mpss_thread, NULL, &thread) == KERN_SUCCESS) {
 +		thread_deallocate(thread);
