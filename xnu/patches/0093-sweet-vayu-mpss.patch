@@ -295,7 +295,7 @@
  /* MB/s of a 16 MB memcpy, best of 4 (cached kernel memory, the CPU renderer's kind of work). */
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,5820 @@
+@@ -0,0 +1,5854 @@
 +/*
 + * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 1 - the modem is loaded, authenticated and let
 + * out of reset, the link to it taken up, and the application processor's file services started, so that
@@ -5781,6 +5781,40 @@
 +			kfree_data(m, 2048);
 +		}
 +		return false;
++	}
++
++	/*
++	 * 0. power save off, as ath10k's add_interface for a station (RX wake policy WAKE, TX wake threshold ALWAYS,
++	 * PS-poll count no max: STA POWERSAVE PARAM 0x9002, TLV 0x6d) and ath10k_mac_vif_setup_ps with power save
++	 * not enabled (STA POWERSAVE MODE 0x9001, TLV 0x6c: disabled). ios-mpss26: associated, then the WLAN PD
++	 * asserted in wlan_powersave_sta.c:wlan_ps_sta_health_monitor_timeout with none of this sent.
++	 */
++	{
++		static const uint32_t ps_params[3][2] = { { 0, 0 }, { 1, 1 }, { 2, 0 } };
++
++		for (unsigned i = 0; i < 3; i++) {
++			bzero(m, 64);
++			at = 4;
++			tlv_hdr(m + at, 0x6d, 12);
++			put32(m + at + 4, 0);
++			put32(m + at + 8, ps_params[i][0]);
++			put32(m + at + 12, ps_params[i][1]);
++			at += 4 + 12;
++			if (!wlan_wmi_send(ce, 0x9002, m, at)) {
++				goto fail;
++			}
++		}
++		bzero(m, 64);
++		at = 4;
++		tlv_hdr(m + at, 0x6c, 8);
++		put32(m + at + 4, 0);                   /* vdev 0 */
++		put32(m + at + 8, 0);                   /* WMI_STA_PS_MODE_DISABLED */
++		at += 4 + 8;
++		if (!wlan_wmi_send(ce, 0x9001, m, at)) {
++			goto fail;
++		}
++		bzero(m, 64);
++		printf("SWEET MPSS: %u: station power save off (as ath10k without power save)\n", step);
 +	}
 +
 +	/* 1. VDEV START on the router's channel (no SSID for a station, as ath10k) */
