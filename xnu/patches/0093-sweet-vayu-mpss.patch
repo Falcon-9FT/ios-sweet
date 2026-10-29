@@ -295,7 +295,7 @@
  /* MB/s of a 16 MB memcpy, best of 4 (cached kernel memory, the CPU renderer's kind of work). */
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,4045 @@
+@@ -0,0 +1,4050 @@
 +/*
 + * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 1 - the modem is loaded, authenticated and let
 + * out of reset, the link to it taken up, and the application processor's file services started, so that
@@ -4110,7 +4110,12 @@
 +	sleep_ms(3000);
 +	volatile uint32_t *ce = NULL;
 +	if (read) {
-+		ce = (volatile uint32_t *)ml_io_map(WLAN_MEMBASE + WLAN_CE0, WLAN_CE_WRAPPER - WLAN_CE0 + 0x1000);
++		static volatile uint32_t *ce_map;       /* ml_io_map() is permanent: mapped once, never unmapped */
++
++		if (ce_map == NULL) {
++			ce_map = (volatile uint32_t *)ml_io_map(WLAN_MEMBASE + WLAN_CE0, WLAN_CE_WRAPPER - WLAN_CE0 + 0x1000);
++		}
++		ce = ce_map;
 +		if (ce == NULL) {
 +			kfree_data(m, 1024);
 +			return false;
@@ -4132,9 +4137,6 @@
 +	}
 +	printf("SWEET MPSS: %u: mode MISSION: errno %d, result %u, error %u\n", step, e, result, error);
 +	if (e != 0 || result != 0) {
-+		if (ce != NULL) {
-+			ml_io_unmap((vm_offset_t)ce, WLAN_CE_WRAPPER - WLAN_CE0 + 0x1000);
-+		}
 +		return false;
 +	}
 +	/*
@@ -4161,7 +4163,6 @@
 +			}
 +			printf("SWEET MPSS: %u:   CE%u: %s\n", step, c, line);
 +		}
-+		ml_io_unmap((vm_offset_t)ce, WLAN_CE_WRAPPER - WLAN_CE0 + 0x1000);
 +	}
 +	printf("SWEET MPSS: %u: THE RADIO IS IN MISSION MODE\n", step);
 +	return true;
@@ -4189,7 +4190,12 @@
 +	uint32_t cr0, idr0, idr1, groups, banks, page, half, found = 0;
 +
 +	announce("read how the boot chain left the SMMU for the radio's stream 0x640 (apps-smmu@0x15000000; nothing written)");
-+	s = (volatile uint32_t *)ml_io_map(APPS_SMMU, APPS_SMMU_SIZE);
++	static volatile uint32_t *smmu_map;     /* ml_io_map() is permanent: mapped once, never unmapped */
++
++	if (smmu_map == NULL) {
++		smmu_map = (volatile uint32_t *)ml_io_map(APPS_SMMU, APPS_SMMU_SIZE);
++	}
++	s = smmu_map;
 +	if (s == NULL) {
 +		return false;
 +	}
@@ -4225,7 +4231,6 @@
 +		}
 +	}
 +	printf("SWEET MPSS: %u: %u stream match entr%s take the radio's stream\n", step, found, found == 1 ? "y" : "ies");
-+	ml_io_unmap((vm_offset_t)s, APPS_SMMU_SIZE);
 +	return true;
 +}
 +
