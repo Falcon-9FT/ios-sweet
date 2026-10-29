@@ -175,7 +175,7 @@
  void sweet_bw_init(void);
  
  /* Live downstream DT has two positional reg entries, no reg-names. */
-@@ -397,6 +399,59 @@
+@@ -397,6 +399,65 @@
  	return error;
  }
  
@@ -195,6 +195,8 @@
 +		{ "ldoa7", 1800, 1800 },        /* vdd-1.8-xo, pm8150 L7 */
 +		{ "ldoc2", 1304, 1304 },        /* vdd-1.3-rfa, pm8150l L2 */
 +		{ "ldoc11", 3104, 3312 },       /* vdd-3.3-ch0, pm8150l L11 (the touch panel's too) */
++		{ "rfclka2", 0, 0 },            /* the radio's XO (mainline sm8150.dtsi: cxo_ref_clk_pin = RPMH_RF_CLK2):
++		                                 * a VRM resource of clk-rpmh, enable only */
 +	};
 +	unsigned i;
 +	uint32_t address = 0;
@@ -216,7 +218,11 @@
 +	if (!error) {
 +		error = rh_lookup(res, RH_VRM, &address);
 +	}
-+	if (!error && on) {
++	if (!error && allowed[i].max_mv == 0) {
++		const uint32_t addresses[1] = {address + 4};     /* CLK_RPMH_VRM_EN_OFFSET */
++		const uint32_t values[1] = {on ? 1u : 0u};
++		error = rh_send(addresses, values, 1, res);
++	} else if (!error && on) {
 +		const uint32_t addresses[3] = {address, address + 8, address + 4};
 +		const uint32_t values[3] = {mv, 7, 1};
 +		error = rh_send(addresses, values, 3, res);
@@ -235,7 +241,7 @@
  /* Highest level of each named bus clock manager (BCM), one active-only request, commit on each. */
  int
  sweet_rpmh_bcm_max(const char *const *names, unsigned count)
-@@ -457,6 +512,51 @@
+@@ -457,6 +518,51 @@
  	}
  	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
  	return error;
@@ -289,7 +295,7 @@
  /* MB/s of a 16 MB memcpy, best of 4 (cached kernel memory, the CPU renderer's kind of work). */
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,3800 @@
+@@ -0,0 +1,3806 @@
 +/*
 + * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 1 - the modem is loaded, authenticated and let
 + * out of reset, the link to it taken up, and the application processor's file services started, so that
@@ -3845,7 +3851,7 @@
 +		static const struct {
 +			const char *res;
 +			unsigned mv;
-+		} supplies[] = { { "ldoa1", 752 }, { "ldoa7", 1800 }, { "ldoc2", 1304 }, { "ldoc11", 3300 } };
++		} supplies[] = { { "ldoa1", 752 }, { "ldoa7", 1800 }, { "ldoc2", 1304 }, { "ldoc11", 3300 }, { "rfclka2", 0 } };
 +		uint32_t power = 1;
 +
 +		PE_parse_boot_argn("sweetwlfwpower", &power, sizeof(power));
@@ -3858,6 +3864,12 @@
 +				return false;
 +			}
 +			sleep_ms(1);
++		}
++		/* the second clock of mainline's wifi node: "qdss", which qcom_aoss turns on with a message to the AOP */
++		if (power) {
++			bool qdss = mailbox_send("{class: clock, res: qdss, val: 1}");
++
++			printf("SWEET MPSS: %u: the always-on processor %s \"qdss on\"\n", step, qdss ? "has taken" : "DID NOT TAKE");
 +		}
 +	}
 +
