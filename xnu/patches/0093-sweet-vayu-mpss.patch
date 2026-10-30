@@ -295,7 +295,7 @@
  /* MB/s of a 16 MB memcpy, best of 4 (cached kernel memory, the CPU renderer's kind of work). */
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,5887 @@
+@@ -0,0 +1,5907 @@
 +/*
 + * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 1 - the modem is loaded, authenticated and let
 + * out of reset, the link to it taken up, and the application processor's file services started, so that
@@ -5814,6 +5814,26 @@
 +			kfree_data(m, 2048);
 +		}
 +		return false;
++	}
++
++	/*
++	 * WMI credits: the scan's three commands may not all have been credited back by now - step 15 stops its pump
++	 * the moment the scan COMPLETED event arrives, so a credit report riding a later message is never drained, and
++	 * the endpoint can read empty though the firmware freed those command buffers seconds ago (ios-mpss29: 0
++	 * credits, the first command of step 16 starved for 3 s). Give a pending credit a short moment; then, the scan
++	 * being quiescent and every scan command long done, trust the grant READY gave (2) so the sends below proceed.
++	 */
++	{
++		uint8_t eid = wlan_wmi_eid & 7;
++
++		for (unsigned t = 0; t < 500 && wlan_credits[eid] < 2; t++) {
++			wlan_pump(ce, 1);
++		}
++		printf("SWEET MPSS: %u: WMI credits on entering the connection: %u\n", step, wlan_credits[eid]);
++		if (wlan_credits[eid] < 2) {
++			wlan_credits[eid] = 2;
++			printf("SWEET MPSS: %u: the scan is quiescent - WMI credits restored to the READY grant (2)\n", step);
++		}
 +	}
 +
 +	/*
