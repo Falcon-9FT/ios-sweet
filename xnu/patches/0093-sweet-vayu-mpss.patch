@@ -295,7 +295,7 @@
  /* MB/s of a 16 MB memcpy, best of 4 (cached kernel memory, the CPU renderer's kind of work). */
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,5942 @@
+@@ -0,0 +1,5962 @@
 +/*
 + * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 1 - the modem is loaded, authenticated and let
 + * out of reset, the link to it taken up, and the application processor's file services started, so that
@@ -5002,6 +5002,7 @@
 +#define WMI_PEER_CREATE         0x6001u
 +#define WMI_PEER_ASSOC          0x6005u
 +#define WMI_MGMT_TX             0x7008u          /* MGMT_TX_SEND: the frame carried by physical address */
++#define WMI_PEER_SET_PARAM      0x6004u          /* poke the fw STA power-save state machine (dummy param) */
 +#define WMI_STA_KEEPALIVE       0x1c005u         /* TID_ADDBA group (0x1c): turn the firmware keepalive off */
 +#define WMI_EV_VDEV_START_RESP  0x5001u
 +#define WMI_TLV_MGMT_TX_MAX     64u              /* bytes of the frame copied inline; the rest read by address */
@@ -6046,17 +6047,19 @@
 +	}
 +
 +	/*
-+	 * 5. firmware keepalive off, then power save off, now that the link is up.
++	 * 5. poke the firmware power-save state machine, then turn the firmware keepalive and power save off, now
++	 * that the link is up.
 +	 *
-+	 * The WLAN PD runs a station power-save health monitor once associated; left at its default the firmware
-+	 * keepalive makes it assert wlan_ps_sta_health_monitor_timeout a few seconds after the link comes up - both
-+	 * ios-mpss26 and ios-mpss32 reached VDEV UP and the modem then crashed right there, power save alone did not
-+	 * prevent it. ath10k turns the firmware keepalive off at add_interface (ath10k_mac_vif_disable_keepalive):
-+	 * STA KEEPALIVE, method NULL_FRAME, interval 0 (DISABLE) - some firmware ignores the `enabled` field, so the
-+	 * zero interval is what disables it; the ARP-response TLV is required but left empty. Then power save off, as
-+	 * ath10k from bss_info_changed (ath10k_mac_vif_setup_ps): STA POWERSAVE PARAM (0x9002, TLV 0x6d: RX wake
-+	 * policy WAKE, TX wake threshold ALWAYS, PS-poll count no max), then STA POWERSAVE MODE (0x9001, TLV 0x6c:
-+	 * disabled).
++	 * The WLAN PD runs a station power-save health monitor once associated and asserts
++	 * wlan_ps_sta_health_monitor_timeout a few seconds after the link comes up (ios-mpss26, ios-mpss32,
++	 * ios-mpss33 all reached VDEV UP, then the modem crashed right there; keepalive-off and power-save-off did
++	 * not prevent it). ath10k issues a peer_set_param with the dummy parameter (0xff) immediately after VDEV UP
++	 * for exactly this: "Some firmware revisions have a buggy powersave state machine and must be poked with a
++	 * peer param command" (ath10k_bss_assoc). Then, as ath10k elsewhere: the firmware keepalive off
++	 * (ath10k_mac_vif_disable_keepalive - STA KEEPALIVE, method NULL_FRAME, interval 0 (DISABLE); some firmware
++	 * ignores the `enabled` field, so the zero interval disables it; the ARP-response TLV is required but empty),
++	 * and power save off (ath10k_mac_vif_setup_ps - STA POWERSAVE PARAM 0x9002, TLV 0x6d: RX wake policy WAKE, TX
++	 * wake threshold ALWAYS, PS-poll count no max; then STA POWERSAVE MODE 0x9001, TLV 0x6c: disabled).
 +	 *
 +	 * None of these draw a reply, and the firmware returns a WMI credit only riding a message it sends of its own:
 +	 * the connection commands above each drew an event that carried their credit back, but here nothing comes and
@@ -6072,6 +6075,23 @@
 +			{ 0x9001, 0x6c, 8, 0, 0 },      /* STA POWERSAVE MODE: disabled */
 +		};
 +		uint8_t eid = wlan_wmi_eid & 7;
++
++		/* peer_set_param DUMMY_VAR (0xff) = 1: the ath10k poke for the buggy fw power-save state machine */
++		sleep_ms(30);
++		if (wlan_credits[eid] == 0) {
++			wlan_credits[eid] = 1;
++		}
++		bzero(m, 64);
++		at = 4;
++		tlv_hdr(m + at, 0x64, 20);              /* wmi_peer_set_param_cmd */
++		put32(m + at + 4 + 0x00, 0);            /* vdev 0 */
++		memcpy(m + at + 4 + 0x04, net->bssid, 6);       /* peer_macaddr (wmi_mac_addr, 8 bytes) */
++		put32(m + at + 4 + 0x0c, 0xff);         /* param_id: PEER_DUMMY_VAR */
++		put32(m + at + 4 + 0x10, 1);            /* param_value */
++		at += 4 + 20;
++		if (!wlan_wmi_send(ce, WMI_PEER_SET_PARAM, m, at)) {
++			goto fail;
++		}
 +
 +		/* STA KEEPALIVE: disabled - method NULL_FRAME (1), interval 0; empty ARP-response TLV follows */
 +		sleep_ms(30);
@@ -6110,7 +6130,7 @@
 +				goto fail;
 +			}
 +		}
-+		printf("SWEET MPSS: %u: keepalive off, station power save off (as ath10k)\n", step);
++		printf("SWEET MPSS: %u: power-save state machine poked, keepalive off, power save off (as ath10k)\n", step);
 +	}
 +	kfree_data(m, 2048);
 +	printf("SWEET MPSS: %u: VDEV UP - CONNECTED to \"%.*s\"%s\n", step, ssid_len, ssid,
