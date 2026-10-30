@@ -295,7 +295,7 @@
  /* MB/s of a 16 MB memcpy, best of 4 (cached kernel memory, the CPU renderer's kind of work). */
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,5916 @@
+@@ -0,0 +1,5942 @@
 +/*
 + * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 1 - the modem is loaded, authenticated and let
 + * out of reset, the link to it taken up, and the application processor's file services started, so that
@@ -5002,6 +5002,7 @@
 +#define WMI_PEER_CREATE         0x6001u
 +#define WMI_PEER_ASSOC          0x6005u
 +#define WMI_MGMT_TX             0x7008u          /* MGMT_TX_SEND: the frame carried by physical address */
++#define WMI_STA_KEEPALIVE       0x1c005u         /* TID_ADDBA group (0x1c): turn the firmware keepalive off */
 +#define WMI_EV_VDEV_START_RESP  0x5001u
 +#define WMI_TLV_MGMT_TX_MAX     64u              /* bytes of the frame copied inline; the rest read by address */
 +
@@ -6045,14 +6046,21 @@
 +	}
 +
 +	/*
-+	 * 5. power save off, now that the link is up - as ath10k, which configures it from bss_info_changed once
-+	 * associated (ath10k_mac_vif_setup_ps), not at add_interface. STA POWERSAVE PARAM (0x9002, TLV 0x6d: RX wake
-+	 * policy WAKE, TX wake threshold ALWAYS, PS-poll count no max), then STA POWERSAVE MODE (0x9001, TLV 0x6c:
-+	 * disabled). Without it the WLAN PD asserts wlan_ps_sta_health_monitor_timeout (ios-mpss26).
++	 * 5. firmware keepalive off, then power save off, now that the link is up.
 +	 *
-+	 * These draw no reply, and the firmware returns a WMI credit only riding a message it sends of its own: the
-+	 * connection commands above each drew an event that carried their credit back, but here nothing comes and the
-+	 * four sets would starve (ios-mpss31: associated to aid 3, then the first 0x9002 waited 3 s for a credit that
++	 * The WLAN PD runs a station power-save health monitor once associated; left at its default the firmware
++	 * keepalive makes it assert wlan_ps_sta_health_monitor_timeout a few seconds after the link comes up - both
++	 * ios-mpss26 and ios-mpss32 reached VDEV UP and the modem then crashed right there, power save alone did not
++	 * prevent it. ath10k turns the firmware keepalive off at add_interface (ath10k_mac_vif_disable_keepalive):
++	 * STA KEEPALIVE, method NULL_FRAME, interval 0 (DISABLE) - some firmware ignores the `enabled` field, so the
++	 * zero interval is what disables it; the ARP-response TLV is required but left empty. Then power save off, as
++	 * ath10k from bss_info_changed (ath10k_mac_vif_setup_ps): STA POWERSAVE PARAM (0x9002, TLV 0x6d: RX wake
++	 * policy WAKE, TX wake threshold ALWAYS, PS-poll count no max), then STA POWERSAVE MODE (0x9001, TLV 0x6c:
++	 * disabled).
++	 *
++	 * None of these draw a reply, and the firmware returns a WMI credit only riding a message it sends of its own:
++	 * the connection commands above each drew an event that carried their credit back, but here nothing comes and
++	 * the sets would starve (ios-mpss31: associated to aid 3, then the first 0x9002 waited 3 s for a credit that
 +	 * never came). They are tiny and the firmware frees each in well under a millisecond, so pace them - a short
 +	 * wait lets the previous one be consumed - and, the endpoint being idle, keep one credit in hand for the next.
 +	 */
@@ -6063,10 +6071,28 @@
 +			{ 0x9002, 0x6d, 12, 2, 0 },     /* PS-poll count: no maximum */
 +			{ 0x9001, 0x6c, 8, 0, 0 },      /* STA POWERSAVE MODE: disabled */
 +		};
++		uint8_t eid = wlan_wmi_eid & 7;
++
++		/* STA KEEPALIVE: disabled - method NULL_FRAME (1), interval 0; empty ARP-response TLV follows */
++		sleep_ms(30);
++		if (wlan_credits[eid] == 0) {
++			wlan_credits[eid] = 1;
++		}
++		bzero(m, 64);
++		at = 4;
++		tlv_hdr(m + at, 0x7f, 16);              /* wmi_tlv_sta_keepalive_cmd */
++		put32(m + at + 4 + 0x00, 0);            /* vdev 0 */
++		put32(m + at + 4 + 0x04, 1);            /* enabled (ignored by some fw; the interval disables) */
++		put32(m + at + 4 + 0x08, 1);            /* method: NULL_FRAME */
++		put32(m + at + 4 + 0x0c, 0);            /* interval 0: DISABLE */
++		at += 4 + 16;
++		tlv_hdr(m + at, 0x80, 16);              /* wmi_sta_keepalive_arp_resp: all zero */
++		at += 4 + 16;
++		if (!wlan_wmi_send(ce, WMI_STA_KEEPALIVE, m, at)) {
++			goto fail;
++		}
 +
 +		for (unsigned i = 0; i < 4; i++) {
-+			uint8_t eid = wlan_wmi_eid & 7;
-+
 +			sleep_ms(30);                   /* let the firmware consume and free the previous set */
 +			if (wlan_credits[eid] == 0) {
 +				wlan_credits[eid] = 1;
@@ -6084,7 +6110,7 @@
 +				goto fail;
 +			}
 +		}
-+		printf("SWEET MPSS: %u: station power save off (as ath10k without power save)\n", step);
++		printf("SWEET MPSS: %u: keepalive off, station power save off (as ath10k)\n", step);
 +	}
 +	kfree_data(m, 2048);
 +	printf("SWEET MPSS: %u: VDEV UP - CONNECTED to \"%.*s\"%s\n", step, ssid_len, ssid,
