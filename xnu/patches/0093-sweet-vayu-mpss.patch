@@ -295,7 +295,7 @@
  /* MB/s of a 16 MB memcpy, best of 4 (cached kernel memory, the CPU renderer's kind of work). */
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,5907 @@
+@@ -0,0 +1,5909 @@
 +/*
 + * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 1 - the modem is loaded, authenticated and let
 + * out of reset, the link to it taken up, and the application processor's file services started, so that
@@ -5836,40 +5836,6 @@
 +		}
 +	}
 +
-+	/*
-+	 * 0. power save off, as ath10k's add_interface for a station (RX wake policy WAKE, TX wake threshold ALWAYS,
-+	 * PS-poll count no max: STA POWERSAVE PARAM 0x9002, TLV 0x6d) and ath10k_mac_vif_setup_ps with power save
-+	 * not enabled (STA POWERSAVE MODE 0x9001, TLV 0x6c: disabled). ios-mpss26: associated, then the WLAN PD
-+	 * asserted in wlan_powersave_sta.c:wlan_ps_sta_health_monitor_timeout with none of this sent.
-+	 */
-+	{
-+		static const uint32_t ps_params[3][2] = { { 0, 0 }, { 1, 1 }, { 2, 0 } };
-+
-+		for (unsigned i = 0; i < 3; i++) {
-+			bzero(m, 64);
-+			at = 4;
-+			tlv_hdr(m + at, 0x6d, 12);
-+			put32(m + at + 4, 0);
-+			put32(m + at + 8, ps_params[i][0]);
-+			put32(m + at + 12, ps_params[i][1]);
-+			at += 4 + 12;
-+			if (!wlan_wmi_send(ce, 0x9002, m, at)) {
-+				goto fail;
-+			}
-+		}
-+		bzero(m, 64);
-+		at = 4;
-+		tlv_hdr(m + at, 0x6c, 8);
-+		put32(m + at + 4, 0);                   /* vdev 0 */
-+		put32(m + at + 8, 0);                   /* WMI_STA_PS_MODE_DISABLED */
-+		at += 4 + 8;
-+		if (!wlan_wmi_send(ce, 0x9001, m, at)) {
-+			goto fail;
-+		}
-+		bzero(m, 64);
-+		printf("SWEET MPSS: %u: station power save off (as ath10k without power save)\n", step);
-+	}
-+
 +	/* 1. VDEV START on the router's channel (no SSID for a station, as ath10k) */
 +	at = 4;
 +	tlv_hdr(m + at, 0x58, 0x48);                    /* VDEV_START_REQUEST_CMD, 72 bytes */
@@ -6076,6 +6042,42 @@
 +	at += 4 + 16;
 +	if (!wlan_wmi_send(ce, WMI_VDEV_UP, m, at)) {
 +		goto fail;
++	}
++
++	/*
++	 * 5. power save off, now that the link is up - as ath10k, which configures it from bss_info_changed once
++	 * associated (ath10k_mac_vif_setup_ps), not at add_interface. Here the firmware is sending events again
++	 * (PEER ASSOC CONF, the first EAPOL), so their HTC credit reports keep the WMI endpoint fed; sent before
++	 * VDEV START it starved - four fire-and-forget sets, no replies, no returns between them (ios-mpss30:
++	 * 2 credits, then the third 0x9002 waited 3 s for nothing). STA POWERSAVE PARAM 0x9002 (TLV 0x6d: RX wake
++	 * policy WAKE, TX wake threshold ALWAYS, PS-poll count no max), then STA POWERSAVE MODE 0x9001 (TLV 0x6c:
++	 * disabled). Without it the WLAN PD asserts wlan_ps_sta_health_monitor_timeout (ios-mpss26).
++	 */
++	{
++		static const uint32_t ps_params[3][2] = { { 0, 0 }, { 1, 1 }, { 2, 0 } };
++
++		for (unsigned i = 0; i < 3; i++) {
++			bzero(m, 64);
++			at = 4;
++			tlv_hdr(m + at, 0x6d, 12);
++			put32(m + at + 4, 0);
++			put32(m + at + 8, ps_params[i][0]);
++			put32(m + at + 12, ps_params[i][1]);
++			at += 4 + 12;
++			if (!wlan_wmi_send(ce, 0x9002, m, at)) {
++				goto fail;
++			}
++		}
++		bzero(m, 64);
++		at = 4;
++		tlv_hdr(m + at, 0x6c, 8);
++		put32(m + at + 4, 0);                   /* vdev 0 */
++		put32(m + at + 8, 0);                   /* WMI_STA_PS_MODE_DISABLED */
++		at += 4 + 8;
++		if (!wlan_wmi_send(ce, 0x9001, m, at)) {
++			goto fail;
++		}
++		printf("SWEET MPSS: %u: station power save off (as ath10k without power save)\n", step);
 +	}
 +	kfree_data(m, 2048);
 +	printf("SWEET MPSS: %u: VDEV UP - CONNECTED to \"%.*s\"%s\n", step, ssid_len, ssid,
