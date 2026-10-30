@@ -295,7 +295,7 @@
  /* MB/s of a 16 MB memcpy, best of 4 (cached kernel memory, the CPU renderer's kind of work). */
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,5962 @@
+@@ -0,0 +1,6042 @@
 +/*
 + * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 1 - the modem is loaded, authenticated and let
 + * out of reset, the link to it taken up, and the application processor's file services started, so that
@@ -5038,6 +5038,12 @@
 +static uint16_t wlan_assoc_status, wlan_assoc_aid;
 +static bool     wlan_deauth_seen;
 +static uint16_t wlan_deauth_reason;
++/* step 16, point 2 (WPA2 4-way handshake): what the EAPOL-Key frames carry. ANonce and the replay counter are
++ * not secret; the PSK and the derived keys are never printed. */
++static bool     wlan_eapol_m1_seen;
++static uint32_t wlan_eapol_seen;
++static uint8_t  wlan_anonce[32];
++static uint8_t  wlan_key_replay[8];
 +
 +/*
 + * HTT receive (ath10k htt.c/htt_rx.c/htt_tx.c for wcn3990, 64-bit; layouts checked by compiling ath10k's
@@ -5063,6 +5069,7 @@
 +
 +static bool wlan_beacon(const uint8_t *frame, uint32_t len, uint32_t channel, int signal, const char *how);
 +static void wlan_rx_mgmt(const uint8_t *frame, uint32_t buf_len, uint32_t channel, int signal);
++static void wlan_rx_eapol(const uint8_t *frame, uint32_t len);
 +
 +/* A buffer (by its index in the pool) put at the ring's head; the head published once the caller is done. */
 +static void
@@ -5103,7 +5110,11 @@
 +		len = le32(buf + 0x1c) & 0x3fff;                /* msdu_start.info0 */
 +	}
 +	if (len != 0 && 0x168 + len <= CE_RX_BUF) {
-+		(void)wlan_beacon(buf + 0x168, len, 0, 0, "over HTT");
++		const uint8_t *frame = buf + 0x168;
++
++		if (!wlan_beacon(frame, len, 0, 0, "over HTT")) {
++			wlan_rx_eapol(frame, len);         /* a data frame: maybe the WPA2 handshake */
++		}
 +	}
 +	wlan_htt_post(b);
 +}
@@ -5731,6 +5742,69 @@
 +	}
 +}
 +
++/*
++ * A received 802.11 data frame, checked for an EAPOL-Key frame of the WPA2 4-way handshake. These travel
++ * unencrypted - the keys are what they install - so messages 1 and 3 (from the router) arrive in clear. Here
++ * we only recognise them and keep message 1's ANonce and replay counter for the reply; deriving the keys and
++ * sending messages 2 and 4 is the next milestone. No key material is printed.
++ */
++static void
++wlan_rx_eapol(const uint8_t *frame, uint32_t len)
++{
++	uint8_t fc0 = frame[0];
++	uint32_t hdr = 24;
++	const uint8_t *e;
++	uint16_t info;
++
++	if ((fc0 & 0x0c) != 0x08) {                     /* not a data frame */
++		return;
++	}
++	if ((fc0 & 0xf0) >= 0x80) {                     /* QoS data: a 2-byte QoS control field */
++		hdr += 2;
++		if (frame[1] & 0x80) {                  /* Order bit on QoS data: 4-byte HT control */
++			hdr += 4;
++		}
++	}
++	/* LLC/SNAP header (AA AA 03 00 00 00) then the ethertype; EAPOL is 0x888e */
++	if (len < hdr + 8 || frame[hdr] != 0xaa || frame[hdr + 1] != 0xaa || frame[hdr + 2] != 0x03 ||
++	    frame[hdr + 6] != 0x88 || frame[hdr + 7] != 0x8e) {
++		/* not where expected: report this data frame a few times so the real layout can be read off the log */
++		static unsigned diag;
++
++		if (diag < 4) {
++			int off = -1;
++
++			for (unsigned i = 0; i + 1 < len && i < 96; i++) {
++				if (frame[i] == 0x88 && frame[i + 1] == 0x8e) {
++					off = (int)i;
++					break;
++				}
++			}
++			diag++;
++			printf("SWEET MPSS: %u: data frame fc %#04x, len %u, 0x888e at offset %d (-1 = none)\n",
++			    step, fc0, len, off);
++		}
++		return;
++	}
++	e = frame + hdr + 8;                            /* EAPOL header: version, type, length(2) */
++	if (len < hdr + 8 + 49 || e[1] != 3) {          /* 3 = EAPOL-Key; need through the key nonce (e+17..48) */
++		return;
++	}
++	info = (uint16_t)(e[5] << 8 | e[6]);            /* key information (big-endian) */
++	wlan_eapol_seen++;
++	if ((info & 0x0008) && (info & 0x0080) && !(info & 0x0100)) {    /* Pairwise + ACK, no MIC: message 1 */
++		memcpy(wlan_anonce, e + 17, 32);                        /* key nonce = ANonce */
++		memcpy(wlan_key_replay, e + 9, 8);                      /* replay counter, echoed in message 2 */
++		wlan_eapol_m1_seen = true;
++		printf("SWEET MPSS: %u: EAPOL-Key message 1 of the WPA2 handshake received (key info %#06x)\n",
++		    step, info);
++	} else if ((info & 0x0008) && (info & 0x0080) && (info & 0x0100)) {      /* Pairwise + ACK + MIC: message 3 */
++		printf("SWEET MPSS: %u: EAPOL-Key message 3 received (key info %#06x)\n", step, info);
++	} else {
++		printf("SWEET MPSS: %u: EAPOL-Key frame received (key info %#06x)\n", step, info);
++	}
++}
++
 +/* Handle whatever the target has to say for about ms milliseconds. */
 +static void
 +wlan_pump(volatile uint32_t *ce, unsigned ms)
@@ -5810,6 +5884,8 @@
 +	    net->channel, freq, has_ht ? ", HT" : "", has_rsn ? ", WPA2" : " (open)");
 +
 +	wlan_vdev_started = wlan_auth_seen = wlan_assoc_seen = wlan_deauth_seen = false;
++	wlan_eapol_m1_seen = false;
++	wlan_eapol_seen = 0;
 +	m = kalloc_data(2048, Z_WAITOK | Z_ZERO);
 +	if (m == NULL || !wlan_page_get(&wlan_mgmt)) {
 +		if (m != NULL) {
@@ -6137,8 +6213,12 @@
 +	    has_rsn ? "; waiting for the WPA2 handshake to begin (EAPOL)" : "");
 +	/* a WPA2 router sends the first EAPOL message at once (HTT data): watch a few seconds as a sign it took */
 +	wlan_pump(ce, 5000);
-+	printf("SWEET MPSS: %u: %u frames received since the link came up%s\n", step, wlan_htt_frames,
-+	    wlan_deauth_seen ? " (then the router disconnected us)" : "");
++	if (wlan_deauth_seen) {
++		printf("SWEET MPSS: %u: %u frames received, then the router disconnected us (reason %u)\n",
++		    step, wlan_htt_frames, wlan_deauth_reason);
++	} else {
++		printf("SWEET MPSS: %u: %u frames received since the link came up\n", step, wlan_htt_frames);
++	}
 +	return !wlan_deauth_seen;
 +
 +fail:
