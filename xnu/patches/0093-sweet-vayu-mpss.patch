@@ -295,7 +295,7 @@
  /* MB/s of a 16 MB memcpy, best of 4 (cached kernel memory, the CPU renderer's kind of work). */
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,5854 @@
+@@ -0,0 +1,5887 @@
 +/*
 + * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 1 - the modem is loaded, authenticated and let
 + * out of reset, the link to it taken up, and the application processor's file services started, so that
@@ -5007,7 +5007,9 @@
 +
 +static const uint16_t wlan_scan_mhz[] = {
 +	2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
-+	5180, 5200, 5220, 5240, 5745, 5765, 5785, 5805, 5825,
++	5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320,
++	5500, 5520, 5540, 5560, 5580, 5600, 5620, 5640, 5660, 5680, 5700,       /* 100-140: the user's router is on 100 */
++	5745, 5765, 5785, 5805, 5825,
 +};
 +/* Each network heard once, with enough of its beacon (capability, channel, the information elements) for step 16
 + * to start a connection without scanning again. */
@@ -5423,15 +5425,15 @@
 +	return true;
 +}
 +
++static bool wlan_scan_run(volatile uint32_t *ce, uint32_t scan_id, uint32_t dwell);
++
 +static bool
 +step_scan(void)
 +{
 +	volatile uint32_t *ce = wlan_ce_map();
 +	const unsigned channels = sizeof(wlan_scan_mhz) / sizeof(wlan_scan_mhz[0]);
-+	static uint8_t in[2048];
 +	uint8_t *m;
 +	uint32_t at;
-+	unsigned from = 0;
 +
 +	if (ce == NULL || wlan_wmi_eid == 0) {
 +		return false;
@@ -5459,7 +5461,9 @@
 +		bzero(c, 0x18);
 +		put32(c + 0x00, wlan_scan_mhz[i]);
 +		put32(c + 0x04, wlan_scan_mhz[i]);
-+		put32(c + 0x0c, wlan_scan_mhz[i] < 5000 ? 0x1941 : 0x1940);     /* 11G / 11A, HT, VHT, HT40+, ad hoc */
++		/* 11G / 11A with HT, VHT, HT40+, ad hoc; 5250-5730 MHz (52-144) are radar channels: DFS and passive */
++		put32(c + 0x0c, wlan_scan_mhz[i] < 5000 ? 0x1941 : wlan_scan_mhz[i] >= 5250 && wlan_scan_mhz[i] <= 5730 ? 0x1cc0 :
++		    0x1940);
 +		c[0x11] = c[0x12] = c[0x15] = 0x28;                             /* 20 dBm, in 0.5 dBm */
 +	}
 +	if (!wlan_wmi_send(ce, WMI_SCAN_CHAN_LIST, m, at)) {
@@ -5482,20 +5486,35 @@
 +		return false;
 +	}
 +	printf("SWEET MPSS: %u: VDEV CREATE sent (vdev 0, station, 02:50:43:4f:01:01)\n", step);
-+	/* START SCAN, passive, on all those channels */
-+	bzero(m, 2048);
++	kfree_data(m, 2048);
++	return wlan_scan_run(ce, 0xa000, 150);
++}
++
++/* START SCAN (passive, all of wlan_scan_mhz, dwell ms per channel) and up to 20 s of what is heard. */
++static bool
++wlan_scan_run(volatile uint32_t *ce, uint32_t scan_id, uint32_t dwell)
++{
++	static uint8_t in[2048];
++	const unsigned channels = sizeof(wlan_scan_mhz) / sizeof(wlan_scan_mhz[0]);
++	unsigned from = 0;
++	uint32_t at;
++	uint8_t *m = kalloc_data(2048, Z_WAITOK | Z_ZERO);
++
++	if (m == NULL) {
++		return false;
++	}
 +	at = 4;
 +	tlv_hdr(m + at, 0x4d, 0x64);
 +	{
 +		uint8_t *s = m + at + 4;
 +
-+		put32(s + 0x00, 0xa000);                        /* scan id */
++		put32(s + 0x00, scan_id);
 +		put32(s + 0x04, 0xa001);                        /* requestor */
 +		put32(s + 0x08, 0);                             /* vdev */
 +		put32(s + 0x0c, 1);                             /* priority low */
 +		put32(s + 0x10, 0x11f);                         /* events: started .. foreign channel exit */
 +		put32(s + 0x14, 50);                            /* dwell active */
-+		put32(s + 0x18, 150);                           /* dwell passive */
++		put32(s + 0x18, dwell);                         /* dwell passive */
 +		put32(s + 0x1c, 50);                            /* min rest */
 +		put32(s + 0x20, 500);                           /* max rest */
 +		put32(s + 0x30, 20000);                         /* max scan time */
@@ -5523,7 +5542,9 @@
 +		return false;
 +	}
 +	kfree_data(m, 2048);
-+	printf("SWEET MPSS: %u: START SCAN sent (passive, %u channels); listening 20 s\n", step, channels);
++	wlan_scan_done = false;
++	printf("SWEET MPSS: %u: START SCAN %#x sent (passive, %u channels, %u ms each); listening 20 s\n", step, scan_id,
++	    channels, dwell);
 +	for (uint64_t end = now_us() + 20000000ull; now_us() < end && !wlan_scan_done;) {
 +		uint32_t n = wlan_htc_wait(ce, in, sizeof(in), 1, &from);
 +
@@ -5757,8 +5778,20 @@
 +			break;
 +		}
 +	}
++	/* not heard (a passive scan can miss a beacon; routers move channel): up to three more scans, longer each */
++	for (unsigned again = 0; net == NULL && again < 3; again++) {
++		printf("SWEET MPSS: %u: \"%.*s\" not among the %u networks heard; scanning again (%u ms a channel)\n", step,
++		    ssid_len, ssid, wlan_seen_count, 250 + 100 * again);
++		(void)wlan_scan_run(ce, 0xa001 + again, 250 + 100 * again);
++		for (unsigned i = 0; i < wlan_seen_count; i++) {
++			if (wlan_nets[i].ssid_len == ssid_len && memcmp(wlan_nets[i].ssid, ssid, ssid_len) == 0) {
++				net = &wlan_nets[i];
++				break;
++			}
++		}
++	}
 +	if (net == NULL) {
-+		printf("SWEET MPSS: %u: the network \"%.*s\" was not among the %u the scan heard\n", step, ssid_len, ssid,
++		printf("SWEET MPSS: %u: the network \"%.*s\" was not among the %u the scans heard\n", step, ssid_len, ssid,
 +		    wlan_seen_count);
 +		return false;
 +	}
