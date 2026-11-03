@@ -295,7 +295,7 @@
  /* MB/s of a 16 MB memcpy, best of 4 (cached kernel memory, the CPU renderer's kind of work). */
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,6157 @@
+@@ -0,0 +1,6356 @@
 +/*
 + * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 1 - the modem is loaded, authenticated and let
 + * out of reset, the link to it taken up, and the application processor's file services started, so that
@@ -377,6 +377,7 @@
 +#include <vm/vm_kern.h>
 +#include <vm/memory_types.h>
 +#include <sys/uio.h>
++#include <sys/random.h>
 +#include <sys/vnode.h>
 +#include <sys/vnode_internal.h>
 +#include <stdarg.h>
@@ -5042,6 +5043,7 @@
 +/* step 16, point 2 (WPA2 4-way handshake): what the EAPOL-Key frames carry. ANonce and the replay counter are
 + * not secret; the PSK and the derived keys are never printed. */
 +static bool     wlan_eapol_m1_seen;
++static bool     wlan_eapol_m3_seen;
 +static uint32_t wlan_eapol_seen;
 +static uint8_t  wlan_anonce[32];
 +static uint8_t  wlan_key_replay[8];
@@ -5800,6 +5802,7 @@
 +		printf("SWEET MPSS: %u: EAPOL-Key message 1 of the WPA2 handshake received (key info %#06x)\n",
 +		    step, info);
 +	} else if ((info & 0x0008) && (info & 0x0080) && (info & 0x0100)) {      /* Pairwise + ACK + MIC: message 3 */
++		wlan_eapol_m3_seen = true;
 +		printf("SWEET MPSS: %u: EAPOL-Key message 3 received (key info %#06x)\n", step, info);
 +	} else {
 +		printf("SWEET MPSS: %u: EAPOL-Key frame received (key info %#06x)\n", step, info);
@@ -5935,6 +5938,110 @@
 +	return ok;
 +}
 +
++/* IEEE 802.11 PRF-n over HMAC-SHA1: out = HMAC(key, label || 0x00 || data || i) for i = 0,1,... truncated. */
++static void
++wlan_prf(const uint8_t *key, unsigned keylen, const char *label, const uint8_t *data, unsigned datalen,
++    uint8_t *out, unsigned outlen)
++{
++	uint8_t buf[128], hash[20];
++	unsigned labellen = (unsigned)strlen(label);
++	unsigned done = 0, i = 0;
++
++	while (done < outlen) {
++		unsigned at = 0, n;
++
++		memcpy(buf + at, label, labellen);
++		at += labellen;
++		buf[at++] = 0x00;
++		memcpy(buf + at, data, datalen);
++		at += datalen;
++		buf[at++] = (uint8_t)i;
++		wlan_hmac_sha1(key, keylen, buf, at, hash);
++		n = outlen - done < 20 ? outlen - done : 20;
++		memcpy(out + done, hash, n);
++		done += n;
++		i++;
++	}
++}
++
++/*
++ * Read the passphrase (line 2 of /fw/network) and derive the WPA2 PMK into pmk[32]: PBKDF2-HMAC-SHA1 with the
++ * SSID as salt, 4096 iterations. The passphrase lives only inside this call - never printed, never kept. Returns
++ * false if line 2 is missing or not a usable 8..63-character passphrase.
++ */
++static bool
++wlan_network_pmk(const uint8_t *ssid, unsigned ssid_len, uint8_t pmk[32])
++{
++	char buf[160];
++	uint8_t psk[64];
++	vfs_context_t context = vfs_context_kernel();
++	vnode_t vnode = NULLVP;
++	int left = 0, got = 0;
++	unsigned i = 0, pl = 0;
++	bool ok = false;
++
++	if (rootvnode == NULLVP || vnode_lookup("/fw/network", 0, &vnode, context) != 0) {
++		return false;
++	}
++	if (vn_rdwr(UIO_READ, vnode, (caddr_t)buf, (int)sizeof(buf), 0, UIO_SYSSPACE, 0, vfs_context_ucred(context),
++	    &left, vfs_context_proc(context)) == 0) {
++		got = (int)sizeof(buf) - left;
++	}
++	vnode_put(vnode);
++	while (i < (unsigned)got && buf[i] != '\n' && buf[i] != '\r') {          /* skip line 1 (SSID) */
++		i++;
++	}
++	while (i < (unsigned)got && (buf[i] == '\n' || buf[i] == '\r')) {
++		i++;
++	}
++	for (; i < (unsigned)got && buf[i] != '\n' && buf[i] != '\r' && buf[i] != 0 && pl < sizeof(psk); i++) {
++		psk[pl++] = (uint8_t)buf[i];
++	}
++	bzero(buf, sizeof(buf));
++	if (pl >= 8 && pl <= 63) {
++		wlan_pbkdf2_sha1(psk, pl, ssid, ssid_len, 4096, pmk, 32);
++		ok = true;
++	}
++	bzero(psk, sizeof(psk));
++	return ok;
++}
++
++/*
++ * Send one 802.11 frame over the HTT data path as ath10k does for native-wifi (ath10k_htt_tx_64): the frame goes
++ * in a DMA buffer the radio reads by address (we reuse the mgmt page), a fragment/extension descriptor in the
++ * frag bank (entry 0) points at it, and the HTT TX_FRM command on CE4 references that descriptor. EAPOL frames
++ * are data, so this is how they must go out - the WMI mgmt-tx path is for management frames only.
++ */
++static bool
++wlan_htt_tx(volatile uint32_t *ce, const uint8_t *frame, uint32_t len)
++{
++	uint8_t msg[96], *ext;
++	uint32_t pref;
++
++	if (len == 0 || len > PAGE_SIZE) {
++		return false;
++	}
++	memcpy((void *)wlan_mgmt.va, frame, len);
++	wlan_flush(wlan_mgmt.va, len);
++	ext = (uint8_t *)wlan_htt_frag_va;                      /* htt_msdu_ext_desc_64, entry 0 */
++	bzero(ext, 0x48);
++	put32(ext + 24, (uint32_t)wlan_mgmt.pa);                /* frags[0].tword_addr.paddr_lo */
++	put16(ext + 28, (uint16_t)(wlan_mgmt.pa >> 32));        /* paddr_hi */
++	put16(ext + 30, (uint16_t)len);                         /* len_16 */
++	wlan_flush(wlan_htt_frag_va, 0x48);
++	bzero(msg, sizeof(msg));
++	msg[0] = 0x01;                                          /* HTT_H2T_MSG_TYPE_TX_FRM */
++	msg[1] = 0x25;                                          /* flags0: MAC_HDR_PRESENT | NATIVE_WIFI<<5 | NO_ENCRYPT */
++	put16(msg + 2, 0x0c00);                                 /* flags1: vdev 0, ext tid 16 (<<6), POSTPONED (1<<11) */
++	put16(msg + 4, (uint16_t)len);                          /* frame length */
++	put16(msg + 6, 0);                                      /* msdu id (echoed in the tx completion) */
++	put64(msg + 8, wlan_htt_frag_pa);                       /* frags_paddr: the extension descriptor */
++	put32(msg + 16, 0x0000ffff);                            /* peerid: invalid */
++	pref = len < 56 ? len : 56;                             /* prefetch: start of frame for the classifier */
++	memcpy(msg + 20, frame, pref);
++	return wlan_htt_send(ce, msg, (uint16_t)(20 + pref));
++}
++
 +static bool
 +step_connect(void)
 +{
@@ -5999,7 +6106,7 @@
 +	    net->channel, freq, has_ht ? ", HT" : "", has_rsn ? ", WPA2" : " (open)");
 +
 +	wlan_vdev_started = wlan_auth_seen = wlan_assoc_seen = wlan_deauth_seen = false;
-+	wlan_eapol_m1_seen = false;
++	wlan_eapol_m1_seen = wlan_eapol_m3_seen = false;
 +	wlan_eapol_seen = 0;
 +	m = kalloc_data(2048, Z_WAITOK | Z_ZERO);
 +	if (m == NULL || !wlan_page_get(&wlan_mgmt)) {
@@ -6325,16 +6432,108 @@
 +	}
 +	kfree_data(m, 2048);
 +	printf("SWEET MPSS: %u: VDEV UP - CONNECTED to \"%.*s\"%s\n", step, ssid_len, ssid,
-+	    has_rsn ? "; waiting for the WPA2 handshake to begin (EAPOL)" : "");
-+	/* a WPA2 router sends the first EAPOL message at once (HTT data): watch a few seconds as a sign it took */
-+	wlan_pump(ce, 5000);
-+	if (wlan_deauth_seen) {
-+		printf("SWEET MPSS: %u: %u frames received, then the router disconnected us (reason %u)\n",
-+		    step, wlan_htt_frames, wlan_deauth_reason);
-+	} else {
-+		printf("SWEET MPSS: %u: %u frames received since the link came up\n", step, wlan_htt_frames);
++	    has_rsn ? "; starting the WPA2 handshake (EAPOL)" : "");
++	if (!has_rsn) {
++		/* open network: nothing to negotiate, just watch the link for a few seconds */
++		wlan_pump(ce, 5000);
++		printf("SWEET MPSS: %u: %u frames received since the link came up%s\n", step, wlan_htt_frames,
++		    wlan_deauth_seen ? " (then the router disconnected us)" : "");
++		return !wlan_deauth_seen;
 +	}
-+	return !wlan_deauth_seen;
++
++	/*
++	 * 6. WPA2 4-way handshake (point 2), message 2. Derive the PMK from the passphrase, wait for the router's
++	 * message 1 (ANonce), derive the PTK with a fresh SNonce (KCK = PTK[0:16]), and send message 2 - our SNonce
++	 * and RSN element, signed with a MIC over the EAPOL frame. Installing the keys and sending message 4 is the
++	 * next milestone; here success is the router answering with message 3, which means it accepted message 2.
++	 */
++	{
++		uint8_t pmk[32], ptk[48], ptkdata[76], snonce[32], mic[20];
++		uint8_t *e;
++		uint32_t flen;
++
++		if (!wlan_network_pmk(ssid, ssid_len, pmk)) {
++			printf("SWEET MPSS: %u: no usable passphrase on line 2 of /fw/network (need 8..63 characters)\n", step);
++			return false;
++		}
++		for (unsigned t = 0; t < 4000 && !wlan_eapol_m1_seen && !wlan_deauth_seen; t++) {
++			wlan_pump(ce, 1);
++		}
++		if (!wlan_eapol_m1_seen) {
++			bzero(pmk, sizeof(pmk));
++			printf("SWEET MPSS: %u: no EAPOL message 1 from the router%s\n", step,
++			    wlan_deauth_seen ? " - it disconnected us" : "");
++			return false;
++		}
++		if (memcmp(net->bssid, wlan_our_mac, 6) <= 0) {
++			memcpy(ptkdata + 0, net->bssid, 6);
++			memcpy(ptkdata + 6, wlan_our_mac, 6);
++		} else {
++			memcpy(ptkdata + 0, wlan_our_mac, 6);
++			memcpy(ptkdata + 6, net->bssid, 6);
++		}
++		read_random(snonce, sizeof(snonce));
++		if (memcmp(wlan_anonce, snonce, 32) <= 0) {
++			memcpy(ptkdata + 12, wlan_anonce, 32);
++			memcpy(ptkdata + 44, snonce, 32);
++		} else {
++			memcpy(ptkdata + 12, snonce, 32);
++			memcpy(ptkdata + 44, wlan_anonce, 32);
++		}
++		wlan_prf(pmk, 32, "Pairwise key expansion", ptkdata, sizeof(ptkdata), ptk, sizeof(ptk));
++		bzero(pmk, sizeof(pmk));
++
++		bzero(frame, sizeof(frame));
++		frame[0] = 0x08;                                /* data */
++		frame[1] = 0x01;                                /* to DS */
++		memcpy(frame + 4, net->bssid, 6);               /* addr1: the AP */
++		memcpy(frame + 10, wlan_our_mac, 6);            /* addr2: us */
++		memcpy(frame + 16, net->bssid, 6);              /* addr3: the AP */
++		{
++			static const uint8_t snap[8] = { 0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8e };
++			memcpy(frame + 24, snap, 8);
++		}
++		e = frame + 32;                                 /* EAPOL-Key frame (matches the layout wlan_rx_eapol reads) */
++		e[0] = 1;                                       /* version */
++		e[1] = 3;                                       /* type: EAPOL-Key */
++		e[2] = 0x00;
++		e[3] = 0x75;                                    /* body length 117 = 95 fixed + 22 key data */
++		e[4] = 2;                                       /* descriptor type: RSN */
++		e[5] = 0x01;
++		e[6] = 0x0a;                                    /* key info 0x010a: version 2 (HMAC-SHA1), pairwise, MIC */
++		e[7] = 0x00;
++		e[8] = 0x10;                                    /* key length 16 */
++		memcpy(e + 9, wlan_key_replay, 8);              /* replay counter, echoed from message 1 */
++		memcpy(e + 17, snonce, 32);                     /* SNonce */
++		/* IV (e+49), RSC (e+65), reserved (e+73) and MIC (e+81) stay zero while the MIC is computed */
++		e[97] = 0x00;
++		e[98] = 0x16;                                   /* key data length 22 */
++		e[99] = 0x30;                                   /* RSN element: id 48, length 20 */
++		e[100] = 0x14;
++		memcpy(e + 101, rsn_ie, sizeof(rsn_ie));
++		wlan_hmac_sha1(ptk, 16, e, 4 + 117, mic);       /* MIC = HMAC-SHA1(KCK = PTK[0:16], EAPOL frame, MIC zeroed) */
++		memcpy(e + 81, mic, 16);
++		bzero(ptk, sizeof(ptk));
++		flen = 32 + 4 + 117;                            /* 802.11 (24) + SNAP (8) + EAPOL (121) = 153 bytes */
++		printf("SWEET MPSS: %u: WPA2: PMK derived, SNonce made, EAPOL message 2 built (%u bytes); sending\n",
++		    step, flen);
++		if (!wlan_htt_tx(ce, frame, flen)) {
++			printf("SWEET MPSS: %u: could not send EAPOL message 2\n", step);
++			return false;
++		}
++		for (unsigned t = 0; t < 4000 && !wlan_eapol_m3_seen && !wlan_deauth_seen; t++) {
++			wlan_pump(ce, 1);
++		}
++		if (wlan_eapol_m3_seen) {
++			printf("SWEET MPSS: %u: the router answered with message 3 - it accepted message 2\n", step);
++		} else if (wlan_deauth_seen) {
++			printf("SWEET MPSS: %u: no message 3; the router disconnected us (reason %u)\n", step,
++			    wlan_deauth_reason);
++		} else {
++			printf("SWEET MPSS: %u: no message 3 within 4 s\n", step);
++		}
++		return wlan_eapol_m3_seen;
++	}
 +
 +fail:
 +	kfree_data(m, 2048);
