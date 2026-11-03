@@ -295,7 +295,7 @@
  /* MB/s of a 16 MB memcpy, best of 4 (cached kernel memory, the CPU renderer's kind of work). */
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,6356 @@
+@@ -0,0 +1,6439 @@
 +/*
 + * SWEET vayu (SM8150): modem (MPSS) bring-up, milestone 1 - the modem is loaded, authenticated and let
 + * out of reset, the link to it taken up, and the application processor's file services started, so that
@@ -5001,6 +5001,7 @@
 +#define WMI_EV_MGMT_RX          0x7001u
 +#define WMI_VDEV_START          0x5003u         /* step 16 (ids from ath10k wmi-tlv.h) */
 +#define WMI_VDEV_UP             0x5005u
++#define WMI_VDEV_INSTALL_KEY    0x5009u          /* install the PTK/GTK after the WPA2 handshake */
 +#define WMI_PEER_CREATE         0x6001u
 +#define WMI_PEER_ASSOC          0x6005u
 +#define WMI_MGMT_TX             0x7008u          /* MGMT_TX_SEND: the frame carried by physical address */
@@ -5047,6 +5048,7 @@
 +static uint32_t wlan_eapol_seen;
 +static uint8_t  wlan_anonce[32];
 +static uint8_t  wlan_key_replay[8];
++static uint8_t  wlan_m3_replay[8];
 +
 +/*
 + * HTT receive (ath10k htt.c/htt_rx.c/htt_tx.c for wcn3990, 64-bit; layouts checked by compiling ath10k's
@@ -5802,6 +5804,7 @@
 +		printf("SWEET MPSS: %u: EAPOL-Key message 1 of the WPA2 handshake received (key info %#06x)\n",
 +		    step, info);
 +	} else if ((info & 0x0008) && (info & 0x0080) && (info & 0x0100)) {      /* Pairwise + ACK + MIC: message 3 */
++		memcpy(wlan_m3_replay, e + 9, 8);                       /* replay counter, echoed in message 4 */
 +		wlan_eapol_m3_seen = true;
 +		printf("SWEET MPSS: %u: EAPOL-Key message 3 received (key info %#06x)\n", step, info);
 +	} else {
@@ -6513,26 +6516,106 @@
 +		memcpy(e + 101, rsn_ie, sizeof(rsn_ie));
 +		wlan_hmac_sha1(ptk, 16, e, 4 + 117, mic);       /* MIC = HMAC-SHA1(KCK = PTK[0:16], EAPOL frame, MIC zeroed) */
 +		memcpy(e + 81, mic, 16);
-+		bzero(ptk, sizeof(ptk));
 +		flen = 32 + 4 + 117;                            /* 802.11 (24) + SNAP (8) + EAPOL (121) = 153 bytes */
 +		printf("SWEET MPSS: %u: WPA2: PMK derived, SNonce made, EAPOL message 2 built (%u bytes); sending\n",
 +		    step, flen);
 +		if (!wlan_htt_tx(ce, frame, flen)) {
++			bzero(ptk, sizeof(ptk));
 +			printf("SWEET MPSS: %u: could not send EAPOL message 2\n", step);
 +			return false;
 +		}
 +		for (unsigned t = 0; t < 4000 && !wlan_eapol_m3_seen && !wlan_deauth_seen; t++) {
 +			wlan_pump(ce, 1);
 +		}
-+		if (wlan_eapol_m3_seen) {
-+			printf("SWEET MPSS: %u: the router answered with message 3 - it accepted message 2\n", step);
-+		} else if (wlan_deauth_seen) {
-+			printf("SWEET MPSS: %u: no message 3; the router disconnected us (reason %u)\n", step,
-+			    wlan_deauth_reason);
-+		} else {
-+			printf("SWEET MPSS: %u: no message 3 within 4 s\n", step);
++		if (!wlan_eapol_m3_seen) {
++			bzero(ptk, sizeof(ptk));
++			if (wlan_deauth_seen) {
++				printf("SWEET MPSS: %u: no message 3; the router disconnected us (reason %u)\n", step,
++				    wlan_deauth_reason);
++			} else {
++				printf("SWEET MPSS: %u: no message 3 within 4 s\n", step);
++			}
++			return false;
 +		}
-+		return wlan_eapol_m3_seen;
++		printf("SWEET MPSS: %u: the router answered with message 3 - it accepted message 2\n", step);
++
++		/*
++		 * 7. finish the handshake (point 2, milestone D1): send message 4, then install the pairwise key so
++		 * the link is protected. Message 4 goes out before the key is installed, so it is still unencrypted
++		 * (like message 2). The group key (GTK), carried encrypted in message 3, is the next milestone.
++		 */
++		bzero(frame, sizeof(frame));
++		frame[0] = 0x08;                                /* data */
++		frame[1] = 0x01;                                /* to DS */
++		memcpy(frame + 4, net->bssid, 6);               /* addr1: the AP */
++		memcpy(frame + 10, wlan_our_mac, 6);            /* addr2: us */
++		memcpy(frame + 16, net->bssid, 6);              /* addr3: the AP */
++		{
++			static const uint8_t snap[8] = { 0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8e };
++			memcpy(frame + 24, snap, 8);
++		}
++		e = frame + 32;
++		e[0] = 1;                                       /* version */
++		e[1] = 3;                                       /* type: EAPOL-Key */
++		e[2] = 0x00;
++		e[3] = 0x5f;                                    /* body length 95, no key data */
++		e[4] = 2;                                       /* descriptor type: RSN */
++		e[5] = 0x03;
++		e[6] = 0x0a;                                    /* key info 0x030a: version 2, pairwise, MIC, secure */
++		e[7] = 0x00;
++		e[8] = 0x00;                                    /* key length 0 */
++		memcpy(e + 9, wlan_m3_replay, 8);               /* replay counter, echoed from message 3 */
++		/* nonce, IV, RSC, reserved, MIC and key data length (e+97) all stay zero */
++		wlan_hmac_sha1(ptk, 16, e, 4 + 95, mic);        /* MIC = HMAC-SHA1(KCK, EAPOL frame, MIC zeroed) */
++		memcpy(e + 81, mic, 16);
++		flen = 32 + 4 + 95;                             /* 131 bytes */
++		if (!wlan_htt_tx(ce, frame, flen)) {
++			bzero(ptk, sizeof(ptk));
++			printf("SWEET MPSS: %u: could not send EAPOL message 4\n", step);
++			return false;
++		}
++		printf("SWEET MPSS: %u: EAPOL message 4 sent - the 4-way handshake is complete\n", step);
++
++		/* install the pairwise key (TK = PTK[32:48], CCMP) for the AP peer */
++		{
++			uint8_t eid = wlan_wmi_eid & 7;
++
++			sleep_ms(30);                           /* let message 4 go out before the key takes effect */
++			if (wlan_credits[eid] == 0) {
++				wlan_credits[eid] = 1;
++			}
++			bzero(frame, sizeof(frame));
++			at = 4;
++			tlv_hdr(frame + at, 0x60, 92);                  /* wmi_vdev_install_key_cmd */
++			put32(frame + at + 4 + 0x00, 0);                /* vdev 0 */
++			memcpy(frame + at + 4 + 0x04, net->bssid, 6);   /* peer_macaddr: the AP */
++			put32(frame + at + 4 + 0x0c, 0);                /* key_idx 0 */
++			put32(frame + at + 4 + 0x10, 0);                /* key_flags: pairwise */
++			put32(frame + at + 4 + 0x14, 4);                /* key_cipher: AES_CCM (CCMP) */
++			put32(frame + at + 4 + 0x50, 16);               /* key_len */
++			at += 4 + 92;
++			tlv_hdr(frame + at, 0x11, 16);                  /* ARRAY_BYTE: the key material */
++			memcpy(frame + at + 4, ptk + 32, 16);           /* TK */
++			at += 4 + 16;
++			if (!wlan_wmi_send(ce, WMI_VDEV_INSTALL_KEY, frame, at)) {
++				bzero(ptk, sizeof(ptk));
++				printf("SWEET MPSS: %u: could not install the pairwise key\n", step);
++				return false;
++			}
++		}
++		bzero(ptk, sizeof(ptk));
++		printf("SWEET MPSS: %u: pairwise key installed (CCMP); the link is now protected\n", step);
++
++		/* watch a few seconds: a link that stays up (no deauth) means the handshake held */
++		wlan_pump(ce, 4000);
++		if (wlan_deauth_seen) {
++			printf("SWEET MPSS: %u: the router disconnected us after the handshake (reason %u)\n", step,
++			    wlan_deauth_reason);
++			return false;
++		}
++		printf("SWEET MPSS: %u: link holding after the handshake (%u frames); group key and DHCP are next\n",
++		    step, wlan_htt_frames);
++		return true;
 +	}
 +
 +fail:
